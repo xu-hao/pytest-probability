@@ -9,12 +9,11 @@ module-level function whose name starts with `bench_` is a benchmark**
 ## The module contract
 
 `bench_*(**params)` functions
-: Each is a generator (any iterable-returning callable works) that
-  exercises one case and yields one step result per check. Cases come
-  from plain `@pytest.mark.parametrize` on the function — every
-  parameter combination is one case, and its values arrive as
-  arguments. A function with no parametrize marks is a single case
-  named after the function. See {doc}`parametrization`.
+: Each is an **ordinary test body**: it takes its case's values as
+  arguments, does the work, and `assert`s the outcome. Cases come from
+  plain `@pytest.mark.parametrize` on the function — every parameter
+  combination is one case. A function with no parametrize marks is a
+  single case named after the function. See {doc}`parametrization`.
 
 `setup()` / `teardown()` *(optional)*
 : Called once per file: `setup()` before the file's first item runs,
@@ -33,13 +32,13 @@ you need per-run resources, create them inside the bench function;
 per-file resources belong in `setup()`/`teardown()`.
 ```
 
-## Declaring cases
+## Writing a benchmark
 
-Cases are stock pytest parametrization — nothing plugin-specific:
+If you can write a pytest test, you already know the syntax:
 
 ```python
 import pytest
-from pytest_probability import StepResult
+from pytest_probability import record_cost
 
 @pytest.mark.parametrize("text,expected", [
     pytest.param("my ssn is 078-05-1120", "pii", id="identify_pii",
@@ -48,7 +47,8 @@ from pytest_probability import StepResult
 ])
 def bench_classify(text, expected):
     answer = my_classifier(text)
-    yield StepResult(label="classify", passed=(answer == expected))
+    record_cost(0.0002)                      # optional, see Cost
+    assert answer == expected, f"got '{answer}'"
 ```
 
 - **Values are function arguments** — named, hintable, refactorable.
@@ -67,116 +67,86 @@ Each case gets its own summary row, namespaced by the function's short
 name so identical ids in different benchmarks never collide:
 
 ```text
-  [classify::identify_pii] classify   7/10  FLAKY
-  [classify::is_question] classify   10/10
+  classify::identify_pii   7/10  FLAKY
+  classify::is_question   10/10
 ```
 
-Dataset-driven suites are a comprehension away — and a ragged payload
-is just a dict-valued parameter:
+Dataset-driven suites are a comprehension away — a ragged payload is
+just a dict-valued parameter:
 
 ```python
 @pytest.mark.parametrize("row", [
     pytest.param(row, id=row["id"]) for row in load_dataset()
 ])
 def bench_extract(row):
-    ...
+    assert extract(row["input"]) == row["expected"]
 ```
 
-## Step results
+## Run outcomes
 
-Bench functions yield one result per step:
+A run's outcome is decided by how the function body ends — the three
+classes fall straight out of Python:
 
-```python
-from pytest_probability import StepResult, TokenUsage
-
-StepResult(
-    label="classify",       # required — the row key in the summary
-    passed=True,            # required — did this step pass this run?
-    elapsed=0.42,           # optional — seconds, recorded in the JSON report
-    error=None,             # optional — infrastructure failure text
-    message="got 'other'",  # optional — shown in the failure summary
-    details={},             # optional — free-form, for your own use
-    cost=0.0002,            # optional — summed into the report
-    usage=[TokenUsage(model="m-small", input_tokens=100, output_tokens=20)],
-)
-```
-
-Field semantics:
-
-| Field | Type | Effect |
+| The body… | Outcome | Meaning |
 |---|---|---|
-| `label` | `str` | Aggregation key: fractions are computed per `(case, label)` pair |
-| `passed` | `bool` | `False` fails this run's item and counts toward the row's `fails` |
-| `elapsed` | `float` | Informational; preserved in `--prob-json` records |
-| `error` | `str \| None` | Non-`None` counts the step as an **error**, not a fail |
-| `message` | `str \| None` | Appended to the one-line failure report |
-| `details` | `dict` | Not interpreted by the plugin |
-| `cost` | `float \| None` | Summed per row and overall; see {doc}`cost` |
-| `usage` | `list[TokenUsage]` | Per-model token accounting; see {doc}`cost` |
+| returns normally | **pass** | correct answer |
+| raises `AssertionError` | **fail** | your code answered wrong |
+| raises anything else | **error** | your harness broke (API down, timeout, bug) |
 
-Steps are duck-typed: anything with a `label` and `passed` attribute
-is accepted, and the remaining fields are read with `getattr(..., None)`
-defaults — so bench functions may yield result types from other
-frameworks as long as the attribute names line up.
+Two consequences worth internalizing:
 
-## Multi-step runs
+- **Assert the *outcome*, let infrastructure raise.** A wrong
+  classification is an `assert`; a `ConnectionError` from the client
+  library propagates by itself and lands in the error class. You get
+  the fail/error separation for free by writing idiomatic code.
+- **`pytest.skip()` / `xfail` work** exactly as in pytest — and a
+  skipped run is not a sample: it never enters any fraction.
 
-Yield as many steps as the case has checks. Each label aggregates into
-its own summary row, and one failing step does not stop the following
-steps from running:
+The plugin measures each run's wall-clock time itself (`elapsed` in the
+{doc}`JSON report <json-report>`) — no stopwatch code in your benches.
 
-```python
-@pytest.mark.parametrize("text", CASES)
-def bench_pipeline(text):
-    t0 = time.time()
-    answer = pipeline(text)
-    yield StepResult(label="classify", passed=answer.kind == "billing",
-                     elapsed=time.time() - t0)
-    yield StepResult(label="latency", passed=(time.time() - t0) < 2.0)
-    yield StepResult(label="citation", passed=answer.citation is not None)
-```
+Failures are ordinary assertion failures with **pytest's full assertion
+rewriting**: bench modules pass through the same rewriter as
+`test_*.py` files, so a bare assert reports its operands and diffs —
 
 ```text
-  [pipeline::refund_request] classify  9/10  FLAKY
-  [pipeline::refund_request] latency   10/10
-  [pipeline::refund_request] citation  4/10  FLAKY
+>       assert answer == expected
+E       AssertionError: assert 'other' == 'pii'
+
+bench_classify.py:41: AssertionError
 ```
 
-## Failure and error semantics
+The first line of that message (your explicit assert message, or the
+rewritten `assert 'other' == 'pii'`) also lands in the JSON report as
+the run's `message`, so wrong answers are analyzable in bulk.
 
-Two distinct things can go wrong, and they are reported differently:
+Rewriting honors pytest's own escape hatches: `--assert=plain`
+disables it session-wide, and a module docstring containing
+`PYTEST_DONT_REWRITE` opts that file out.
 
-**A step fails** (`passed=False`)
-: The run's item fails with a compact one-liner — no traceback, because
-  there is no exception to trace:
+Want several checks against one case? Either assert them in sequence
+(the first failure ends the run — exactly like a test), or split them
+into separate `bench_*` functions sharing a helper so each check gets
+its own fraction row.
 
-  ```text
-  ______________________ case: classify::identify_pii ______________________
-  step 'classify' failed: got 'other'
-  ```
+## Multiple benchmarks per file
 
-  The text after the colon is the step's `error` or, failing that, its
-  `message`.
+A file holds as many `bench_*` functions as you like; they collect in
+definition order:
 
-**The bench function raises**
-: The item fails with the ordinary pytest traceback, *and* the run is
-  recorded as a failed step labeled `error` so it still counts in the
-  aggregate:
+```python
+@pytest.mark.parametrize("row", CASES)
+def bench_classify(row):
+    assert classify(row["input"]) == row["expected"]
 
-  ```text
-    [check::crashy] ok     1/1
-    [check::crashy] error  0/1  ERROR
-  ```
+@pytest.mark.parametrize("row", CASES)
+def bench_latency(row):
+    t0 = time.perf_counter()
+    classify(row["input"])
+    assert time.perf_counter() - t0 < 2.0
+```
 
-  Steps yielded before the exception are kept.
-
-Runs are a three-class outcome, and the row status names the
-combination: all errors shows **ERROR** (harness problem), passes
-mixed with errors shows **N ERRORED** (`7/10  3 ERRORED` — the model
-never answered wrong, the harness dropped runs), no passes with real
-failures shows **FAIL**, and passes mixed with failures shows
-**FLAKY** — the word reserved for genuine nondeterminism. The fraction
-is always `passes/total runs`, so an errored run costs the row its
-perfect score; the status word says which class of trouble it was.
-All seven class combinations and their exact renderings are tabulated
-in {doc}`reference`.
+Summary rows are namespaced by the function's short name
+(`bench_classify` → `classify::`), so identical case ids in different
+benchmarks aggregate separately, and `-k bench_latency` selects one
+benchmark's items.

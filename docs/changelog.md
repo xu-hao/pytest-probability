@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.0 (2026-07-08)
+
+Bench functions are now **plain test bodies that assert** — the
+yield-a-result style is gone.
+
+- **Breaking:** `StepResult` is removed. A bench function passes by
+  returning, fails on `AssertionError`, and errors on any other
+  exception — the three outcome classes fall straight out of Python.
+  `pytest.skip`/`xfail` bypass recording, as in pytest. A generator
+  bench (the old style) is rejected with a clear error.
+- **Breaking:** rows aggregate per case (the step/label dimension is
+  gone): terminal rows read `classify::identify_pii  7/10  FLAKY`, and
+  the JSON `rows` lose `label` while `records` become flat per-run
+  entries (`outcome`, `message`, `error`, `elapsed`, `cost`, `usage`).
+- **Assertion rewriting:** bench modules pass through pytest's
+  rewriter, so bare asserts report operands and diffs
+  (`assert 'other' == 'pii'`); the first line lands in the JSON
+  `message`. `--assert=plain` and `PYTEST_DONT_REWRITE` opt out.
+- **New:** `record_usage(...)` and `record_cost(...)` attribute
+  per-model token usage and plain cost to the current run from inside
+  the body; usage recorded before a failing assert is kept. Run
+  wall-clock time is measured by the plugin (`elapsed` in records).
+- Multiple checks per case = multiple asserts (first failure ends the
+  run) or multiple `bench_*` functions sharing a helper.
+
 ## 0.1.0 (2026-07-08)
 
 Initial release.

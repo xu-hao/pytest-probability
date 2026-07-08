@@ -2,34 +2,39 @@
 
 Collects ``bench_*.py`` files the way pytest collects ``test_*.py``:
 every module-level ``bench_*`` function is a benchmark — an ordinary
-parametrized generator that yields step results. Each parameter
-combination is a case; every case runs N times; and a pass-fraction
-summary — ``7/10 FLAKY`` — renders after pytest's own output.
+test body that asserts. Each parameter combination is a case; every
+case runs N times; and a pass-fraction summary — ``7/10 FLAKY`` —
+renders after pytest's own output.
 
-There is no declaration surface beyond stock pytest:
+There is no authoring surface beyond stock pytest:
 ``@pytest.mark.parametrize`` supplies the cases (values arrive as
 function arguments, ids compose pytest-style), ``pytest.param`` names
-and marks individual cases, ``-k``/``-m`` select them, and a function
-with no parametrize marks simply runs as a single case.
+and marks individual cases, ``-k``/``-m`` select them, a function with
+no parametrize marks simply runs as a single case, and the body
+``assert``\\ s. The only additions are ``record_usage``/``record_cost``
+for attributing spend to a run.
 
 Design notes:
 
 - Multi-run execution is modeled as one pytest item per (case, run),
   so ``-k``, ``-x``, xdist, and JUnit XML all apply per run.
-- Step results ride on ``report.user_properties`` as plain dicts so the
+- Run outcomes are three classes: a clean return passes, an
+  ``AssertionError`` fails (the code answered wrong), any other
+  exception errors (the harness broke). ``pytest.skip``/``xfail``
+  bypass recording entirely.
+- Results ride on ``report.user_properties`` as plain dicts so the
   aggregate survives pytest-xdist's worker-to-controller serialization.
 - A pass fraction only exists across items, so it cannot be attached to
   any single test outcome; it is rendered in ``pytest_terminal_summary``.
-- Steps are consumed by duck-typing (``label``, ``passed``, ``elapsed``,
-  ``error``, ``message``, ``cost``, ``usage``), so bench functions may
-  yield the ``StepResult`` defined here or any object with the same
-  attributes.
 """
 from __future__ import annotations
 
+import ast
+import contextvars
 import fnmatch
 import hashlib
 import importlib.util
+import inspect
 import json
 import sys
 import time
@@ -41,15 +46,15 @@ from typing import Any, Callable, Iterator
 import pytest
 
 # ---------------------------------------------------------------------------
-# Author-facing types
+# Author-facing API
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class TokenUsage:
-    """Token accounting for one model's calls within a step.
+    """Token accounting for one model's calls within a run.
 
-    A step may carry several of these — one per model it touched.
+    A run may record several of these — one per model it touched.
     """
 
     model: str = ""
@@ -59,18 +64,58 @@ class TokenUsage:
     cost: float = 0.0
 
 
-@dataclass
-class StepResult:
-    """One yielded step of a bench function."""
+class _RunRecorder:
+    """Per-run accumulator fed by ``record_usage``/``record_cost``."""
 
-    label: str
-    passed: bool
-    elapsed: float = 0.0
-    error: str | None = None
-    message: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
-    cost: float | None = None
-    usage: list[TokenUsage] = field(default_factory=list)
+    __slots__ = ("usage", "cost")
+
+    def __init__(self) -> None:
+        self.usage: list[dict[str, Any]] = []
+        self.cost = 0.0
+
+
+# The active run's recorder. ContextVar (not a global) so parallel
+# in-process runs — e.g. under pytest-xdist workers or user threads
+# driven through contextvars — cannot cross-contaminate.
+_RUN_RECORDER: contextvars.ContextVar[_RunRecorder | None] = contextvars.ContextVar(
+    "pytest_probability_run", default=None
+)
+
+
+def _current_recorder(caller: str) -> _RunRecorder:
+    rec = _RUN_RECORDER.get()
+    if rec is None:
+        raise RuntimeError(f"{caller}() called outside a bench run")
+    return rec
+
+
+def record_usage(usage: Any = None, /, **fields: Any) -> None:
+    """Attribute per-model token usage to the current bench run.
+
+    Accepts a ``TokenUsage``, any object with the same attributes, a
+    plain dict — or the fields directly as keyword arguments::
+
+        record_usage(model="m-small", input_tokens=120, output_tokens=8,
+                     cost=0.0001)
+
+    Call it as many times as the run makes model calls; entries
+    aggregate per model. Recorded usage survives a failing ``assert``
+    that comes after it — spend is never lost to a wrong answer.
+    """
+    if usage is not None and fields:
+        raise TypeError("pass a usage object or keyword fields, not both")
+    _current_recorder("record_usage").usage.append(
+        _usage_to_dict(usage if usage is not None else fields)
+    )
+
+
+def record_cost(amount: float) -> None:
+    """Add a non-token cost to the current bench run.
+
+    The run's total cost is ``record_cost`` amounts plus the ``cost``
+    of every recorded usage entry.
+    """
+    _current_recorder("record_cost").cost += float(amount)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +138,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         dest="prob_json",
         default=None,
         metavar="PATH",
-        help="Write a JSON report (fractions, statuses, per-run steps) to PATH",
+        help="Write a JSON report (fractions, statuses, per-run records) to PATH",
     )
     group.addoption(
         "--prob-delay",
@@ -240,7 +285,37 @@ def pytest_collect_file(file_path: Path, parent: pytest.Collector):
     return None
 
 
-def _import_bench_module(path: Path):
+try:
+    # pytest's assertion rewriter. Internal module, but the function
+    # signature has been stable for many years; we degrade gracefully
+    # if it ever moves.
+    from _pytest.assertion.rewrite import rewrite_asserts as _rewrite_asserts
+except ImportError:  # pragma: no cover - future-pytest safety net
+    _rewrite_asserts = None
+
+
+def _compile_bench_source(source: bytes, path: Path, config: pytest.Config):
+    """Compile a bench module, passing it through pytest's assertion
+    rewriter so ``assert answer == expected`` reports full
+    sub-expression introspection — the same behavior ``test_*.py``
+    files get.
+
+    Rewriting is skipped under ``--assert=plain``, when the module
+    docstring contains ``PYTEST_DONT_REWRITE``, or if the rewriter is
+    unavailable; asserts then behave like stock Python.
+    """
+    tree = ast.parse(source, filename=str(path))
+    docstring = ast.get_docstring(tree, clean=False) or ""
+    if (
+        _rewrite_asserts is not None
+        and config.getoption("assertmode", "rewrite") == "rewrite"
+        and "PYTEST_DONT_REWRITE" not in docstring
+    ):
+        _rewrite_asserts(tree, source, str(path), config)
+    return compile(tree, str(path), "exec", dont_inherit=True)
+
+
+def _import_bench_module(path: Path, config: pytest.Config):
     """Import a benchmark file under a path-unique module name.
 
     Import errors propagate so pytest reports them as collection errors.
@@ -250,9 +325,10 @@ def _import_bench_module(path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {path}")
+    code = _compile_bench_source(path.read_bytes(), path, config)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
+    exec(code, mod.__dict__)
     return mod
 
 
@@ -263,7 +339,7 @@ class BenchFile(pytest.File):
     _teardown_fn: Callable[[], None] | None = None
 
     def collect(self) -> Iterator[pytest.Collector]:
-        mod = _import_bench_module(self.path)
+        mod = _import_bench_module(self.path, self.config)
 
         setup = getattr(mod, "setup", None)
         teardown = getattr(mod, "teardown", None)
@@ -354,14 +430,6 @@ class BenchFunction(pytest.Collector):
 # ---------------------------------------------------------------------------
 
 
-class StepFailures(Exception):
-    """Raised by ``BenchItem.runtest`` when one or more steps failed."""
-
-    def __init__(self, steps: list[dict[str, Any]]) -> None:
-        super().__init__(f"{len(steps)} step(s) failed")
-        self.steps = steps
-
-
 def _usage_to_dict(u: Any) -> dict[str, Any]:
     """Normalize a usage entry (``TokenUsage``, any object with the same
     attributes, or a plain dict) into a serializable dict."""
@@ -378,25 +446,15 @@ def _usage_to_dict(u: Any) -> dict[str, Any]:
     }
 
 
-def _step_to_dict(step: Any) -> dict[str, Any]:
-    usage = [_usage_to_dict(u) for u in (getattr(step, "usage", None) or ())]
-    cost = getattr(step, "cost", None)
-    if cost is None and usage:
-        # An explicit cost overrides; otherwise it derives from usage.
-        cost = sum(u["cost"] for u in usage)
-    return {
-        "label": getattr(step, "label", "step"),
-        "passed": bool(getattr(step, "passed", False)),
-        "elapsed": float(getattr(step, "elapsed", 0.0) or 0.0),
-        "error": getattr(step, "error", None),
-        "message": getattr(step, "message", None),
-        "cost": float(cost) if cost is not None else None,
-        "usage": usage,
-    }
-
-
 class BenchItem(pytest.Item):
-    """One (case, run) execution of a bench function."""
+    """One (case, run) execution of a bench function.
+
+    The function body is an ordinary pytest test body: a passing body
+    is a pass, an ``AssertionError`` is a fail (your code answered
+    wrong), any other exception is an error (your harness broke).
+    ``pytest.skip``/``xfail`` raise outcomes that bypass recording
+    entirely, exactly like pytest.
+    """
 
     def __init__(
         self,
@@ -421,56 +479,53 @@ class BenchItem(pytest.Item):
                 time.sleep(delay)
             else:
                 self.config.stash[_DELAYED_ONCE] = True
-        steps: list[dict[str, Any]] = []
+
+        recorder = _RunRecorder()
+        token = _RUN_RECORDER.set(recorder)
+        start = time.perf_counter()
+        outcome: str | None = None
+        message: str | None = None
+        error: str | None = None
         try:
-            for step in self.bench_fn(**self.params):
-                steps.append(_step_to_dict(step))
-        except Exception as exc:
-            # An exception mid-case is recorded as a failed "error"
-            # step so it counts in the aggregate, then surfaces as a
-            # normal pytest failure.
-            steps.append(
-                {
-                    "label": "error",
-                    "passed": False,
-                    "elapsed": 0.0,
-                    "error": str(exc),
-                    "message": None,
-                    "cost": None,
-                    "usage": [],
-                }
-            )
-            self._publish(steps)
-            raise
-        self._publish(steps)
-        failed = [s for s in steps if not s["passed"]]
-        if failed:
-            raise StepFailures(failed)
-
-    def _publish(self, steps: list[dict[str, Any]]) -> None:
-        # Plain dicts only: user_properties must survive xdist's
-        # worker-to-controller report serialization.
-        self.user_properties.append(
-            (
-                "probability",
-                {
-                    "case": self.case,
-                    "run": self.run_id,
-                    "steps": steps,
-                },
-            )
-        )
-
-    def repr_failure(self, excinfo, style=None):
-        if isinstance(excinfo.value, StepFailures):
-            lines = []
-            for s in excinfo.value.steps:
-                detail = s["error"] or s["message"]
-                lines.append(
-                    f"step '{s['label']}' failed" + (f": {detail}" if detail else "")
+            result = self.bench_fn(**self.params)
+            if inspect.isgenerator(result):
+                raise TypeError(
+                    "bench functions are plain test bodies since 0.2.0 —"
+                    " use assert instead of yielding step results"
                 )
-            return "\n".join(lines)
-        return super().repr_failure(excinfo, style=style)
+            outcome = "pass"
+        except AssertionError as exc:
+            outcome = "fail"
+            first = str(exc).split("\n", 1)[0].strip()
+            message = first or None
+            raise
+        except Exception as exc:
+            outcome = "error"
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            _RUN_RECORDER.reset(token)
+            # outcome is None for pytest.skip()/fail() and other
+            # control-flow BaseExceptions: those runs are not samples.
+            if outcome is not None:
+                cost = recorder.cost + sum(u["cost"] for u in recorder.usage)
+                self.user_properties.append(
+                    (
+                        # Plain dicts only: user_properties must survive
+                        # xdist's worker-to-controller serialization.
+                        "probability",
+                        {
+                            "case": self.case,
+                            "run": self.run_id,
+                            "outcome": outcome,
+                            "message": message,
+                            "error": error,
+                            "elapsed": time.perf_counter() - start,
+                            "cost": cost or None,
+                            "usage": recorder.usage,
+                        },
+                    )
+                )
 
     def reportinfo(self):
         return self.path, 0, f"case: {self.case}"
@@ -501,10 +556,9 @@ def _merge_usage(into: dict[str, dict[str, Any]], usage: dict[str, Any]) -> None
 
 @dataclass
 class CaseStats:
-    """Aggregated results for a (case, label) pair across all runs."""
+    """Aggregated results for one case across all its runs."""
 
     case: str
-    label: str
     passes: int = 0
     fails: int = 0
     errors: int = 0
@@ -545,7 +599,7 @@ _MARKUP = {
 
 
 def _row_name(s: CaseStats) -> str:
-    return f"[{s.case}] {s.label}"
+    return s.case
 
 
 class ProbabilityAggregator:
@@ -559,10 +613,10 @@ class ProbabilityAggregator:
 
     def __init__(self, config: pytest.Config) -> None:
         self._config = config
-        self._stats: OrderedDict[tuple[str, str], CaseStats] = OrderedDict()
+        self._stats: OrderedDict[str, CaseStats] = OrderedDict()
         self._json_path = config.getoption("prob_json")
-        # Raw (case, run, steps) records, kept only when a JSON report
-        # was requested.
+        # Raw per-run records, kept only when a JSON report was
+        # requested.
         self._records: list[dict[str, Any]] | None = (
             [] if self._json_path else None
         )
@@ -575,21 +629,18 @@ class ProbabilityAggregator:
                 continue
             if self._records is not None:
                 self._records.append(value)
-            for step in value["steps"]:
-                key = (value["case"], step["label"])
-                st = self._stats.setdefault(
-                    key, CaseStats(case=value["case"], label=step["label"])
-                )
-                if step["error"] is not None:
-                    st.errors += 1
-                elif step["passed"]:
-                    st.passes += 1
-                else:
-                    st.fails += 1
-                if step["cost"]:
-                    st.cost += step["cost"]
-                for usage in step.get("usage", ()):
-                    _merge_usage(st.usage, usage)
+            st = self._stats.setdefault(value["case"], CaseStats(case=value["case"]))
+            outcome = value["outcome"]
+            if outcome == "pass":
+                st.passes += 1
+            elif outcome == "error":
+                st.errors += 1
+            else:
+                st.fails += 1
+            if value["cost"]:
+                st.cost += value["cost"]
+            for usage in value.get("usage", ()):
+                _merge_usage(st.usage, usage)
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         if not self._json_path:
@@ -621,7 +672,6 @@ class ProbabilityAggregator:
             "rows": [
                 {
                     "case": s.case,
-                    "label": s.label,
                     "passes": s.passes,
                     "fails": s.fails,
                     "errors": s.errors,

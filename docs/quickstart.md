@@ -13,7 +13,6 @@ Each parameter combination is a case:
 ```python
 # benchmarks/bench_greeting.py
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("text,expected", [
     pytest.param("hello", "greeting", id="english"),
@@ -21,29 +20,27 @@ from pytest_probability import StepResult
 ])
 def bench_classify(text, expected):
     answer = my_classifier(text)          # your code under test
-    yield StepResult(
-        label="classify",
-        passed=(answer == expected),
-    )
+    assert answer == expected, f"got '{answer}'"
 ```
 
-The function *yields* one `StepResult` per step instead of asserting.
-A run can therefore report several labeled checks, and a failing step
-doesn't abort the rest of the run.
+That's a pytest test in everything but name — the `bench_` prefix is
+the entire opt-in. The body asserts; a wrong answer fails the run, an
+exception (API down, timeout) errors it, and those are tracked as
+different classes.
 
 ## 2. Run it
 
 ```text
 $ pytest benchmarks/
 ========================= test session starts ==========================
-plugins: probability-0.1.0
+plugins: probability-0.2.0
 collected 2 items
 
 benchmarks/bench_greeting.py ..                                   [100%]
 
 ============================= probability ==============================
-  [classify::english] classify  1/1
-  [classify::german] classify   1/1
+  classify::english  1/1
+  classify::german   1/1
 
   Overall: 2/2 passed (100%)
 ========================== 2 passed in 0.02s ===========================
@@ -65,8 +62,8 @@ collected 20 items
 benchmarks/bench_greeting.py ...............F..F.               [100%]
 
 ============================= probability ==============================
-  [classify::english] classify  10/10
-  [classify::german] classify    8/10  FLAKY
+  classify::english  10/10
+  classify::german    8/10  FLAKY
 
   Overall: 18/20 passed (90%)
 ```
@@ -100,7 +97,7 @@ case splits into `-small` / `-large` rows.
 
 ## 5. Where to go next
 
-- {doc}`cases` — the full benchmark-file contract, multi-step runs,
+- {doc}`cases` — the full benchmark-file contract, run outcomes,
   lifecycle hooks, error semantics.
 - {doc}`parametrization` — axes, ids, marks, and selection.
 - {doc}`running` — repeat counts, ordering, throttling, parallelism.

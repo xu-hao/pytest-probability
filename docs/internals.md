@@ -23,7 +23,7 @@ pytest_collect_file            (file name matches prob_pattern)
 
 BenchItem.runtest()            (one (case, run) execution)
   ├─ optional inter-run delay
-  ├─ drive the bench_* generator, duck-type each step into a dict
+  ├─ run the bench_* body; classify by exception type
   ├─ publish ("probability", {...}) onto item.user_properties
   └─ raise StepFailures / let exceptions propagate
 
@@ -99,25 +99,38 @@ deliberately, not accidentally.
 
 ## Execution
 
-`BenchItem.runtest()` drives `bench_fn(**params)` and converts each
-yielded object to a plain dict immediately (`_step_to_dict`), via
-`getattr` with defaults — this is where the duck-typing contract is
-enforced. `usage` entries (objects or dicts) are normalized per model,
-and the step's cost is its explicit `cost` if set, else the sum of its
-usage entries' costs.
+`BenchItem.runtest()` calls `bench_fn(**params)` — a plain test body —
+inside a try that classifies the outcome:
 
-Outcome mapping:
+- **Clean return** → pass. (A returned generator is rejected with a
+  loud `TypeError`: the pre-0.2.0 yield-based style would otherwise
+  silently pass without executing.)
+- **`AssertionError`** → fail; the first line of the assert message is
+  kept as the run's `message`, then the exception re-raises so pytest
+  renders its normal traceback — pointing at the actual `assert`.
+- **Any other `Exception`** → error; recorded as
+  `"TypeError: …"`-style text, then re-raised.
+- **`BaseException` control flow** (`pytest.skip`, `pytest.fail`,
+  KeyboardInterrupt) is not caught: those runs are not samples and are
+  never recorded.
 
-- **All steps passed** → the item passes.
-- **Some step has `passed=False`** → after the generator is exhausted,
-  `StepFailures` is raised. `repr_failure()` intercepts it and returns
-  one line per failed step instead of a traceback — there is no
-  meaningful stack for "the model answered wrong".
-- **The bench function raises** → a synthetic failed step labeled
-  `error` (with the exception text) is appended so the aggregate still
-  counts the run, results are published, and the exception is
-  re-raised for pytest's normal traceback rendering. Steps yielded
-  before the crash are preserved.
+Around the call, `runtest()` starts a `perf_counter` clock (the run's
+`elapsed`) and installs a `_RunRecorder` into a `ContextVar` —
+`record_usage()`/`record_cost()` resolve it and append. The
+`finally` block publishes the record whatever the outcome, which is
+why usage recorded before a failing assert survives. The ContextVar
+(rather than a global) keeps concurrent in-process runs isolated.
+
+**Assertion rewriting** is wired in at import: `_compile_bench_source`
+parses the module to an AST, runs it through pytest's rewriter
+(`_pytest.assertion.rewrite.rewrite_asserts` — one deliberate internal
+import, guarded so the plugin degrades to plain asserts if it ever
+moves), and compiles the result itself. The rewritten code is
+self-contained (it imports its helpers at module top), and pytest's
+own `pytest_runtest_protocol` wrapper installs the comparison hooks
+around every item — including ours — so bare asserts report operands
+and diffs exactly as in `test_*.py`. `--assert=plain` and a
+`PYTEST_DONT_REWRITE` docstring opt out, matching pytest.
 
 The inter-run delay also lives at the top of `runtest()`. A
 `StashKey[bool]` on `config` marks "the first benchmark item already
@@ -130,7 +143,9 @@ throttles its own stream.
 `runtest()` ends by appending one tuple to `item.user_properties`:
 
 ```python
-("probability", {"case": case, "run": run_id, "steps": [ ... ]})
+("probability", {"case": case, "run": run_id, "outcome": "fail",
+                 "message": ..., "error": None, "elapsed": 0.41,
+                 "cost": 0.0002, "usage": [ ... ]})
 ```
 
 Alternatives considered and rejected:
@@ -143,9 +158,9 @@ Alternatives considered and rejected:
 `user_properties` is the sanctioned escape hatch: pytest copies it onto
 the `TestReport`, and xdist serializes reports from workers to the
 controller. The constraint it imposes is that values must survive that
-serialization — hence **plain dicts and scalars only**, enforced by
-converting steps to dicts at yield time. If you extend the payload,
-keep it JSON-shaped.
+serialization — hence **plain dicts and scalars only** (usage entries
+are normalized to dicts as they are recorded). If you extend the
+payload, keep it JSON-shaped.
 
 ## Aggregation and output
 
@@ -154,12 +169,10 @@ keep it JSON-shaped.
 methods get called with no global state.
 
 - `pytest_runtest_logreport` filters for `when == "call"` reports,
-  unpacks the `"probability"` user property, and folds each step into
-  an `OrderedDict[(case, label) → CaseStats]`. Counting rules: a step
-  with non-`None` `error` increments `errors`; otherwise `passed`
-  picks between `passes` and `fails`. Cost sums when present, and
-  `usage` entries merge into a per-model aggregate on the row. Row
-  order is therefore first-encounter order of results.
+  unpacks the `"probability"` user property, and folds each run into
+  an `OrderedDict[case → CaseStats]` by its `outcome` class. Cost sums
+  when present, and `usage` entries merge into a per-model aggregate
+  on the row. Row order is therefore first-encounter order of results.
 - `pytest_terminal_summary` renders the table with fractions
   right-aligned across rows, colors by status (green/yellow/red), and
   appends the `Overall`/`Cost`/`Tokens`/`Report` footer lines (the
@@ -190,8 +203,9 @@ down and users rely on:
    `-k` and `--deselect`.
 3. Parametrize ids and ordering match real pytest for the same
    decorators.
-4. A failing step never produces a traceback; a raising bench function
-   always does, and still counts in the aggregate.
+4. Outcome classes are exception-derived and exact: `AssertionError` →
+   fail, other `Exception` → error, `pytest.skip`/control-flow → not a
+   sample. Usage recorded before the exception is never lost.
 5. Files matching the pattern but lacking `bench_*` functions collect
    nothing, silently.
 6. The summary section appears only when benchmark items ran; regular

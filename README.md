@@ -16,11 +16,11 @@ fraction per case, so `7/10 FLAKY` stops hiding inside a green checkmark.
 $ pytest benchmarks/ --prob-runs=10
 ...
 ================================= probability ==================================
-  [classify::is_question] classify           10/10  $0.0020
-  [classify::identify_pii] classify           7/10  $0.0020  FLAKY
-  [classify::extract_amount] classify         0/10  $0.0020  FAIL
-  [triage::refund-terse] triage              8/10  $0.0010  FLAKY
-  [triage::refund-chain_of_thought] triage  10/10  $0.0040
+  classify::is_question            10/10  $0.0020
+  classify::identify_pii            7/10  $0.0020  FLAKY
+  classify::extract_amount          0/10  $0.0020  FAIL
+  triage::refund-terse              8/10  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  $0.0040
 
   Overall: 35/50 passed (70%)
   Cost:    $0.0110
@@ -52,14 +52,13 @@ and pytest 7.4+.
 
 Benchmark files are named `bench_*.py`, and every `bench_*` function in
 them is a benchmark — the same convention pytest applies to `test_*`.
-There is no plugin syntax to learn: cases are stock
+**A bench function is a pytest test body**: cases are stock
 `@pytest.mark.parametrize`, values arrive as function arguments, and
-the function yields one result per step instead of asserting:
+the body asserts:
 
 ```python
-import time
 import pytest
-from pytest_probability import StepResult
+from pytest_probability import record_cost
 
 @pytest.mark.parametrize("text,expected", [
     pytest.param("is this a question?", "question", id="is_question"),
@@ -67,15 +66,16 @@ from pytest_probability import StepResult
                  marks=pytest.mark.fast),
 ])
 def bench_classify(text, expected):
-    t0 = time.time()
     answer = my_classifier(text)
-    yield StepResult(
-        label="classify",
-        passed=(answer == expected),
-        elapsed=time.time() - t0,
-        cost=0.0002,          # optional — summed into the report
-    )
+    record_cost(0.0002)                   # optional — summed into the report
+    assert answer == expected
 ```
+
+A run's class falls straight out of Python: a clean return **passes**,
+an `AssertionError` **fails** (wrong answer — with pytest's full
+assertion introspection, `assert 'other' == 'pii'`), any other
+exception **errors** (broken harness). The plugin times each run
+itself.
 
 Every parameter combination is a case with its own fraction row,
 namespaced by function (`classify::identify_pii`); items collect as
@@ -101,7 +101,7 @@ thresholds) on their own axes and each combination gets its own row:
 
 ```python
 import pytest
-from pytest_probability import StepResult, TokenUsage
+from pytest_probability import record_usage
 
 @pytest.mark.parametrize("style", ["terse", "chain_of_thought"])
 @pytest.mark.parametrize("text", [
@@ -109,19 +109,16 @@ from pytest_probability import StepResult, TokenUsage
 ])
 def bench_triage(text, style):
     response = my_classifier(text, prompt_style=style)
-    yield StepResult(
-        label="triage",
-        passed=response.answer == "billing",
-        usage=[TokenUsage(model=response.model,
-                          input_tokens=response.input_tokens,
-                          output_tokens=response.output_tokens,
-                          cost=response.cost)],
-    )
+    record_usage(model=response.model,
+                 input_tokens=response.input_tokens,
+                 output_tokens=response.output_tokens,
+                 cost=response.cost)      # survives a failing assert
+    assert response.answer == "billing"
 ```
 
 ```
-  [triage::refund-terse] triage              8/10  $0.0010  FLAKY
-  [triage::refund-chain_of_thought] triage  10/10  $0.0040
+  triage::refund-terse              8/10  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  $0.0040
 ```
 
 ## Options

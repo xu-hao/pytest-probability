@@ -4,93 +4,92 @@ import time
 
 BENCH_OK = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("word", ["alpha", "beta"])
 def bench_check(word):
-    yield StepResult(label="check", passed=True)
+    assert word in ("alpha", "beta")
 """
 
 BENCH_FLAKY = """
 import pytest
-from pytest_probability import StepResult
 
 _calls = {"n": 0}
 
 @pytest.mark.parametrize("word", ["wobbly"])
 def bench_check(word):
     _calls["n"] += 1
-    yield StepResult(label="check", passed=_calls["n"] % 2 == 0)
+    assert _calls["n"] % 2 == 0
 """
 
 BENCH_FAIL_MSG = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("word", ["bad"])
 def bench_check(word):
-    yield StepResult(label="classify", passed=False,
-                     message="expected refund got billing")
+    answer = "billing"
+    assert answer == "refund", f"got '{answer}'"
 """
 
 BENCH_COST = """
 import pytest
-from pytest_probability import StepResult
+from pytest_probability import record_cost
 
 @pytest.mark.parametrize("word", ["paid"])
 def bench_call(word):
-    yield StepResult(label="llm", passed=True, cost=0.05)
+    record_cost(0.05)
+    assert True
 """
 
 BENCH_USAGE = """
 import pytest
-from pytest_probability import StepResult, TokenUsage
+from pytest_probability import TokenUsage, record_cost, record_usage
 
 @pytest.mark.parametrize("word", ["paid"])
 def bench_call(word):
-    yield StepResult(label="llm", passed=True, usage=[
-        TokenUsage(model="m-small", input_tokens=100, output_tokens=20,
-                   cost=0.01),
-        # plain dicts are accepted too (duck-typed)
-        {"model": "m-big", "input_tokens": 50, "output_tokens": 5,
-         "cached_input_tokens": 30, "cost": 0.04},
-    ])
+    record_usage(TokenUsage(model="m-small", input_tokens=100, output_tokens=20,
+                            cost=0.01))
+    # plain dicts and keyword form are accepted too (duck-typed)
+    record_usage({"model": "m-big", "input_tokens": 50, "output_tokens": 5,
+                  "cached_input_tokens": 30, "cost": 0.04})
+    assert True
 
-@pytest.mark.parametrize("word", ["override"])
-def bench_override(word):
-    # explicit cost wins over the usage-derived sum
-    yield StepResult(label="llm", passed=True, cost=0.2, usage=[
-        TokenUsage(model="m-small", input_tokens=10, output_tokens=1,
-                   cost=0.5),
-    ])
+@pytest.mark.parametrize("word", ["extra"])
+def bench_extra(word):
+    # run cost = record_cost amounts + usage entry costs
+    record_cost(0.2)
+    record_usage(model="m-small", input_tokens=10, output_tokens=1, cost=0.5)
+    assert True
 """
 
-BENCH_DUCK_TYPED = """
+BENCH_USAGE_SURVIVES_FAILURE = """
 import pytest
+from pytest_probability import record_usage
 
-class Step:
-    label = "quack"
-    passed = True
-
-@pytest.mark.parametrize("word", ["ducky"])
-def bench_duck(word):
-    yield Step()
+@pytest.mark.parametrize("word", ["expensive_wrong"])
+def bench_call(word):
+    record_usage(model="m-big", input_tokens=100, output_tokens=10, cost=0.03)
+    assert False, "wrong answer"
 """
 
 BENCH_ERROR = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("word", ["crashy"])
 def bench_check(word):
-    yield StepResult(label="ok", passed=True)
     raise RuntimeError("boom")
+"""
+
+BENCH_OLD_GENERATOR = """
+import pytest
+
+@pytest.mark.parametrize("word", ["legacy"])
+def bench_check(word):
+    yield word
 """
 
 BENCH_LIFECYCLE = """
 import pytest
 from pathlib import Path
-from pytest_probability import StepResult
 
 LOG = Path(__file__).parent / "lifecycle.log"
 
@@ -103,24 +102,22 @@ def teardown():
 
 @pytest.mark.parametrize("word", ["a", "b"])
 def bench_check(word):
-    yield StepResult(label="check", passed=True)
+    assert True
 """
 
 BENCH_MARKED_CASES = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("word", [
     pytest.param("fast_one", marks=pytest.mark.fast),
     pytest.param("slow_one", marks=pytest.mark.slow),
 ])
 def bench_check(word):
-    yield StepResult(label="check", passed=True)
+    assert True
 """
 
 BENCH_MULTI_ARGNAMES = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("text,expected", [
     pytest.param("my ssn is 078-05-1120", "pii", id="identify_pii"),
@@ -128,67 +125,58 @@ from pytest_probability import StepResult
 ])
 def bench_classify(text, expected):
     assert isinstance(text, str)
-    yield StepResult(label="classify", passed=expected in ("pii", "question"))
+    assert expected in ("pii", "question")
 """
 
 BENCH_STACKED = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("lang", ["en", "de"])
 @pytest.mark.parametrize("model", ["small", "large"])
 def bench_x(model, lang):
     assert model in ("small", "large") and lang in ("en", "de")
-    yield StepResult(label="check", passed=True)
 """
 
 BENCH_VARIANT_PARAM_ID = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("threshold", [
     pytest.param(0.5, id="loose"),
     pytest.param(0.9, id="strict", marks=pytest.mark.skip(reason="not yet")),
 ])
 def bench_t(threshold):
-    yield StepResult(label="check", passed=threshold == 0.5)
+    assert threshold == 0.5
 """
 
 BENCH_FN_SKIP = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.skip(reason="flaky infra")
 @pytest.mark.parametrize("word", ["a", "b"])
 def bench_check(word):
-    yield StepResult(label="check", passed=False)
+    assert False
 """
 
 BENCH_UNPARAMETRIZED = """
-from pytest_probability import StepResult
-
 def bench_smoke():
-    yield StepResult(label="check", passed=True)
+    assert True
 """
 
 BENCH_MULTI_FN = """
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("word", ["shared"])
 def bench_first(word):
-    yield StepResult(label="check", passed=True)
+    assert True
 
 @pytest.mark.parametrize("word", ["shared"])
 def bench_second(word):
-    yield StepResult(label="check", passed=False)
+    assert False
 """
 
 BENCH_OLD_STYLE = """
-from pytest_probability import StepResult
-
 def bench(word):   # not bench_* prefixed -> not a benchmark
-    yield StepResult(label="check", passed=True)
+    assert True
 """
 
 
@@ -210,8 +198,8 @@ def test_multiple_bench_functions_per_file(pytester):
     result = pytester.runpytest()
     result.assert_outcomes(passed=1, failed=1)
     # same case id, distinct rows namespaced by function
-    result.stdout.fnmatch_lines(["*first::shared* check*1/1*"])
-    result.stdout.fnmatch_lines(["*second::shared* check*0/1  FAIL*"])
+    result.stdout.fnmatch_lines(["*first::shared*1/1*"])
+    result.stdout.fnmatch_lines(["*second::shared*0/1  FAIL*"])
 
 
 def test_k_selects_bench_function(pytester):
@@ -226,7 +214,7 @@ def test_unparametrized_function_is_one_case(pytester):
     result.stdout.fnmatch_lines(["*bench_smoke.py::bench_smoke::run1*"])
     result = pytester.runpytest("--prob-runs=3")
     result.assert_outcomes(passed=3)
-    result.stdout.fnmatch_lines(["*smoke* check  3/3*"])
+    result.stdout.fnmatch_lines(["*smoke*3/3*"])
 
 
 def test_non_prefixed_functions_not_collected(pytester):
@@ -246,7 +234,7 @@ def test_non_bench_python_files_untouched(pytester):
 
 
 # ---------------------------------------------------------------------------
-# Runs and fractions
+# Outcomes: assert -> fail, exception -> error
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +258,7 @@ def test_fraction_and_flaky_in_summary(pytester):
     result.assert_outcomes(passed=1, failed=1)
     assert result.ret == 1
     result.stdout.fnmatch_lines(
-        ["*= probability =*", "*check::wobbly* check  1/2  FLAKY*"]
+        ["*= probability =*", "*check::wobbly  1/2  FLAKY*"]
     )
     result.stdout.fnmatch_lines(["*Overall: 1/2 passed (50%)*"])
 
@@ -280,18 +268,39 @@ def test_all_passing_summary_and_exit_code(pytester):
     result = pytester.runpytest("--prob-runs=2")
     result.assert_outcomes(passed=4)
     assert result.ret == 0
-    result.stdout.fnmatch_lines(
-        ["*check::alpha* check  2/2*", "*Overall: 4/4 passed (100%)*"]
-    )
+    result.stdout.fnmatch_lines(["*check::alpha  2/2*", "*Overall: 4/4 passed (100%)*"])
 
 
-def test_step_failure_repr_is_compact(pytester):
+def test_assert_failure_shows_native_traceback(pytester):
     pytester.makepyfile(bench_bad=BENCH_FAIL_MSG)
-    result = pytester.runpytest()
+    result = pytester.runpytest("--prob-json=report.json")
     result.assert_outcomes(failed=1)
-    result.stdout.fnmatch_lines(
-        ["*step 'classify' failed: expected refund got billing*"]
-    )
+    # the real assert line and message, straight from pytest
+    result.stdout.fnmatch_lines(["*AssertionError: got 'billing'*"])
+    result.stdout.fnmatch_lines(["*check::bad  0/1  FAIL*"])
+
+    import json
+
+    data = json.loads((pytester.path / "report.json").read_text())
+    (rec,) = data["records"]
+    assert rec["outcome"] == "fail"
+    assert rec["message"] == "got 'billing'"
+    assert rec["error"] is None
+
+
+def test_exception_is_the_error_class(pytester):
+    pytester.makepyfile(bench_crash=BENCH_ERROR)
+    result = pytester.runpytest("--prob-json=report.json")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*check::crashy  0/1  ERROR*"])
+    result.stdout.fnmatch_lines(["*RuntimeError: boom*"])
+
+    import json
+
+    data = json.loads((pytester.path / "report.json").read_text())
+    (rec,) = data["records"]
+    assert rec["outcome"] == "error"
+    assert rec["error"] == "RuntimeError: boom"
 
 
 def test_errored_runs_are_a_distinct_class(pytester):
@@ -300,7 +309,6 @@ def test_errored_runs_are_a_distinct_class(pytester):
     pytester.makepyfile(
         bench_shaky="""
 import pytest
-from pytest_probability import StepResult
 
 _calls = {"n": 0}
 
@@ -308,42 +316,74 @@ _calls = {"n": 0}
 def bench_check(word):
     _calls["n"] += 1
     if _calls["n"] == 2:
-        yield StepResult(label="check", passed=False, error="API timeout")
-    else:
-        yield StepResult(label="check", passed=True)
+        raise ConnectionError("API timeout")
+    assert True
 """
     )
     result = pytester.runpytest("--prob-runs=3", "--prob-json=report.json")
     result.assert_outcomes(passed=2, failed=1)
     # three run classes: 2 pass, 0 fail, 1 error -> 2/3 with the error
     # class named, never a 100%-looking row
-    result.stdout.fnmatch_lines(["*shaky_api* check  2/3  1 ERRORED*"])
+    result.stdout.fnmatch_lines(["*shaky_api  2/3  1 ERRORED*"])
     result.stdout.fnmatch_lines(["*Overall: 2/3 passed (67%), 1 errored*"])
 
     data = json.loads((pytester.path / "report.json").read_text())
     (row,) = data["rows"]
     assert (row["passes"], row["fails"], row["errors"]) == (2, 0, 1)
-    assert row["total"] == 3
-    assert 66 < row["pass_rate"] < 67
     assert row["status"] == "errored"
-    assert data["totals"]["errors"] == 1
-    assert 66 < data["totals"]["pass_rate"] < 67
+    assert 66 < row["pass_rate"] < 67
 
 
-def test_exception_becomes_error_step(pytester):
-    pytester.makepyfile(bench_crash=BENCH_ERROR)
+def test_assertion_rewriting_gives_introspection(pytester):
+    import json
+
+    pytester.makepyfile(
+        bench_rw="""
+import pytest
+
+@pytest.mark.parametrize("word", ["intro"])
+def bench_check(word):
+    answer = "other"
+    expected = "pii"
+    assert answer == expected
+"""
+    )
+    result = pytester.runpytest("--prob-json=report.json")
+    result.assert_outcomes(failed=1)
+    # pytest's assertion rewriter ran on the bench module: a bare
+    # assert reports both operands
+    result.stdout.fnmatch_lines(["*assert 'other' == 'pii'*"])
+
+    data = json.loads((pytester.path / "report.json").read_text())
+    assert data["records"][0]["message"] == "assert 'other' == 'pii'"
+
+
+def test_pytest_dont_rewrite_docstring_opt_out(pytester):
+    import json
+
+    pytester.makepyfile(
+        bench_plain='''
+"""PYTEST_DONT_REWRITE"""
+import pytest
+
+@pytest.mark.parametrize("word", ["plain"])
+def bench_check(word):
+    assert "other" == "pii"
+'''
+    )
+    result = pytester.runpytest("--prob-json=report.json")
+    result.assert_outcomes(failed=1)
+    data = json.loads((pytester.path / "report.json").read_text())
+    # bare AssertionError, no rewritten message
+    assert data["records"][0]["message"] is None
+
+
+def test_legacy_generator_bench_errors_loudly(pytester):
+    pytester.makepyfile(bench_legacy=BENCH_OLD_GENERATOR)
     result = pytester.runpytest()
     result.assert_outcomes(failed=1)
-    result.stdout.fnmatch_lines(["*check::crashy* ok     1/1*"])
-    result.stdout.fnmatch_lines(["*check::crashy* error  0/1  ERROR*"])
-    result.stdout.fnmatch_lines(["*RuntimeError: boom*"])
-
-
-def test_duck_typed_steps(pytester):
-    pytester.makepyfile(bench_duck=BENCH_DUCK_TYPED)
-    result = pytester.runpytest()
-    result.assert_outcomes(passed=1)
-    result.stdout.fnmatch_lines(["*duck::ducky* quack  1/1*"])
+    result.stdout.fnmatch_lines(["*use assert instead of yielding*"])
+    result.stdout.fnmatch_lines(["*check::legacy  0/1  ERROR*"])
 
 
 def test_module_setup_teardown_run_once(pytester):
@@ -359,24 +399,24 @@ def test_module_setup_teardown_run_once(pytester):
 # ---------------------------------------------------------------------------
 
 
-def test_cost_scalar_in_summary(pytester):
+def test_record_cost_in_summary(pytester):
     pytester.makepyfile(bench_cost=BENCH_COST)
     result = pytester.runpytest()
     result.assert_outcomes(passed=1)
-    result.stdout.fnmatch_lines(["*call::paid* llm  1/1  $0.0500*"])
+    result.stdout.fnmatch_lines(["*call::paid  1/1  $0.0500*"])
     result.stdout.fnmatch_lines(["*Cost:    $0.0500*"])
 
 
-def test_detailed_usage_per_model(pytester):
+def test_record_usage_per_model(pytester):
     import json
 
     pytester.makepyfile(bench_usage=BENCH_USAGE)
     result = pytester.runpytest("--prob-json=report.json")
     result.assert_outcomes(passed=2)
-    # row cost derives from usage when cost is unset
-    result.stdout.fnmatch_lines(["*call::paid* llm*$0.0500*"])
-    # explicit cost wins over usage-derived sum
-    result.stdout.fnmatch_lines(["*override::override* llm*$0.2000*"])
+    # run cost derives from usage entries
+    result.stdout.fnmatch_lines(["*call::paid*$0.0500*"])
+    # record_cost adds to usage costs
+    result.stdout.fnmatch_lines(["*extra::extra*$0.7000*"])
     # per-model token breakdown, cached shown only when non-zero
     result.stdout.fnmatch_lines(["*Tokens:  m-small  110 in / 21 out*$0.5100*"])
     result.stdout.fnmatch_lines(["*m-big    50 in / 5 out / 30 cached  $0.0400*"])
@@ -386,9 +426,40 @@ def test_detailed_usage_per_model(pytester):
     assert paid_row["usage"]["m-small"]["input_tokens"] == 100
     assert paid_row["usage"]["m-big"]["cached_input_tokens"] == 30
     assert data["totals"]["usage"]["m-small"]["input_tokens"] == 110
-    assert data["totals"]["cost"] == 0.25
-    step = data["records"][0]["steps"][0]
-    assert {u["model"] for u in step["usage"]} == {"m-small", "m-big"}
+    assert abs(data["totals"]["cost"] - 0.75) < 1e-9
+    (rec,) = [r for r in data["records"] if r["case"] == "call::paid"]
+    assert {u["model"] for u in rec["usage"]} == {"m-small", "m-big"}
+    assert rec["elapsed"] > 0
+
+
+def test_usage_survives_failing_assert(pytester):
+    import json
+
+    pytester.makepyfile(bench_spent=BENCH_USAGE_SURVIVES_FAILURE)
+    result = pytester.runpytest("--prob-json=report.json")
+    result.assert_outcomes(failed=1)
+    # the run failed, but the money it spent is still on the row
+    result.stdout.fnmatch_lines(["*call::expensive_wrong  0/1  $0.0300  FAIL*"])
+
+    data = json.loads((pytester.path / "report.json").read_text())
+    (rec,) = data["records"]
+    assert rec["outcome"] == "fail"
+    assert rec["usage"][0]["cost"] == 0.03
+
+
+def test_record_usage_outside_run_raises(pytester):
+    pytester.makepyfile(
+        test_outside="""
+import pytest
+from pytest_probability import record_usage
+
+def test_outside():
+    with pytest.raises(RuntimeError, match="outside a bench run"):
+        record_usage(model="m", input_tokens=1)
+"""
+    )
+    result = pytester.runpytest()
+    result.assert_outcomes(passed=1)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +493,7 @@ def test_multi_argname_values_arrive_as_arguments(pytester):
     )
     result = pytester.runpytest()
     result.assert_outcomes(passed=2)
-    result.stdout.fnmatch_lines(["*classify::identify_pii* classify*1/1*"])
+    result.stdout.fnmatch_lines(["*classify::identify_pii*1/1*"])
 
 
 def test_stacked_decorators(pytester):
@@ -434,14 +505,14 @@ def test_stacked_decorators(pytester):
     )
     result = pytester.runpytest()
     result.assert_outcomes(passed=4)
-    result.stdout.fnmatch_lines(["*x::small-en* check*1/1*"])
+    result.stdout.fnmatch_lines(["*x::small-en*1/1*"])
 
 
 def test_pytest_param_id_and_marks(pytester):
     pytester.makepyfile(bench_ids=BENCH_VARIANT_PARAM_ID)
     result = pytester.runpytest()
     result.assert_outcomes(passed=1, skipped=1)
-    result.stdout.fnmatch_lines(["*t::loose* check*1/1*"])
+    result.stdout.fnmatch_lines(["*t::loose*1/1*"])
 
 
 def test_function_level_skip_mark(pytester):
@@ -513,14 +584,13 @@ def test_json_report(pytester):
     assert data["totals"]["count"] == 2
     (row,) = data["rows"]
     assert row["case"] == "check::wobbly"
-    assert row["label"] == "check"
     assert row["status"] == "flaky"
     assert (row["passes"], row["fails"], row["total"]) == (1, 1, 2)
     assert row["usage"] == {}
     assert len(data["records"]) == 2
     assert {r["run"] for r in data["records"]} == {1, 2}
-    assert data["records"][0]["case"] == "check::wobbly"
-    assert data["records"][0]["steps"][0]["label"] == "check"
+    assert {r["outcome"] for r in data["records"]} == {"pass", "fail"}
+    assert all(r["case"] == "check::wobbly" for r in data["records"])
 
 
 def test_no_json_report_by_default(pytester):

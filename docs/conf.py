@@ -3,8 +3,8 @@
 project = "pytest-probability"
 author = "Hao Xu"
 copyright = "2026, Hao Xu"
-release = "0.1.0"
-version = "0.1.0"
+release = "0.2.0"
+version = "0.2.0"
 
 extensions = [
     "myst_parser",

@@ -14,11 +14,11 @@ inside a green checkmark.
 $ pytest benchmarks/ --prob-runs=10
 ...
 ================================= probability ==================================
-  [classify::is_question] classify          10/10  $0.0020
-  [classify::identify_pii] classify          7/10  $0.0020  FLAKY
-  [classify::extract_amount] classify        0/10  $0.0020  FAIL
-  [triage::refund-terse] triage              8/10  $0.0010  FLAKY
-  [triage::refund-chain_of_thought] triage  10/10  $0.0040
+  classify::is_question            10/10  $0.0020
+  classify::identify_pii            7/10  $0.0020  FLAKY
+  classify::extract_amount          0/10  $0.0020  FAIL
+  triage::refund-terse              8/10  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  $0.0040
 
   Overall: 35/50 passed (70%)
   Cost:    $0.0110
@@ -44,14 +44,12 @@ case
 run
 : One execution of a case — one pytest item
   (`bench_x.py::bench_classify::identify_pii[run3]`). Lands in exactly
-  one of three classes: pass, fail, or error.
-
-step
-: One yielded `StepResult` within a run — a labeled check.
+  one of three classes: a clean return **passes**, an `AssertionError`
+  **fails**, any other exception **errors**.
 
 row
-: The aggregate of all runs of one `(case, step label)` pair — a
-  fraction, a status, and a cost in the summary table.
+: The aggregate of all runs of one case — a fraction, a status, and a
+  cost in the summary table.
 
 ## Why fractions?
 
@@ -90,9 +88,10 @@ up the gap.
 - **Fractions per combination** — every parameter combination gets its
   own row and pass fraction, stacked axes cross-product with pytest's
   exact id rules, and an unparametrized function runs as a single case.
-- **Cost and token accounting** — attach a `cost` or per-model
-  `TokenUsage` entries to any step and get per-row spend plus a
-  per-model input/output/cached token breakdown.
+- **Cost and token accounting** — `record_usage()`/`record_cost()`
+  attribute spend to the current run (surviving failed asserts) and
+  yield per-row cost plus a per-model input/output/cached token
+  breakdown.
 - **Machine-readable output** — `--prob-json` writes fractions,
   statuses, and raw per-run records to a single file.
 - **One dependency: pytest.**

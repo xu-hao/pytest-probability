@@ -52,27 +52,23 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 Everything importable lives in the top-level package:
 
 ```python
-from pytest_probability import StepResult, TokenUsage
+from pytest_probability import TokenUsage, record_cost, record_usage
 ```
 
-### `StepResult`
+### `record_usage(usage=None, /, **fields)`
 
-```python
-@dataclass
-class StepResult:
-    label: str
-    passed: bool
-    elapsed: float = 0.0
-    error: str | None = None
-    message: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
-    cost: float | None = None
-    usage: list[TokenUsage] = field(default_factory=list)
-```
+Attribute per-model token usage to the current bench run. Accepts a
+`TokenUsage`, any object or dict with the same field names, or the
+fields directly as keywords. Call once per model call; entries
+aggregate per model. Usage recorded before a failing `assert` is kept
+— spend is never lost to a wrong answer. Raises `RuntimeError` outside
+a bench run.
 
-One yielded step of a bench function. See {doc}`cases` for field
-semantics. Steps are duck-typed — `label` and `passed` are the only
-attributes that must exist.
+### `record_cost(amount)`
+
+Add a non-token cost to the current bench run. A run's total cost is
+its `record_cost` amounts plus the `cost` of every usage entry. Raises
+`RuntimeError` outside a bench run.
 
 ### `TokenUsage`
 
@@ -86,16 +82,14 @@ class TokenUsage:
     cost: float = 0.0
 ```
 
-Token accounting for one model's calls within a step; a step's `usage`
-list may carry several. Entries are duck-typed — any object with these
-attribute names, or a plain dict with the same keys, is accepted. See
-{doc}`cost` for aggregation rules.
+Token accounting for one model's calls within a run. See {doc}`cost`
+for aggregation rules.
 
 ## Benchmark module contract
 
 | Name | Required | Contract |
 |---|---|---|
-| `bench_*(**params)` | at least one | a benchmark per function; callable returning an iterable of step objects; cases come from its `parametrize` marks (none → a single case named after the function) |
+| `bench_*(**params)` | at least one | a benchmark per function; an ordinary test body that `assert`s; cases come from its `parametrize` marks (none → a single case named after the function) |
 | `setup()` | no | called once per file, before its first item |
 | `teardown()` | no | called once per file, after its last item |
 
@@ -119,10 +113,12 @@ function's row is just the short name.
 
 ## Row statuses
 
-Every run lands in one of **three classes** — pass, fail, or error —
-and the row status names the combination, so model nondeterminism and
-infrastructure trouble never blur into one word. Fractions render as
-`passes/total`: every run counts.
+Every run lands in one of **three classes**, decided by how the
+function body ends — a clean return **passes**, an `AssertionError`
+**fails**, any other exception **errors** — and the row status names
+the combination, so model nondeterminism and infrastructure trouble
+never blur into one word. Fractions render as `passes/total`: every
+run counts.
 
 | Status | Definition | Color |
 |---|---|---|
@@ -132,9 +128,8 @@ infrastructure trouble never blur into one word. Fractions render as
 | `fail` | no run passed, at least one real failure | red |
 | `error` | every run errored | red |
 
-A run counts as *errored* when its step carried a non-`None` `error`,
-including the synthetic `error` step recorded when the bench function
-raises.
+A run counts as *errored* when the bench function raised anything
+other than `AssertionError`.
 
 The status word is the verdict on your code, derived from the pass/fail
 evidence; errors are an orthogonal fact about the harness and ride as
@@ -159,8 +154,8 @@ the status word.
 
 ```text
 ================================= probability ==================================
-  [classify::identify_pii] classify   7/10  $0.0020  FLAKY
-   \_ function::case-id    \_ label \_ fraction \_ cost \_ status (omitted when pass)
+  classify::identify_pii   7/10  $0.0020  FLAKY
+   \_ function::case-id  \_ fraction  \_ cost  \_ status (omitted when pass)
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Cost:    $0.0110                                 # only when cost was recorded

@@ -13,7 +13,6 @@ fastest, `pytest.param(id=...)` and `ids=` override per value.
 
 ```python
 import pytest
-from pytest_probability import StepResult
 
 @pytest.mark.parametrize("style", ["terse", "chain_of_thought"])
 @pytest.mark.parametrize("text", [
@@ -21,12 +20,12 @@ from pytest_probability import StepResult
 ])
 def bench_triage(text, style):
     answer = my_classifier(text, prompt_style=style)
-    yield StepResult(label="triage", passed=answer == "billing")
+    assert answer == "billing"
 ```
 
 ```text
-  [triage::refund-terse] triage              8/10  $0.0010  FLAKY
-  [triage::refund-chain_of_thought] triage  10/10  $0.0040
+  triage::refund-terse              8/10  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  $0.0040
 ```
 
 Two rows, one comparison: the cheap prompt is a coin flip, the

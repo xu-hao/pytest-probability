@@ -32,7 +32,7 @@ def test_fraction_and_flaky_in_summary(pytester):
     pytester.makepyfile(bench_flaky=BENCH_FLAKY)
     result = pytester.runpytest("--prob-runs=2")
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.fnmatch_lines(["*= probability =*", "*wobbly* check  1/2  FLAKY*"])
+    result.stdout.fnmatch_lines(["*= probability =*", "*check::wobbly  1/2  FLAKY*"])
 ```
 
 Conventions that keep the suite honest:
