@@ -1,7 +1,6 @@
 # pytest-probability
 
-**A test that passes 7 times out of 10 is not a passing test — it's a
-probability.**
+**A semantic bug won't reproduce in one run — and can't hide from ten.**
 
 pytest-probability is a pytest plugin for testing nondeterministic code:
 LLM-driven functions, model inference, integration points, anything
@@ -120,6 +119,18 @@ four times the price. Select one arm with `-k terse`, add a third
 prompt by adding a string, compare models the same way with a second
 axis.
 
+## Benchmark-driven development
+
+The workflow this enables is TDD with the instrument swapped: for a
+semantic function, **red is a low fraction, green is a fraction meeting
+your bar, and refactor means beating the incumbent prompt on an axis.**
+When a prompt fails in production, the loop starts from the incident:
+turn the verbatim input into a case, sample it — `6/10 FLAKY` *is* the
+reproduction a single playground retry would have closed as "cannot
+reproduce" — fix against the incumbent on the same table, and keep the
+case forever as a regression sentinel. The full loop, worked end to
+end: {doc}`bdd`.
+
 ## Highlights
 
 - **One pytest item per (case, run)** — `-k`, `-m`, `-x`, `--lf`, JUnit
@@ -149,6 +160,7 @@ axis.
 
 installation
 quickstart
+bdd
 cases
 parametrization
 running

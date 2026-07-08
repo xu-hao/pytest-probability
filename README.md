@@ -4,13 +4,23 @@
 [![PyPI](https://img.shields.io/pypi/v/pytest-probability)](https://pypi.org/project/pytest-probability/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A test that passes 7 times out of 10 is not a passing test — it's a probability.**
+**A semantic bug won't reproduce in one run — and can't hide from ten.**
 
 A pytest plugin for nondeterministic code — LLM-driven functions, model
 inference, integration points, anything flaky-prone. A single-shot test lies
 to you: it samples a distribution once and calls the result truth.
 pytest-probability runs every case N times and reports the empirical pass
 fraction per case, so `7/10 FLAKY` stops hiding inside a green checkmark.
+
+This enables **benchmark-driven development** for semantic functions —
+TDD with the instrument swapped: red is a low fraction, green is a
+fraction meeting your bar, refactor means beating the incumbent prompt
+on a comparison axis. When a prompt fails in production, turn the
+verbatim input into a case and sample it: the `6/10 FLAKY` row *is* the
+reproduction that a single playground retry would have closed as
+"cannot reproduce" — and the case stays in CI forever as a regression
+sentinel. The worked loop:
+[Benchmark-driven development](https://pytest-probability.readthedocs.io/en/latest/bdd.html).
 
 ```
 $ pytest benchmarks/ --prob-runs=10

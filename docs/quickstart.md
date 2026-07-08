@@ -97,6 +97,8 @@ case splits into `-small` / `-large` rows.
 
 ## 5. Where to go next
 
+- {doc}`bdd` — the development loop: reproduce a production prompt
+  failure as a fraction, fix it on an axis, guard it forever.
 - {doc}`cases` — the full benchmark-file contract, run outcomes,
   lifecycle hooks, error semantics.
 - {doc}`parametrization` — axes, ids, marks, and selection.
