@@ -75,6 +75,51 @@ The fraction is always over all runs — `7/10` never dresses up as
 `7/7` — while the status word tells you *which kind* of trouble made
 up the gap.
 
+## A/B-testing two prompts
+
+The bread-and-butter use: put the prompts on a parametrize axis, and
+every case splits into one fraction row per prompt — same inputs, same
+sample size, cost attached:
+
+```python
+import pytest
+from pytest_probability import record_usage
+
+PROMPTS = {
+    "terse": "Category for: {text}. One word.",
+    "chain_of_thought": "Think step by step, then categorize: {text}",
+}
+
+@pytest.mark.parametrize("prompt", ["terse", "chain_of_thought"])
+@pytest.mark.parametrize("text", [
+    pytest.param("my card was charged twice", id="refund"),
+])
+def bench_triage(text, prompt):
+    response = llm.complete(PROMPTS[prompt].format(text=text))
+    record_usage(model=response.model,
+                 input_tokens=response.input_tokens,
+                 output_tokens=response.output_tokens,
+                 cost=response.cost)
+    assert response.category == "billing"
+```
+
+```text
+$ pytest bench_triage.py --prob-runs=10
+...
+  triage::refund-terse              8/10  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  $0.0040
+
+  Overall: 18/20 passed (90%)
+  Cost:    $0.0050
+  Tokens:  m-small  1,200 in / 80 out / 640 cached  $0.0010
+           m-large  4,800 in / 900 out              $0.0040
+```
+
+That table is the whole decision: prompt B eliminates the flakiness at
+four times the price. Select one arm with `-k terse`, add a third
+prompt by adding a string, compare models the same way with a second
+axis.
+
 ## Highlights
 
 - **One pytest item per (case, run)** — `-k`, `-m`, `-x`, `--lf`, JUnit

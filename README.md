@@ -93,11 +93,12 @@ pytest benchmarks/ -n 4                 # parallel via pytest-xdist
 
 Module-level `setup()` / `teardown()` run once per benchmark file.
 
-### Comparison axes
+### A/B-testing prompts (comparison axes)
 
 Stacked decorators cross-product with pytest's exact id layout and
-ordering — put the configurations you're comparing (models, prompts,
-thresholds) on their own axes and each combination gets its own row:
+ordering — put the prompts (or models, or thresholds) you're comparing
+on their own axis and each combination gets its own fraction row, same
+inputs, same sample size, cost attached:
 
 ```python
 import pytest
