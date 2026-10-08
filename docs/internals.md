@@ -592,7 +592,11 @@ column notes in `explain.py` (`plan_notes()`, `render_notes()`).
   counting them (so a selected subset of runs is what's planned) and
   taking the case's `Gate` from its first item. Gate numbers don't
   depend on the planned run count, so they are cached per gate with
-  `runs` cleared.
+  `runs` cleared. A case's latency gate (its first item's
+  `LatencySpec`, when `gated`) only raises `min_runs` to
+  `LatencySpec.min_runs()` — `stats.quantile_min_n(quantile, level)`,
+  the same number `_warn_infeasible()` uses; the power columns stay the
+  rate gate's, marked `*` (`_PLAN_LATENCY_MARK`) when both apply.
 - `Gate.critical_passes(n)` is the fewest passes of n with a PASS
   verdict (bisection: verdicts are monotone in the pass count).
   `Gate.power(n, rate)` is `stats.binom_sf(critical − 1, n, rate)`.

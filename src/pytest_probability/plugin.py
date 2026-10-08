@@ -3211,6 +3211,9 @@ _PLAN_ASSUME = 0.97
 _PLAN_FLAKE = "0.1,0.01"
 _PLAN_POWER = 0.8
 _PLAN_CAP = 10_000
+# Suffix on a row's power cells when a latency gate also applies: the
+# numbers are the rate gate's, and the latency gate's runs aren't planned.
+_PLAN_LATENCY_MARK = "*"
 
 
 @dataclass(frozen=True)
@@ -3298,11 +3301,17 @@ class PlanRow:
     """One case's budget. ``runs`` is what would run (selection
     applied); the gate columns are ``None`` for an ungated case, and
     ``power_runs`` also when no run count up to the cap gets there.
-    ``cost_per_run`` is ``None`` when no report priced the case."""
+    ``cost_per_run`` is ``None`` when no report priced the case.
+
+    ``latency`` is the case's latency gate (``None`` without one).
+    ``min_runs`` is then the larger of the two gates' minimums; the
+    power columns stay the rate gate's alone (``None`` without one),
+    since a latency gate's chance would need an assumed run time."""
 
     case: str
     runs: int
     gate: Gate | None
+    latency: LatencySpec | None = None
     min_runs: int | None = None
     power_runs: int | None = None
     chance: float | None = None
@@ -3322,11 +3331,12 @@ def plan_rows(items: Iterable[pytest.Item], pcfg: PlanConfig) -> list[PlanRow]:
     cases: OrderedDict[str, list[Any]] = OrderedDict()
     for item in items:
         if isinstance(item, BenchItem):
-            entry = cases.setdefault(item.case, [0, item.gate])
+            latency = item.latency if item.latency and item.latency.gated else None
+            entry = cases.setdefault(item.case, [0, item.gate, latency])
             entry[0] += 1
     per_gate: dict[Gate, tuple[int, int | None]] = {}
     rows = []
-    for case, (runs, gate) in cases.items():
+    for case, (runs, gate, latency) in cases.items():
         extra: dict[str, Any] = {"cost_per_run": pcfg.costs.get(case)}
         if gate is not None:
             key = dataclasses.replace(gate, runs=0)
@@ -3337,7 +3347,9 @@ def plan_rows(items: Iterable[pytest.Item], pcfg: PlanConfig) -> list[PlanRow]:
                 )
             extra["min_runs"], extra["power_runs"] = per_gate[key]
             extra["chance"] = gate.power(runs, pcfg.assume)
-        rows.append(PlanRow(case, runs, gate, **extra))
+        if latency is not None:
+            extra["min_runs"] = max(extra.get("min_runs", 0), latency.min_runs())
+        rows.append(PlanRow(case, runs, gate, latency, **extra))
     return rows
 
 
@@ -4795,11 +4807,11 @@ class ProbabilityAggregator:
         pcfg = plan_config(self._config)
         level = stats_config(self._config).level
         gated = any(r.gate is not None for r in rows)
+        timed = any(r.latency is not None for r in rows)
+        both = any(r.gate is not None and r.latency is not None for r in rows)
         priced = any(r.cost is not None for r in rows)
 
         def runs_cell(r: PlanRow) -> str:
-            if r.gate is None:
-                return "—"
             if r.power_runs is not None:
                 return f"{r.power_runs:,}"
             if r.gate.rule == "rate" and pcfg.assume <= r.gate.min_rate:
@@ -4807,7 +4819,7 @@ class ProbabilityAggregator:
             return f">{_PLAN_CAP:,}"
 
         header = ["case", "runs"]
-        if gated:
+        if gated or timed:
             header += ["min runs", "runs for 80%", "chance now"]
         header += [f"catch {_pct_bar(f)}" for f in pcfg.flakes]
         if priced:
@@ -4815,11 +4827,15 @@ class ProbabilityAggregator:
         table = []
         for r in rows:
             cells = [_row_name(r), f"{r.runs:,}"]
-            if gated:
+            if gated or timed:
+                least = "—" if r.min_runs is None else f"{r.min_runs:,}"
                 if r.gate is None:
-                    cells += ["—", "—", "—"]
+                    cells += [least, "—", "—"]
                 else:
-                    cells += [f"{r.min_runs:,}", runs_cell(r), _chance(r.chance)]
+                    # The power columns are the rate gate's alone: mark
+                    # them when a latency gate also applies.
+                    mark = _PLAN_LATENCY_MARK if r.latency is not None else ""
+                    cells += [least, runs_cell(r) + mark, _chance(r.chance) + mark]
             cells += [_chance(stats.detection_chance(f, r.runs)) for f in pcfg.flakes]
             if priced:
                 cells.append("" if r.cost is None else f"${r.cost:.4f}")
@@ -4859,6 +4875,9 @@ class ProbabilityAggregator:
             level=level,
             gated=gated,
             report=pcfg.report if priced else None,
+            latency=timed,
+            both=both,
+            mark=_PLAN_LATENCY_MARK,
         )
         for text in explain.render_notes(notes, width):
             tr.write_line(text)
@@ -4867,10 +4886,14 @@ class ProbabilityAggregator:
     def _plan_tone(r: PlanRow) -> str | None:
         # Red: the gate can't pass with these runs; yellow: it passes
         # less than 80% of the time at the assumed rate; green: enough.
-        if r.gate is None:
+        # A latency gate's chance isn't planned, so a latency-only row
+        # above its minimum stays plain.
+        if r.min_runs is None:
             return None
         if r.runs < r.min_runs:
             return "fail"
+        if r.gate is None:
+            return None
         return "pass" if r.chance >= _PLAN_POWER else "flaky"
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:

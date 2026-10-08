@@ -590,7 +590,7 @@ Here `classify` is gated at `min_rate=0.9`, `smoke` at
 | Column | How it is computed |
 |---|---|
 | `runs` | The runs that would execute: the case's run count, after `-k`/`-m` selection (selecting `run1` and `run2` plans 2). |
-| `min runs` | `Gate.min_runs()`, as in the [feasibility warning](#feasibility-warning): the fewest runs whose all-pass result is a PASS verdict. |
+| `min runs` | `Gate.min_runs()`, as in the [feasibility warning](#feasibility-warning): the fewest runs whose all-pass result is a PASS verdict. For a latency gate, `stats.quantile_min_n(quantile, level)`, the fewest runs whose quantile interval has an upper end (72 for p95, 6 for p50, 368 for p99 at 95%); a case with both gates shows the larger. |
 | `runs for 80%` | The smallest n whose *power* — the chance of a PASS verdict when each run passes with probability `--prob-plan-assume` — is at least 80%. Computed exactly: the Binomial(n, rate) probability of every pass count the gate's own `verdict()` calls PASS (the passing counts are one tail, so one boundary per n). Power saw-tooths in n, so every n from `min runs` up is tried; the search stops at 10,000 (`>10,000`). `never` when the assumed rate is at or below a rate gate's bar: then more runs make a PASS *less* likely. |
 | `chance now` | That same power at the planned `runs`. |
 | `catch F` | 1 − (1 − F)^runs, the chance the planned runs show at least one failure when a fraction F of runs fail. The note gives the runs that make it `prob_confidence` (95%): ⌈ln 0.05 / ln(1 − F)⌉ — 29 at 10%, 299 at 1%. |
@@ -605,6 +605,25 @@ Here `classify` is gated at `min_rate=0.9`, `smoke` at
   shows no gate columns.
 - Rows are green when `chance now` is at least 80%, yellow below, and
   red when `runs` is under `min runs` (the gate can't pass).
+- Latency gates (`max_latency=`) are planned only as far as `min runs`:
+  their chance of passing depends on how slow the code really is, which
+  a plan doesn't know. A latency-only case shows its `min runs` and `—`
+  in `runs for 80%` and `chance now`; it is red below `min runs` and
+  plain otherwise. A case with both gates shows the larger `min runs`,
+  and its `runs for 80%` and `chance now` describe the pass-rate gate
+  alone, marked `*` (a column note says so):
+
+  ```text
+    case          runs  min runs  runs for 80%  chance now  catch 10%  catch 1%
+    latency_only    40        72             —           —        99%       33%
+    both            40        72          100*        30%*        99%       33%
+    both_p50       100        36          100*        82%*        99%       63%
+  ```
+
+  Here `both` meets its pass-rate gate's minimum (36) but not its p95
+  latency gate's (72), so the row is red; `both_p50` uses
+  `latency_quantile=0.5`, whose minimum is 6. A suite without latency
+  gates prints exactly what it did before.
 - `prob_errors` doesn't enter the plan: the assumed rate is the chance
   a run passes.
 - The 80% target and the 10,000-run cap are fixed. A rate gate barely

@@ -223,6 +223,13 @@
   `--prob-explain` says why each stopped case could stop and why
   intervals are hidden. Without the option the terminal output and
   exit status are unchanged, and the new JSON fields are `null` or 0.
+- `--prob-plan` includes latency gates: `min runs` is filled in for a
+  `max_latency=` gate (the fewest runs whose quantile interval has an
+  upper end: 72 for p95 at 95%), a case with both gates shows the larger
+  minimum and turns red below it, and its pass-rate power cells are
+  marked `*` because the latency gate's runs aren't planned. A
+  latency-only case shows `—` for `runs for 80%` and `chance now`.
+  Output is unchanged for suites without latency gates.
 
 ## 0.2.0 (2026-07-08)
 
