@@ -105,6 +105,7 @@ PROMPTS = {
            "category word only.\n\nMessage: {text}"),
 }
 
+@pytest.mark.probability(compare="prompt")         # v2 against v1, per case
 @pytest.mark.parametrize("prompt", ["v1", "v2"])
 @pytest.mark.parametrize("text,expected", [...])   # same cases
 def bench_triage(text, expected, prompt):
@@ -119,14 +120,33 @@ def bench_triage(text, expected, prompt):
   triage::password-v2   9/10  [55%,  99%]  $0.0006  FLAKY
   triage::late_box-v1  10/10  [69%, 100%]  $0.0002
   triage::late_box-v2  10/10  [69%, 100%]  $0.0006
+...
+=========================== probability: comparisons ===========================
+  triage[prompt]  v2 − v1  +16.7 pp  p=0.50  3 paired  cost ×3.0
+      late_box  10/10 vs 10/10    0 pp [−28, +28]  p=1
+      password    9/10 vs 8/10  +10 pp [−24, +42]  p=1
+      refund     10/10 vs 6/10  +40 pp [ +4, +69]  p=0.09
 ```
 
-Now the decision is a table, not a vibe: v2 fixes the incident case
-outright, lifts `password` to 9/10, holds `late_box` — at three times
-the token cost. Whether 9/10 clears the bar is a product call; the
-point is you are making it with numbers.
+Now the decision is a table, not a vibe — and the comparison block
+keeps it honest. On the incident case v2's gain is real: +40 points,
+and even the low end of its interval (+4) is a gain. On `password` the
+9/10 against 8/10 is within the noise ([−24, +42] includes no change),
+and `late_box` is a tie. Averaged over the three cases v2 is 16.7
+points ahead at three times the cost per run, but three inputs are too
+few for an interval over inputs (that needs `prob_min_inputs`, 10 by
+default); add cases before reading much into the average. Whether a
+fixed incident is worth the price is a product call; the point is you
+are making it with numbers.
 
 ### 3. Guard: the benchmark outlives the fix
+
+To hold a candidate to the incumbent in CI instead, give the
+comparison a margin: with `compare="prompt", margin=0.02` the session
+passes once v2's interval shows it at most 2 points worse than v1, and
+like a gate it fails while v2 is worse or the data can't tell yet —
+which, with fewer than 10 cases and so no interval, is always. See
+Comparisons in {doc}`reference`.
 
 Promote v2, delete the v1 axis value, and keep the benchmark in CI —
 the incident case is now a permanent regression sentinel, and every

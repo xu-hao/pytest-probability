@@ -400,6 +400,11 @@ def test_normal_interval_is_unclipped():
         lambda: stats.percentile_interval([]),
         lambda: stats.normal_interval([0.5]),
         lambda: stats.normal_interval([0.5, 1.0], level=1.0),
+        lambda: stats.sign_flip_test([0.1], resamples=0),
+        lambda: stats.sign_flip_test([0.1], seed=0.5),
+        lambda: stats.sign_flip_test([math.nan]),
+        lambda: stats.adjust_pvalues([0.1], "fdr"),
+        lambda: stats.adjust_pvalues([1.5], "holm"),
     ],
 )
 def test_invalid_input_raises_value_error(call):
@@ -679,6 +684,174 @@ def test_projection_limits():
 # ---------------------------------------------------------------------------
 # Module hygiene
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Paired differences (#6)
+# ---------------------------------------------------------------------------
+
+
+def _brute_sign_flip(diffs):
+    """P(|Σ ±dᵢ| ≥ |Σ dᵢ|) by listing every sign pattern, on exact
+    fractions so ties are exact."""
+    import itertools
+    from fractions import Fraction
+
+    fr = [Fraction(d).limit_denominator(10**6) for d in diffs]
+    observed = abs(sum(fr))
+    hits = sum(
+        abs(sum(s * f for s, f in zip(signs, fr))) >= observed
+        for signs in itertools.product((1, -1), repeat=len(fr))
+    )
+    return hits / 2 ** len(fr)
+
+
+def _fraction_diffs(rng, n, k):
+    return [rng.randint(0, k) / k - rng.randint(0, k) / k for _ in range(n)]
+
+
+def test_sign_flip_exact_matches_enumeration():
+    rng = random.Random(6)
+    for _ in range(60):
+        k = rng.choice([1, 3, 5, 10])
+        diffs = _fraction_diffs(rng, rng.randint(1, 12), k)
+        p, exact = stats.sign_flip_test(diffs)
+        assert exact
+        assert close(p, _brute_sign_flip(diffs), rel=1e-12), diffs
+
+
+def test_sign_flip_matches_scipy_permutation_test(scipy_stats):
+    np = pytest.importorskip("numpy")
+    rng = random.Random(7)
+    for _ in range(20):
+        diffs = _fraction_diffs(rng, rng.randint(2, 10), 10)
+        if not any(diffs):
+            continue
+        want = scipy_stats.permutation_test(
+            (np.array(diffs),),
+            np.sum,
+            permutation_type="samples",
+            n_resamples=np.inf,
+            alternative="two-sided",
+        ).pvalue
+        got, exact = stats.sign_flip_test(diffs)
+        assert exact and close(got, float(want), rel=1e-9), diffs
+
+
+def test_sign_flip_with_one_run_per_arm_is_mcnemar():
+    # k = 1: differences are -1, 0 or +1, and the exact sign-flip test is
+    # McNemar's exact (binomial) test on the discordant pairs.
+    mcnemar = pytest.importorskip("statsmodels.stats.contingency_tables").mcnemar
+    for b, c, ties in [(0, 3, 4), (1, 6, 0), (5, 5, 2), (2, 9, 20), (40, 70, 300)]:
+        diffs = [1.0] * b + [-1.0] * c + [0.0] * ties
+        p, exact = stats.sign_flip_test(diffs)
+        want = mcnemar([[ties, b], [c, 0]], exact=True).pvalue
+        assert exact and close(p, float(want), rel=1e-9), (b, c)
+
+
+def test_sign_flip_no_differences():
+    assert stats.sign_flip_test([]) == (1.0, True)
+    assert stats.sign_flip_test([0.0, 0.0, 0.0]) == (1.0, True)
+    # equal fractions with different run counts are no difference
+    assert stats.sign_flip_test([5 / 10 - 1 / 2, 3 / 10 - 6 / 20]) == (1.0, True)
+
+
+def test_sign_flip_exact_for_moderate_suites():
+    rng = random.Random(8)
+    assert stats.sign_flip_test(_fraction_diffs(rng, 300, 10))[1]
+    assert stats.sign_flip_test([rng.choice((-1.0, 0.0, 1.0)) for _ in range(1000)])[1]
+    assert not stats.sign_flip_test(_fraction_diffs(rng, 2000, 10))[1]
+
+
+def test_sign_flip_monte_carlo_is_seeded_and_close():
+    rng = random.Random(9)
+    diffs = _fraction_diffs(rng, 14, 10)
+    diffs[0] += 0.5  # push p away from 1
+    exact, _ = stats.sign_flip_test(diffs)
+    mc = stats.sign_flip_test(diffs, max_work=1, resamples=20_000, seed=3)
+    assert mc[1] is False
+    assert mc == stats.sign_flip_test(diffs, max_work=1, resamples=20_000, seed=3)
+    assert mc != stats.sign_flip_test(diffs, max_work=1, resamples=20_000, seed=4)
+    # three standard errors of a Monte Carlo proportion
+    assert abs(mc[0] - exact) < 3 * math.sqrt(exact * (1 - exact) / 20_000) + 1e-4
+    # never 0: (1 + hits) / (1 + resamples)
+    huge = stats.sign_flip_test([1.0] * 40, max_work=1, resamples=99)
+    assert huge == (0.01, False)
+
+
+def test_sign_flip_leaves_global_random_alone():
+    random.seed(12345)
+    expected = random.random()
+    random.seed(12345)
+    stats.sign_flip_test([0.1, -0.3, 0.5] * 10, max_work=1, resamples=50)
+    assert random.random() == expected
+
+
+@pytest.mark.parametrize("method, reference", [
+    ("holm", "holm"), ("bonferroni", "bonferroni"), ("bh", "fdr_bh"),
+])
+def test_adjust_pvalues_matches_statsmodels(method, reference):
+    multitest = pytest.importorskip("statsmodels.stats.multitest")
+    rng = random.Random(10)
+    cases = [[0.04], [0.01, 0.04, 0.03, 0.2], [0.5, 0.5, 0.01, 0.01, 1.0]]
+    cases += [[rng.random() ** 3 for _ in range(rng.randint(2, 30))] for _ in range(50)]
+    for ps in cases:
+        want = multitest.multipletests(ps, method=reference)[1]
+        got = stats.adjust_pvalues(ps, method)
+        assert all(close(g, float(w), rel=1e-12) for g, w in zip(got, want)), ps
+
+
+def test_adjust_pvalues_none_and_empty():
+    assert stats.adjust_pvalues([0.3, 0.01], "none") == [0.3, 0.01]
+    assert stats.adjust_pvalues([], "holm") == []
+    # Holm is never larger than Bonferroni, BH never larger than Holm
+    ps = [0.001, 0.02, 0.03, 0.2, 0.6]
+    holm = stats.adjust_pvalues(ps, "holm")
+    assert all(
+        h <= b for h, b in zip(holm, stats.adjust_pvalues(ps, "bonferroni"))
+    )
+    assert all(x <= h for x, h in zip(stats.adjust_pvalues(ps, "bh"), holm))
+
+
+def _paired_cases(rng, n_inputs, runs, effect):
+    """Pairs of (baseline, arm) counts: each input has its own
+    difficulty, and the arm's pass probability is ``effect`` higher."""
+    from pytest_probability.plugin import Pair
+
+    pairs = []
+    for i in range(n_inputs):
+        p = rng.betavariate(3.0, 1.5) * (1 - abs(effect))
+        q = p + effect
+        base = sum(rng.random() < p for _ in range(runs))
+        arm = sum(rng.random() < q for _ in range(runs))
+        pairs.append(Pair(f"{i:03}", (base, runs), (arm, runs)))
+    return pairs
+
+
+@pytest.mark.parametrize("effect", [0.0, 0.15])
+def test_permutation_and_bootstrap_agree(effect, record_property):
+    """#6: the sign-flip p and the paired bootstrap interval reach the
+    same conclusion — the interval leaves out 0 exactly when p is small
+    — on simulated data with and without a real difference."""
+    from pytest_probability.plugin import CompareSpec, StatsConfig, compare_pairs
+
+    rng = random.Random(2026 + int(effect * 100))
+    spec = CompareSpec(axis="style", baseline="a")
+    agree = found = 0
+    reps = 200
+    for rep in range(reps):
+        pairs = _paired_cases(rng, 30, 10, effect)
+        cfg = StatsConfig(resamples=1000, seed=rep)
+        cmp = compare_pairs("f", spec, "b", pairs, cfg)
+        excludes_zero = not cmp.ci[0] <= 0 <= cmp.ci[1]
+        agree += excludes_zero == (cmp.p < 0.05)
+        found += excludes_zero
+    record_property(f"agreement effect={effect}", agree / reps)
+    assert agree / reps >= 0.95
+    if effect:
+        assert found / reps >= 0.9
+    else:
+        assert found / reps <= 0.1
 
 
 def test_stats_imports_only_the_standard_library():

@@ -238,6 +238,24 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Seed for every resampling procedure, so the same results"
         " always give the same intervals (default: prob_seed ini or 0)",
     )
+    group.addoption(
+        "--prob-compare",
+        dest="prob_compare",
+        default=None,
+        metavar="AXIS",
+        help="Compare the values of the parametrize argument AXIS in every"
+        " bench function that has it, each against the first"
+        " (default: prob_compare ini or no comparison)",
+    )
+    group.addoption(
+        "--prob-adjust",
+        dest="prob_adjust",
+        default=None,
+        choices=stats.ADJUSTMENTS,
+        help="Adjust comparison p-values for the number of comparisons:"
+        " none (exploratory), holm, bonferroni or bh"
+        " (default: prob_adjust ini or none)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -300,6 +318,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "prob_min_inputs",
         "Fewest cases a function needs for its function-level interval",
         default="10",
+    )
+    parser.addini(
+        "prob_compare",
+        "Parametrize argument to compare in every bench function that has it",
+        default="",
+    )
+    parser.addini(
+        "prob_adjust",
+        "Multiple-comparison adjustment: none, holm, bonferroni or bh",
+        default="none",
     )
 
 
@@ -485,16 +513,19 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "probability(min_rate=None, min_passes=None, runs=None,"
-        " confidence=None, method=None, prior=None): gate a benchmark case on"
-        " its pass rate (min_rate) or pass count (min_passes), and/or set its"
-        " run count. See https://pytest-probability.readthedocs.io/en/latest/"
-        "reference.html",
+        " confidence=None, method=None, prior=None, compare=None,"
+        " baseline=None, margin=None, equivalence=False): gate a benchmark"
+        " case on its pass rate (min_rate) or pass count (min_passes), set its"
+        " run count, and/or compare the values of one parametrize argument"
+        " (compare) against a baseline. See"
+        " https://pytest-probability.readthedocs.io/en/latest/reference.html",
     )
     # Resolve (and validate) up front so a bad value is a usage error
     # before anything runs — on the xdist controller, which renders,
     # as much as anywhere.
     stats_config(config)
     gate_config(config)
+    compare_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -528,6 +559,39 @@ def interval_verdict(low: float, high: float, bar: float) -> str:
     if high < bar:
         return FAIL
     return UNDECIDED
+
+
+def equivalence_verdict(low: float, high: float, margin: float) -> str:
+    """The two-sided verdict rule: are two arms within ±``margin``?
+
+    PASS when the whole interval lies strictly inside (−margin,
+    +margin), FAIL when it lies entirely outside — wholly below −margin
+    or wholly above +margin — and UNDECIDED otherwise: the interval
+    reaches past a margin while still overlapping the band between them.
+    Unrounded bounds, as for ``interval_verdict``.
+    """
+    if -margin < low and high < margin:
+        return PASS
+    if high < -margin or low > margin:
+        return FAIL
+    return UNDECIDED
+
+
+def margin_verdict(
+    interval: tuple[float, float] | None, margin: float, equivalence: bool = False
+) -> str:
+    """The verdict on a difference (arm − baseline) with a margin.
+
+    Non-inferiority (the default): ``interval_verdict`` against
+    −``margin`` — PASS when the arm is at most ``margin`` worse.
+    Equivalence: ``equivalence_verdict``. No interval (too few inputs to
+    compute one) is UNDECIDED: the data cannot tell yet.
+    """
+    if interval is None:
+        return UNDECIDED
+    if equivalence:
+        return equivalence_verdict(*interval, margin)
+    return interval_verdict(*interval, -margin)
 
 
 @dataclass(frozen=True)
@@ -580,6 +644,44 @@ def gate_config(config: pytest.Config) -> GateConfig:
     cfg = config.stash.get(_GATE_CONFIG, None)
     if cfg is None:
         cfg = config.stash[_GATE_CONFIG] = _resolve_gate_config(config)
+    return cfg
+
+
+@dataclass(frozen=True)
+class CompareConfig:
+    """Session-wide comparison settings: ``axis`` is
+    ``--prob-compare``/``prob_compare`` (``None``: only functions whose
+    mark sets ``compare=`` are compared), ``adjust`` the
+    multiple-comparison adjustment of their p-values."""
+
+    axis: str | None = None
+    adjust: str = "none"
+
+
+_COMPARE_CONFIG = pytest.StashKey[CompareConfig]()
+
+
+def _resolve_compare_config(config: pytest.Config) -> CompareConfig:
+    axis = config.getoption("prob_compare")
+    if axis is None:
+        axis = config.getini("prob_compare")
+    axis = str(axis).strip() or None
+    adjust = config.getoption("prob_adjust")
+    if adjust is None:
+        adjust = str(config.getini("prob_adjust")).strip()
+        if adjust not in stats.ADJUSTMENTS:
+            raise pytest.UsageError(
+                f"prob_adjust must be one of {', '.join(stats.ADJUSTMENTS)},"
+                f" got {adjust!r}"
+            )
+    return CompareConfig(axis=axis, adjust=adjust)
+
+
+def compare_config(config: pytest.Config) -> CompareConfig:
+    """The session's resolved ``CompareConfig`` (validated at configure)."""
+    cfg = config.stash.get(_COMPARE_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_COMPARE_CONFIG] = _resolve_compare_config(config)
     return cfg
 
 
@@ -768,7 +870,12 @@ class GateResult:
         }
 
 
-_MARK_ARGS = ("min_rate", "min_passes", "runs", "confidence", "method", "prior")
+# Arguments that set up a function's comparison: a case can't have one.
+_COMPARE_ARGS = ("compare", "baseline", "margin", "equivalence")
+_MARK_ARGS = (
+    "min_rate", "min_passes", "runs", "confidence", "method", "prior",
+    *_COMPARE_ARGS,
+)
 
 
 def _merge_probability_marks(marks: list) -> dict[str, Any]:
@@ -863,20 +970,31 @@ def _default_param_id(value: Any, argname: str, index: int) -> str:
     return f"{argname}{index}"
 
 
-def _parametrize_variants(
-    marks: list,
-) -> list[tuple[str, dict[str, Any], tuple]]:
+class _Variant(NamedTuple):
+    """One parameter combination of a bench function."""
+
+    id: str
+    params: dict[str, Any]
+    marks: tuple
+    # (value id, value index) per parametrize decorator, in pytestmark
+    # order: what a comparison splits into its input and its arm.
+    parts: tuple[tuple[str, int], ...] = ()
+
+
+def _parametrize_variants(marks: list) -> list[_Variant]:
     """Expand stacked ``@pytest.mark.parametrize`` decorators.
 
-    Returns ``(id, params, marks)`` triples — the cartesian product
-    across stacked decorators, processed in ``pytestmark`` order so
-    composite ids read ``bottom-top`` like pytest's own. ``params`` are
-    passed to the bench function as keyword arguments; ``marks`` come
-    from ``pytest.param(..., marks=...)`` values. With no parametrize
-    marks this returns the single empty variant: an unparametrized
-    bench function is one case.
+    Returns ``(id, params, marks, parts)`` tuples — the cartesian
+    product across stacked decorators, processed in ``pytestmark`` order
+    so composite ids read ``bottom-top`` like pytest's own. ``params``
+    are passed to the bench function as keyword arguments; ``marks``
+    come from ``pytest.param(..., marks=...)`` values; ``parts`` are the
+    pieces the id is joined from, one per decorator, with the index of
+    the value each came from. With no parametrize marks this returns
+    the single empty variant: an unparametrized bench function is one
+    case.
     """
-    variants: list[tuple[str, dict[str, Any], tuple]] = [("", {}, ())]
+    variants: list[_Variant] = [_Variant("", {}, ())]
     for mark in marks:
         argnames, argvalues = mark.args[0], mark.args[1]
         names = (
@@ -885,8 +1003,8 @@ def _parametrize_variants(
             else [str(n) for n in argnames]
         )
         ids_opt = mark.kwargs.get("ids")
-        expanded: list[tuple[str, dict[str, Any], tuple]] = []
-        for prev_id, prev_params, prev_marks in variants:
+        expanded: list[_Variant] = []
+        for prev_id, prev_params, prev_marks, prev_parts in variants:
             for i, value in enumerate(argvalues):
                 vid: str | None = None
                 vmarks: tuple = ()
@@ -913,14 +1031,169 @@ def _parametrize_variants(
                             for j, v in enumerate(vals)
                         )
                 expanded.append(
-                    (
+                    _Variant(
                         f"{prev_id}-{vid}" if prev_id else vid,
                         {**prev_params, **dict(zip(names, vals))},
                         prev_marks + vmarks,
+                        (*prev_parts, (vid, i)),
                     )
                 )
         variants = expanded
     return variants
+
+
+def _argnames(mark) -> list[str]:
+    argnames = mark.args[0]
+    if isinstance(argnames, str):
+        return [n.strip() for n in argnames.split(",")]
+    return [str(n) for n in argnames]
+
+
+@dataclass(frozen=True)
+class CompareSpec:
+    """A bench function's comparison: the values of the parametrize
+    argument ``axis`` (the *arms*), each against the ``baseline`` arm,
+    paired by *input* — the case's other parameters.
+
+    ``margin`` (``None``: no verdict, the comparison only reports)
+    makes it a gate: non-inferiority by default — the arm may be at
+    most ``margin`` worse — or, with ``equivalence``, within ±margin.
+    Built at collection; travels in every run record (``to_record()``,
+    with the case's ``input``, ``arm`` and ``arm_index``) because the
+    xdist controller compares without collecting.
+    """
+
+    axis: str
+    baseline: str
+    margin: float | None = None
+    equivalence: bool = False
+
+    def verdict(self, interval: tuple[float, float] | None) -> str | None:
+        """The margin verdict on an interval, ``None`` without a margin."""
+        if self.margin is None:
+            return None
+        return margin_verdict(interval, self.margin, self.equivalence)
+
+    def bar(self) -> str:
+        """``≥−2 pp`` (non-inferiority) or ``±2 pp`` (equivalence); ``""``
+        without a margin."""
+        if self.margin is None:
+            return ""
+        size = f"{self.margin * 100:g} pp"
+        return f"±{size}" if self.equivalence else f"≥−{size}"
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "axis": self.axis,
+            "baseline": self.baseline,
+            "margin": self.margin,
+            "equivalence": self.equivalence,
+        }
+
+    @classmethod
+    def from_record(cls, rec: dict[str, Any]) -> CompareSpec:
+        return cls(
+            axis=rec["axis"],
+            baseline=rec["baseline"],
+            margin=rec["margin"],
+            equivalence=rec["equivalence"],
+        )
+
+
+def _compare_plan(
+    config: pytest.Config,
+    fn_prob: list,
+    param_marks: list,
+    variants: list[_Variant],
+) -> tuple[CompareSpec, list[dict[str, Any]]] | None:
+    """A function's comparison and each variant's part in it — the run
+    record's ``compare`` dict — or ``None`` when it isn't compared.
+
+    ``compare=`` on the function's mark beats ``--prob-compare``. An
+    axis named by the mark must be a parametrize argument with at least
+    two values; one from the command line applies only to the functions
+    that have it. Bad arguments raise ``ValueError``.
+    """
+    # Only the comparison's arguments, closest mark first; the case
+    # plans validate the marks as a whole.
+    settings: dict[str, Any] = {}
+    for mark in fn_prob:
+        for key in _COMPARE_ARGS:
+            if mark.kwargs.get(key) is not None:
+                settings.setdefault(key, mark.kwargs[key])
+    axis = settings.get("compare")
+    explicit = axis is not None
+    given = [
+        k for k in ("baseline", "margin") if k in settings
+    ] + (["equivalence"] if settings.get("equivalence") else [])
+    if not explicit and given:
+        raise ValueError(f"{', '.join(given)} needs compare= on the same function")
+    if axis is None:
+        axis = compare_config(config).axis
+    if axis is None:
+        return None
+    if not isinstance(axis, str) or not axis:
+        raise ValueError(f"compare must be a parametrize argument name, got {axis!r}")
+    where = next(
+        (j for j, m in enumerate(param_marks) if axis in _argnames(m)), None
+    )
+    if where is None:
+        if not explicit:
+            return None
+        names = [n for m in param_marks for n in _argnames(m)]
+        has = f"its arguments are {', '.join(names)}" if names else "it has none"
+        raise ValueError(
+            f"compare={axis!r} is not a parametrize argument ({has})"
+        )
+    arms: dict[int, str] = {}
+    for v in variants:
+        vid, index = v.parts[where]
+        arms.setdefault(index, vid)
+    ids = [arms[i] for i in sorted(arms)]
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            f"the values of {axis!r} need distinct ids to be compared,"
+            f" got {', '.join(ids)}"
+        )
+    if len(ids) < 2:
+        if not explicit:
+            return None
+        raise ValueError(f"compare={axis!r} needs at least two values to compare")
+    baseline = settings.get("baseline")
+    if baseline is None:
+        baseline = ids[0]
+    elif str(baseline) not in ids:
+        raise ValueError(
+            f"baseline={baseline!r} is not a value of {axis!r};"
+            f" expected one of {', '.join(ids)}"
+        )
+    margin = settings.get("margin")
+    if margin is not None:
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)):
+            raise ValueError(f"margin must be a number, got {margin!r}")
+        margin = _parse_level(margin, "margin")
+    equivalence = settings.get("equivalence", False)
+    if not isinstance(equivalence, bool):
+        raise ValueError(f"equivalence must be True or False, got {equivalence!r}")
+    if equivalence and margin is None:
+        raise ValueError("equivalence=True needs a margin=")
+    spec = CompareSpec(
+        axis=axis, baseline=str(baseline), margin=margin, equivalence=equivalence
+    )
+    records = []
+    for v in variants:
+        arm, arm_index = v.parts[where]
+        records.append(
+            {
+                **spec.to_record(),
+                "input": "-".join(
+                    vid for j, (vid, _) in enumerate(v.parts) if j != where
+                ),
+                "arm": arm,
+                "arm_index": arm_index,
+            }
+        )
+    return spec, records
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1297,8 @@ class _CasePlan(NamedTuple):
     case: str
     runs: int
     gate: Gate | None
+    # The case's part in its function's comparison (run record form).
+    compare: dict[str, Any] | None = None
 
 
 class BenchFunction(pytest.Collector):
@@ -1047,18 +1322,35 @@ class BenchFunction(pytest.Collector):
         fn_prob = [m for m in other_marks if m.name == "probability"]
         short = self.name.removeprefix("bench_") or self.name
 
+        variants = _parametrize_variants(param_marks)
+        try:
+            planned = _compare_plan(self.config, fn_prob, param_marks, variants)
+        except (ValueError, pytest.UsageError) as exc:
+            raise self.CollectError(
+                f"{short}: invalid probability mark: {exc}"
+            ) from None
+        compares = planned[1] if planned else [None] * len(variants)
         plans: list[_CasePlan] = []
-        for variant_id, params, vmarks in _parametrize_variants(param_marks):
+        for (variant_id, params, vmarks, _), compare in zip(variants, compares):
             # Unparametrized: one case, named after the function.
             case = f"{short}::{variant_id}" if variant_id else short
             case_prob = [m for m in vmarks if m.name == "probability"]
             try:
+                for mark in case_prob:
+                    named = [k for k in _COMPARE_ARGS if k in mark.kwargs]
+                    if named:
+                        raise ValueError(
+                            f"{', '.join(named)} applies to the whole function:"
+                            " put it on the bench function's mark"
+                        )
                 runs, gate = _case_plan(self.config, [*case_prob, *fn_prob])
             except (ValueError, pytest.UsageError) as exc:
                 raise self.CollectError(
                     f"{case}: invalid probability mark: {exc}"
                 ) from None
-            plans.append(_CasePlan(variant_id, params, vmarks, case, runs, gate))
+            plans.append(
+                _CasePlan(variant_id, params, vmarks, case, runs, gate, compare)
+            )
         self._warn_infeasible(short, plans)
 
         if _transpose(self.config):
@@ -1091,6 +1383,7 @@ class BenchFunction(pytest.Collector):
                 params=plan.params,
                 case=plan.case,
                 gate=plan.gate,
+                compare=plan.compare,
             )
             for mark in (*other_marks, *plan.marks):
                 # add_marker() only accepts MarkDecorator; these are raw
@@ -1176,6 +1469,7 @@ class BenchItem(pytest.Item):
         params: dict[str, Any],
         case: str,
         gate: Gate | None = None,
+        compare: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -1185,6 +1479,16 @@ class BenchItem(pytest.Item):
         # Function-qualified case id: the aggregation row.
         self.case = case
         self.gate = gate
+        # The case's input, arm and its function's comparison spec.
+        self.compare = compare
+
+    @property
+    def judged(self) -> bool:
+        """Whether a verdict, not each run, decides this case: it is
+        gated, or its function's comparison has a margin."""
+        return self.gate is not None or bool(
+            self.compare and self.compare["margin"] is not None
+        )
 
     def runtest(self) -> None:
         delay = _delay(self.config)
@@ -1237,6 +1541,9 @@ class BenchItem(pytest.Item):
                     # The controller decides verdicts without collecting,
                     # so the gate rides along with every run.
                     record["gate"] = self.gate.to_record()
+                if self.compare is not None:
+                    # Likewise the comparison, with this case's input/arm.
+                    record["compare"] = dict(self.compare)
                 # Plain dicts only: user_properties must survive xdist's
                 # worker-to-controller serialization.
                 self.user_properties.append(("probability", record))
@@ -1252,16 +1559,19 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
     """Report a gated case's failing runs as xfailed.
 
     A failing run of a gated case is one sample of its pass rate; the
-    gate's verdict, not the run, decides pass or fail. Reporting it as
+    gate's verdict, not the run, decides pass or fail. The same holds
+    for every case of a function whose comparison has a margin: the
+    margin's verdict decides. Reporting it as
     xfailed keeps its traceback on the report (``--xfail-tb`` prints
     it, ``-rx`` lists the run with its assert message as the reason),
     keeps ``-x``/``--maxfail`` from stopping on it, and keeps it from
     failing the session. Errors do fail the session, unless
-    ``prob_errors = exclude`` takes them out of the gate's sample.
+    ``prob_errors = exclude`` takes them out of a gate's sample (a
+    comparison always counts them as non-passes).
     ``--runxfail`` turns all of this off, as it does for xfail marks.
     """
     outcome = yield
-    if call.when != "call" or not isinstance(item, BenchItem) or item.gate is None:
+    if call.when != "call" or not isinstance(item, BenchItem) or not item.judged:
         return
     report = outcome.get_result()
     if not report.failed or getattr(item.config.option, "runxfail", False):
@@ -1273,8 +1583,13 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
         # pytest.fail() and other control flow: not a sample.
         return
     if record["outcome"] == "fail":
-        reason = f"probability gate: {record['message'] or 'AssertionError'}"
-    elif record["outcome"] == "error" and item.gate.errors == "exclude":
+        what = "gate" if item.gate is not None else "comparison"
+        reason = f"probability {what}: {record['message'] or 'AssertionError'}"
+    elif (
+        record["outcome"] == "error"
+        and item.gate is not None
+        and item.gate.errors == "exclude"
+    ):
         reason = f"probability gate, error excluded: {record['error']}"
     else:
         return
@@ -1318,6 +1633,9 @@ class CaseStats:
     usage: dict[str, dict[str, Any]] = field(default_factory=dict)
     # The case's gate, rebuilt from its first run record; None: ungated.
     gate: Gate | None = None
+    # The case's part in a comparison (its first record's ``compare``
+    # dict: spec, input and arm); None: not compared.
+    compare: dict[str, Any] | None = None
 
     @property
     def total(self) -> int:
@@ -1536,6 +1854,345 @@ def aggregate(
     )
 
 
+# ---------------------------------------------------------------------------
+# Paired comparisons
+# ---------------------------------------------------------------------------
+
+
+class Pair(NamedTuple):
+    """One input that ran in both arms: ``(passes, total)`` for each."""
+
+    input: str
+    baseline: tuple[int, int]
+    arm: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class PairedInput:
+    """One input's difference (arm − baseline pass fraction), with its
+    Newcombe interval and Fisher exact p-value: the two arms' runs are
+    independent samples."""
+
+    input: str
+    baseline: tuple[int, int]
+    arm: tuple[int, int]
+    difference: float
+    ci: tuple[float, float]
+    p: float
+
+    def to_json(self, level: float) -> dict[str, Any]:
+        return {
+            "input": self.input,
+            "baseline": {"passes": self.baseline[0], "total": self.baseline[1]},
+            "arm": {"passes": self.arm[0], "total": self.arm[1]},
+            "difference": self.difference,
+            "ci": {
+                "method": "newcombe",
+                "level": level,
+                "low": self.ci[0],
+                "high": self.ci[1],
+            },
+            "p": self.p,
+            "p_method": "fisher",
+        }
+
+
+def paired_input(pair: Pair, level: float) -> PairedInput:
+    (xb, nb), (xa, na) = pair.baseline, pair.arm
+    return PairedInput(
+        input=pair.input,
+        baseline=pair.baseline,
+        arm=pair.arm,
+        difference=xa / na - xb / nb,
+        ci=stats.newcombe(xa, na, xb, nb, level),
+        p=stats.fisher_exact(xa, na, xb, nb),
+    )
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """One arm against the baseline, over the inputs both ran.
+
+    ``estimate`` is the mean of the per-input differences (arm minus
+    baseline pass fraction), every input counting equally. How the
+    interval and p-value are made depends on the number of pairs:
+
+    - **one input:** that input's Newcombe interval and Fisher p
+      (``ci_method`` ``"newcombe"``, ``p_method`` ``"fisher"``);
+    - **at least** ``min_inputs``: a paired cluster bootstrap that
+      re-draws inputs with both arms' runs kept together, and a
+      sign-flip permutation p on the per-input differences
+      (``"bootstrap"``, ``"sign-flip"``);
+    - **in between:** the sign-flip p, but no interval
+      (``suppressed`` says why), as for ``aggregate()``;
+    - **none:** neither.
+
+    ``verdict`` is the margin's (``None`` without one), read off ``ci``
+    alone. ``p_adjusted`` is ``p`` after ``adjustment`` over the
+    session's ``family`` of comparisons. ``inputs`` (each with its own
+    Newcombe/Fisher) and ``unpaired`` are sorted by input id: the
+    bootstrap draws from that order, so the result doesn't depend on
+    the order results arrived in.
+    """
+
+    function: str
+    spec: CompareSpec
+    arm: str
+    inputs: tuple[PairedInput, ...]
+    unpaired: tuple[str, ...]
+    level: float
+    resamples: int
+    seed: int
+    estimate: float | None = None
+    ci: tuple[float, float] | None = None
+    ci_method: str | None = None
+    p: float | None = None
+    p_method: str | None = None
+    exact: bool | None = None
+    suppressed: str | None = None
+    verdict: str | None = None
+    cost_ratio: float | None = None
+    p_adjusted: float | None = None
+    adjustment: str = "none"
+    family: int = 1
+
+    @property
+    def pairs(self) -> int:
+        return len(self.inputs)
+
+    @property
+    def axis(self) -> str:
+        return self.spec.axis
+
+    @property
+    def baseline(self) -> str:
+        return self.spec.baseline
+
+    @property
+    def exploratory(self) -> bool:
+        """Unadjusted p-values among several comparisons."""
+        return self.adjustment == "none" and self.family > 1
+
+    @property
+    def shown_p(self) -> float | None:
+        """The p-value to print: adjusted, when there is an adjustment."""
+        return self.p if self.adjustment == "none" else self.p_adjusted
+
+    def to_json(self) -> dict[str, Any]:
+        ci = None
+        if self.ci is not None:
+            ci = {
+                "method": self.ci_method,
+                "level": self.level,
+                "low": self.ci[0],
+                "high": self.ci[1],
+            }
+        return {
+            "function": self.function,
+            "axis": self.axis,
+            "baseline": self.baseline,
+            "arm": self.arm,
+            "pairs": self.pairs,
+            "unpaired": list(self.unpaired),
+            "difference": self.estimate,
+            "ci": ci,
+            "p": self.p,
+            "p_method": self.p_method,
+            "exact": self.exact,
+            "p_adjusted": self.p_adjusted,
+            "adjustment": self.adjustment,
+            "family": self.family,
+            "exploratory": self.exploratory,
+            "margin": self.spec.margin,
+            "equivalence": self.spec.equivalence,
+            "verdict": self.verdict,
+            "suppressed": self.suppressed,
+            "resamples": self.resamples,
+            "seed": self.seed,
+            "cost_ratio": self.cost_ratio,
+            "inputs": [i.to_json(self.level) for i in self.inputs],
+        }
+
+
+def _mean_difference(sample: list[tuple[float, float]]) -> float:
+    return statistics.fmean([arm - base for base, arm in sample])
+
+
+def compare_pairs(
+    function: str,
+    spec: CompareSpec,
+    arm: str,
+    pairs: Iterable[Pair],
+    cfg: StatsConfig,
+    *,
+    unpaired: Iterable[str] = (),
+    cost_ratio: float | None = None,
+) -> Comparison:
+    """The ``Comparison`` of ``arm`` with ``spec.baseline`` over
+    ``pairs``, at ``cfg``'s level, resamples, seed and min_inputs.
+
+    Pure: everything comes from the pass counts, so a regression gate
+    against a stored report can pair cases the same way and reuse it.
+    The bootstrap resamples ``(baseline, arm)`` fraction pairs sorted by
+    input, through ``stats.bootstrap``'s private generator; the
+    sign-flip test has its own, from the same seed. The margin verdict
+    is read off the interval returned with it.
+    """
+    ordered = tuple(
+        paired_input(p, cfg.level) for p in sorted(pairs, key=lambda p: p.input)
+    )
+    cmp = Comparison(
+        function=function,
+        spec=spec,
+        arm=arm,
+        inputs=ordered,
+        unpaired=tuple(sorted(unpaired)),
+        level=cfg.level,
+        resamples=cfg.resamples,
+        seed=cfg.seed,
+        cost_ratio=cost_ratio,
+    )
+    n = len(ordered)
+    if n == 0:
+        return dataclasses.replace(
+            cmp, suppressed="no paired inputs", verdict=spec.verdict(None)
+        )
+    if n == 1:
+        only = ordered[0]
+        return dataclasses.replace(
+            cmp,
+            estimate=only.difference,
+            ci=only.ci,
+            ci_method="newcombe",
+            p=only.p,
+            p_method="fisher",
+            exact=True,
+            verdict=spec.verdict(only.ci),
+        )
+    diffs = [i.difference for i in ordered]
+    p, exact = stats.sign_flip_test(diffs, resamples=cfg.resamples, seed=cfg.seed)
+    cmp = dataclasses.replace(
+        cmp,
+        estimate=statistics.fmean(diffs),
+        p=p,
+        p_method="sign-flip",
+        exact=exact,
+    )
+    if n < cfg.min_inputs:
+        # As for aggregate(): with few inputs the bootstrap's spread
+        # underestimates the uncertainty.
+        return dataclasses.replace(
+            cmp,
+            suppressed=f"fewer than {cfg.min_inputs} paired inputs",
+            verdict=spec.verdict(None),
+        )
+    fractions = [
+        (i.baseline[0] / i.baseline[1], i.arm[0] / i.arm[1]) for i in ordered
+    ]
+    samples = stats.bootstrap(
+        fractions, _mean_difference, resamples=cfg.resamples, seed=cfg.seed
+    )
+    ci = stats.percentile_interval(samples, cfg.level)
+    return dataclasses.replace(
+        cmp, ci=ci, ci_method="bootstrap", verdict=spec.verdict(ci)
+    )
+
+
+def adjust_comparisons(
+    comparisons: list[Comparison], method: str
+) -> list[Comparison]:
+    """``comparisons`` with ``p_adjusted`` filled in: ``method`` applied
+    over every one that has a p-value — the session's family."""
+    family = [c for c in comparisons if c.p is not None]
+    adjusted = dict(
+        zip(
+            (id(c) for c in family),
+            stats.adjust_pvalues([c.p for c in family], method),
+        )
+    )
+    return [
+        dataclasses.replace(
+            c,
+            p_adjusted=adjusted.get(id(c)),
+            adjustment=method,
+            family=len(family),
+        )
+        for c in comparisons
+    ]
+
+
+def _cost_ratio(base: list[CaseStats], arm: list[CaseStats]) -> float | None:
+    # Cost per run, arm over baseline; None unless both recorded cost.
+    base_cost = math.fsum(s.cost for s in base)
+    arm_cost = math.fsum(s.cost for s in arm)
+    if not (base_cost > 0 and arm_cost > 0):
+        return None
+    per_run = lambda cost, cases: cost / sum(s.total for s in cases)  # noqa: E731
+    return per_run(arm_cost, arm) / per_run(base_cost, base)
+
+
+def comparisons_of(
+    cases: Iterable[CaseStats], cfg: StatsConfig, adjust: str = "none"
+) -> list[Comparison]:
+    """Every comparison among ``cases``: per compared function (by
+    name), each arm (in parametrize order) against its baseline, paired
+    by input, then adjusted as one family.
+
+    An input missing either arm — after ``-k``, say — is left out of
+    that comparison's pairs and listed in ``unpaired``. Cases sharing an
+    input and an arm (duplicate ids) are pooled. Errored runs count as
+    non-passes, as in the row fraction.
+    """
+    by_function: dict[str, list[CaseStats]] = {}
+    for s in cases:
+        if s.compare is not None:
+            by_function.setdefault(function_of(s.case), []).append(s)
+    out: list[Comparison] = []
+    for function in sorted(by_function):
+        group = by_function[function]
+        spec = CompareSpec.from_record(group[0].compare)
+        cells: dict[str, dict[str, list[CaseStats]]] = {}
+        order: dict[str, int] = {}
+        for s in group:
+            arm = s.compare["arm"]
+            order[arm] = s.compare["arm_index"]
+            cells.setdefault(s.compare["input"], {}).setdefault(arm, []).append(s)
+        for arm in sorted(order, key=order.__getitem__):
+            if arm == spec.baseline:
+                continue
+            pairs, unpaired = [], []
+            base_cases: list[CaseStats] = []
+            arm_cases: list[CaseStats] = []
+            for name, arms in cells.items():
+                if spec.baseline in arms and arm in arms:
+                    b, a = arms[spec.baseline], arms[arm]
+                    base_cases += b
+                    arm_cases += a
+                    pairs.append(
+                        Pair(
+                            name,
+                            (sum(s.passes for s in b), sum(s.total for s in b)),
+                            (sum(s.passes for s in a), sum(s.total for s in a)),
+                        )
+                    )
+                elif spec.baseline in arms or arm in arms:
+                    unpaired.append(name)
+            base_cases.sort(key=lambda s: s.case)
+            arm_cases.sort(key=lambda s: s.case)
+            out.append(
+                compare_pairs(
+                    function,
+                    spec,
+                    arm,
+                    pairs,
+                    cfg,
+                    unpaired=unpaired,
+                    cost_ratio=_cost_ratio(base_cases, arm_cases),
+                )
+            )
+    return adjust_comparisons(out, adjust)
+
+
 _MARKUP = {
     "pass": {"green": True},
     "flaky": {"yellow": True},
@@ -1595,6 +2252,166 @@ def _change(c: float) -> str:
     return f"{sign}{pct}%" if pct else f"{sign}<1%"
 
 
+def _pp(d: float, decimals: int = 0) -> str:
+    """A difference in percentage points, signed with a real minus —
+    ``+20``, ``−11``, ``+11.7`` — rounded half up on its size. Only an
+    exact 0 is unsigned."""
+    scale = 10**decimals
+    size = math.floor(abs(d) * 100 * scale + 0.5) / scale
+    text = f"{size:.{decimals}f}"
+    if d == 0:
+        return text
+    return f"{'−' if d < 0 else '+'}{text}"
+
+
+def _p(p: float) -> str:
+    """A p-value as printed: ``0.47``, ``0.004``, ``<0.001``; ``1`` is
+    kept for exactly 1."""
+    if p >= 1.0:
+        return "1"
+    if p < 0.001:
+        return "<0.001"
+    if p < 0.01:
+        return f"{p:.3f}"
+    return f"{min(p, 0.99):.2f}"
+
+
+def _p_cell(p: float | None) -> str:
+    if p is None:
+        return ""
+    text = _p(p)
+    return f"p{text}" if text.startswith("<") else f"p={text}"
+
+
+def _ratio(r: float) -> str:
+    """A cost ratio: ``×4.0``, ``×0.25``."""
+    return f"×{r:.1f}" if r >= 1.0 else f"×{r:.2f}"
+
+
+def _pp_decimals(cmp: Any) -> int:
+    # One input's difference moves in whole-run steps, like a row's
+    # fraction; an average over inputs in finer ones, like an aggregate.
+    return 0 if cmp.ci_method == "newcombe" else 1
+
+
+def _difference_cell(cmp: Any) -> tuple[str, tuple[str, str] | None]:
+    """``("+20 pp", ("−11", "+51"))``; the interval part is ``None``
+    when there is none, and the difference ``""`` with no pairs."""
+    if cmp.estimate is None:
+        return "", None
+    dec = _pp_decimals(cmp)
+    bounds = None
+    if cmp.ci is not None:
+        bounds = (_pp(cmp.ci[0], dec), _pp(cmp.ci[1], dec))
+    return f"{_pp(cmp.estimate, dec)} pp", bounds
+
+
+def _comparison_lines(comparisons: list[Comparison]) -> list[tuple[str, str | None]]:
+    """The comparisons block: one line per comparison, columns aligned —
+    ``triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47
+    1 paired  cost ×4.0`` — each with its verdict (``None``: no margin).
+
+    A comparison with no interval but several pairs (fewer than
+    ``prob_min_inputs``) is followed by one indented line per input
+    with that input's own interval and p. When the session makes more
+    than one comparison, a closing line says whether the p-values were
+    adjusted for that.
+    """
+    names = [f"{c.function}[{c.axis}]" for c in comparisons]
+    arms = [f"{c.arm} − {c.baseline}" for c in comparisons]
+    diffs = [_difference_cell(c) for c in comparisons]
+    ps = [_p_cell(c.shown_p) for c in comparisons]
+    sizes = [
+        f"{c.pairs} paired" + (f", {len(c.unpaired)} unpaired" if c.unpaired else "")
+        for c in comparisons
+    ]
+    costs = [
+        f"cost {_ratio(c.cost_ratio)}" if c.cost_ratio is not None else ""
+        for c in comparisons
+    ]
+    bars = [c.spec.bar() for c in comparisons]
+
+    def width(cells: list[str]) -> int:
+        return max((len(x) for x in cells), default=0)
+
+    shown = [b for _, b in diffs if b is not None]
+    low_w = max((len(b[0]) for b in shown), default=0)
+    high_w = max((len(b[1]) for b in shown), default=0)
+    interval_w = low_w + high_w + 4 if shown else 0
+    widths = {
+        "name": width(names),
+        "arms": width(arms),
+        "diff": width([d for d, _ in diffs]),
+        "p": width(ps),
+        "size": width(sizes),
+        "cost": width(costs),
+        "bar": width(bars),
+    }
+    lines: list[tuple[str, str | None]] = []
+    for c, name, arm, (diff, bounds), p, size, cost, bar in zip(
+        comparisons, names, arms, diffs, ps, sizes, costs, bars
+    ):
+        cell = f"{diff:>{widths['diff']}}"
+        if interval_w:
+            interval = (
+                f"[{bounds[0]:>{low_w}}, {bounds[1]:>{high_w}}]" if bounds else ""
+            )
+            cell += f" {interval:<{interval_w}}"
+        parts = [
+            f"{name:<{widths['name']}}",
+            f"{arm:<{widths['arms']}}",
+            cell,
+            f"{p:<{widths['p']}}",
+            f"{size:<{widths['size']}}",
+        ]
+        if widths["cost"]:
+            parts.append(f"{cost:<{widths['cost']}}")
+        if c.verdict is not None:
+            parts.append(f"{bar:<{widths['bar']}}  {c.verdict.upper()}")
+        # Columns no comparison uses are left out altogether.
+        lines.append(("  " + "  ".join(x for x in parts if x).rstrip(), c.verdict))
+        if c.ci is None and c.pairs > 1:
+            lines.extend((ln, None) for ln in _input_lines(c))
+    family = comparisons[0].family if comparisons else 0
+    if family > 1:
+        adjustment = comparisons[0].adjustment
+        if adjustment == "none":
+            note = (
+                f"p not adjusted for {family} comparisons: exploratory"
+                " (--prob-adjust=holm adjusts them)"
+            )
+        else:
+            note = f"p adjusted for {family} comparisons ({adjustment})"
+        lines.append(("", None))
+        lines.append((f"  {note}", None))
+    return lines
+
+
+def _input_lines(cmp: Comparison) -> list[str]:
+    """Per-input lines under a comparison without an interval:
+    ``refund  10/10 vs 8/10  +20 pp [−11, +51]  p=0.47`` (each input's
+    own Newcombe interval and Fisher p, not adjusted)."""
+    names = [i.input for i in cmp.inputs]
+    counts = [
+        f"{i.arm[0]}/{i.arm[1]} vs {i.baseline[0]}/{i.baseline[1]}"
+        for i in cmp.inputs
+    ]
+    diffs = [f"{_pp(i.difference)} pp" for i in cmp.inputs]
+    bounds = [(_pp(i.ci[0]), _pp(i.ci[1])) for i in cmp.inputs]
+    name_w = max(len(x) for x in names)
+    count_w = max(len(x) for x in counts)
+    diff_w = max(len(x) for x in diffs)
+    low_w = max(len(b[0]) for b in bounds)
+    high_w = max(len(b[1]) for b in bounds)
+    return [
+        f"      {name:<{name_w}}  {count:>{count_w}}  {diff:>{diff_w}}"
+        f" [{low:>{low_w}}, {high:>{high_w}}]  {_p_cell(i.p)}"
+        for i, name, count, diff, (low, high) in zip(
+            cmp.inputs, names, counts, diffs, bounds
+        )
+    ]
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -1621,6 +2438,8 @@ class ProbabilityAggregator:
         # aggregates(), computed once: the JSON report and the summary
         # both need it, and a bootstrap is the one costly step here.
         self._aggregates: list[Aggregate] | None = None
+        # comparisons(), likewise.
+        self._comparisons: list[Comparison] | None = None
 
     def pytest_runtest_logreport(self, report) -> None:
         if getattr(report, "when", None) != "call":
@@ -1629,16 +2448,20 @@ class ProbabilityAggregator:
             if name != "probability":
                 continue
             gate = value.get("gate")
+            compare = value.get("compare")
             if self._records is not None:
-                # The gate spec is per case: rows[].gate reports it once.
+                # The gate and comparison specs are per case: rows[].gate
+                # and comparisons[] report them once.
                 self._records.append(
-                    {k: v for k, v in value.items() if k != "gate"}
-                    if gate is not None
+                    {k: v for k, v in value.items() if k not in ("gate", "compare")}
+                    if gate is not None or compare is not None
                     else value
                 )
             st = self._stats.setdefault(value["case"], CaseStats(case=value["case"]))
             if gate is not None and st.gate is None:
                 st.gate = Gate.from_record(gate)
+            if compare is not None and st.compare is None:
+                st.compare = compare
             outcome = value["outcome"]
             if outcome == "pass":
                 st.passes += 1
@@ -1680,6 +2503,18 @@ class ProbabilityAggregator:
             self._aggregates = out
         return self._aggregates
 
+    def comparisons(self) -> list[Comparison]:
+        """Every comparison (``comparisons_of``), computed once after
+        every result is in; like ``aggregates()``, independent of the
+        order results arrived in."""
+        if self._comparisons is None:
+            self._comparisons = comparisons_of(
+                self._stats.values(),
+                stats_config(self._config),
+                compare_config(self._config).adjust,
+            )
+        return self._comparisons
+
     def _shown_aggregates(self) -> list[Aggregate]:
         """The aggregates the summary prints: those with an interval,
         unless intervals are hidden. Overall is left out when it would
@@ -1702,11 +2537,13 @@ class ProbabilityAggregator:
             return
         results = self.gate_results()
         gcfg = gate_config(session.config)
-        if exitstatus == pytest.ExitCode.OK and any(
-            gcfg.fails(r.verdict) for r in results.values()
-        ):
-            # Every run passed or was xfailed, but a gate did not hold.
-            # Any other status (failures, interrupts) already says more.
+        verdicts = [r.verdict for r in results.values()] + [
+            c.verdict for c in self.comparisons() if c.verdict is not None
+        ]
+        if exitstatus == pytest.ExitCode.OK and any(map(gcfg.fails, verdicts)):
+            # Every run passed or was xfailed, but a gate or a margin did
+            # not hold. Any other status (failures, interrupts) already
+            # says more.
             exitstatus = session.exitstatus = pytest.ExitCode.TESTS_FAILED
         if not self._json_path:
             return
@@ -1751,6 +2588,7 @@ class ProbabilityAggregator:
                 for s in all_stats
             ],
             "aggregates": [a.to_json() for a in self.aggregates()],
+            "comparisons": [c.to_json() for c in self.comparisons()],
             "records": self._records or [],
         }
         if self._explain:
@@ -1762,6 +2600,8 @@ class ProbabilityAggregator:
                     ).text()
             for agg, entry in zip(self.aggregates(), payload["aggregates"]):
                 entry["explanation"] = self._aggregate_reading(agg).text()
+            for cmp, entry in zip(self.comparisons(), payload["comparisons"]):
+                entry["explanation"] = self._comparison_reading(cmp).text()
         path = Path(self._json_path)
         if path.parent != Path(""):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1884,6 +2724,16 @@ class ProbabilityAggregator:
                 line += f"  ({r.excluded} errored, excluded)"
             tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
 
+    def _write_comparisons(self, tr) -> None:
+        """The ``probability: comparisons`` block (nothing when no
+        function is compared)."""
+        comparisons = self.comparisons()
+        if not comparisons:
+            return
+        tr.write_sep("=", "probability: comparisons")
+        for line, verdict in _comparison_lines(comparisons):
+            tr.write_line(line, **_VERDICT_MARKUP.get(verdict, {}))
+
     @staticmethod
     def _aggregate_lines(shown: list[Aggregate]) -> list[str]:
         """``classify  N=40 inputs × k=10  81.4%  [75.0%, 87.2%]  ρ=0.60``,
@@ -1925,6 +2775,15 @@ class ProbabilityAggregator:
         cfg = stats_config(self._config)
         return explain.aggregate_reading(agg, cfg.min_inputs)
 
+    def _comparison_reading(self, cmp: Comparison):
+        from . import explain
+
+        return explain.comparison_reading(
+            cmp,
+            undecided_fails=gate_config(self._config).fails(UNDECIDED),
+            min_inputs=stats_config(self._config).min_inputs,
+        )
+
     def _gate_reading(self, s: CaseStats, result: GateResult):
         from . import explain
 
@@ -1946,7 +2805,11 @@ class ProbabilityAggregator:
 
         cfg = stats_config(self._config)
         interval = cfg.interval(s.passes, s.total) if s.total else None
-        return explain.row_reading(s, interval, cfg, gated=s.gate is not None)
+        # A margin, like a gate, judges the case: its reading has the step.
+        judged = s.gate is not None or bool(
+            s.compare and s.compare["margin"] is not None
+        )
+        return explain.row_reading(s, interval, cfg, gated=judged)
 
     def _write_explained(
         self, tr, all_stats: list[CaseStats], results: dict[str, GateResult]
@@ -1968,6 +2831,7 @@ class ProbabilityAggregator:
             elif s.status != "pass":
                 readings.append(self._row_reading(s))
         readings.extend(self._aggregate_reading(a) for a in self._shown_aggregates())
+        readings.extend(self._comparison_reading(c) for c in self.comparisons())
         # The main table's interval column needs explaining even when no
         # row is notable.
         cfg = stats_config(self._config)
@@ -2042,10 +2906,11 @@ class ProbabilityAggregator:
                 tr.write_line(line.rstrip())
         if self._json_path:
             tr.write_line(f"  Report:  {self._json_path}")
+        self._write_comparisons(tr)
         self._write_gates(tr, results)
         if self._explain:
             self._write_explained(tr, all_stats, results)
-        elif any(r.verdict != PASS for r in results.values()):
+        elif self.comparisons() or any(r.verdict != PASS for r in results.values()):
             from .explain import HINT
 
             tr.write_line("")

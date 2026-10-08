@@ -28,8 +28,20 @@ def bench_triage(text, style):
   triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 ```
 
-Two rows, one comparison: the cheap prompt is a coin flip, the
-expensive one holds — with the price difference right next to it.
+Two rows side by side: the cheap prompt is a coin flip, the expensive
+one held all ten runs — with the price difference right next to it.
+To compare them rather than eyeball them, name the axis with
+`@pytest.mark.probability(compare="style")` or `--prob-compare=style`:
+
+```text
+=========================== probability: comparisons ===========================
+  triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47  1 paired  cost ×4.0
+```
+
+On one input, +20 points could still be luck (the interval includes
+no difference). Every other parameter makes up the *input* the arms
+are paired on, so more inputs make the comparison sharper; see
+Comparisons in {doc}`reference`.
 
 Row identity is the function's short name plus the full composed id
 (`triage::refund-terse`); items are
@@ -42,6 +54,10 @@ put the *inputs* on one axis with explicit `id=`s, and the
 *configurations you are comparing* (models, prompts, thresholds) on
 their own axes with value-derived ids. The composed id then reads
 `<input>-<config>`, and the summary rows group naturally.
+A comparison makes that convention explicit: `compare=` names the
+configuration axis, and the ids of all the other axes form the input
+(`refund`, or `refund-m1` with a model axis too) that each
+configuration is paired on.
 
 ## Marks
 

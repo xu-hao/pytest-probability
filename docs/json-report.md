@@ -87,6 +87,43 @@ only the controller writes it, with the full result set.
       "width_factor": 0.8018541014424008
     }
   ],
+  "comparisons": [
+    {
+      "function": "triage",
+      "axis": "style",
+      "baseline": "terse",
+      "arm": "chain_of_thought",
+      "pairs": 1,
+      "unpaired": [],
+      "difference": 0.19999999999999996,
+      "ci": {"method": "newcombe", "level": 0.95,
+             "low": -0.1123531026122217, "high": 0.5098375284633582},
+      "p": 0.4736842105263155,
+      "p_method": "fisher",
+      "exact": true,
+      "p_adjusted": 0.4736842105263155,
+      "adjustment": "none",
+      "family": 1,
+      "exploratory": false,
+      "margin": null,
+      "equivalence": false,
+      "verdict": null,
+      "suppressed": null,
+      "resamples": 5000,
+      "seed": 0,
+      "cost_ratio": 4.0,
+      "inputs": [
+        {"input": "refund",
+         "baseline": {"passes": 8, "total": 10},
+         "arm": {"passes": 10, "total": 10},
+         "difference": 0.19999999999999996,
+         "ci": {"method": "newcombe", "level": 0.95,
+                "low": -0.1123531026122217, "high": 0.5098375284633582},
+         "p": 0.4736842105263155,
+         "p_method": "fisher"}
+      ]
+    }
+  ],
   "records": [
     {
       "case": "triage::refund-terse",
@@ -116,6 +153,7 @@ Top level:
 | `totals` | object | Aggregates over every row: `passes`, `fails`, `errors`, `count`, `pass_rate`, `cost`, `usage` |
 | `rows` | array | One entry per case, in encounter order |
 | `aggregates` | array | One entry per bench function, by name, then one for Overall (below); empty when nothing ran |
+| `comparisons` | array | One entry per compared arm (below): functions by name, arms in parametrize order; empty when nothing is compared |
 | `records` | array | One entry per executed run |
 
 `rows[]` — the aggregate view, mirroring the terminal table:
@@ -179,6 +217,37 @@ The bootstrap draws from the cases in case-id order with the recorded
 `seed`, and entries are sorted by name, so the same results give the
 same `aggregates` — with or without pytest-xdist.
 
+`comparisons[]` — each arm against its function's baseline (see
+Comparisons in {doc}`reference`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `function` | `str` | The bench function's short name (`triage`) |
+| `axis` | `str` | The compared parametrize argument (`style`) |
+| `baseline` / `arm` | `str` | The two arms' ids; the difference is arm − baseline |
+| `pairs` | `int` | Inputs that ran in both arms |
+| `unpaired` | array | Ids of inputs that ran in only one of the two, sorted; left out |
+| `difference` | `float \| null` | Mean over paired inputs of the arm's pass fraction minus the baseline's, in [−1, 1]; `null` with no pairs |
+| `ci` | object \| `null` | `method` (`"newcombe"` for one pair, `"bootstrap"` for a paired bootstrap over inputs), `level`, unrounded `low`/`high`. `null` when `suppressed` |
+| `p` | `float \| null` | Two-sided p-value, unadjusted; `null` with no pairs |
+| `p_method` | `str \| null` | `"fisher"` (one pair) or `"sign-flip"` (permutation test on the per-input differences) |
+| `exact` | `bool \| null` | Whether `p` is exact (`false`: a Monte Carlo estimate from `resamples` sign patterns) |
+| `p_adjusted` | `float \| null` | `p` after `adjustment` over the session's `family`; equals `p` under `none` |
+| `adjustment` | `str` | `--prob-adjust`: `"none"`, `"holm"`, `"bonferroni"` or `"bh"` |
+| `family` | `int` | How many comparisons in the session have a p-value |
+| `exploratory` | `bool` | `true` when `adjustment` is `"none"` and `family` > 1 |
+| `margin` / `equivalence` | `float \| null` / `bool` | The comparison's margin (`null`: no verdict) and rule |
+| `verdict` | `str \| null` | `"pass"`, `"fail"` or `"undecided"` with a margin, read off `ci`; `null` without one |
+| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 paired inputs"`, `"no paired inputs"` |
+| `resamples` / `seed` | `int` | The bootstrap's and the Monte Carlo sign-flip test's settings |
+| `cost_ratio` | `float \| null` | The arm's recorded cost per run over the baseline's, on the paired inputs; `null` unless both recorded cost |
+| `inputs` | array | One entry per paired input, sorted by id: `input`, `baseline` and `arm` as `{passes, total}`, `difference`, a Newcombe `ci`, a Fisher `p` (never adjusted) |
+| `explanation` | `str` | Only with `--prob-explain`: the comparison in plain language |
+
+Inputs are sorted by id and the bootstrap and sign-flip test are
+seeded, so the same results give the same `comparisons`, with or
+without pytest-xdist.
+
 `records[]` — the raw view, one per (case, run) execution:
 
 | Field | Type | Meaning |
@@ -232,6 +301,13 @@ Print each function's average and interval, with the cross-check:
 ```bash
 jq '.aggregates[] | select(.ci)
     | {name, inputs, estimate, low: .ci.low, high: .ci.high, normal: .normal_ci}' report.json
+```
+
+List each comparison with its interval and p-value:
+
+```bash
+jq '.comparisons[] | {function, arm, baseline, pairs, difference,
+    low: .ci.low, high: .ci.high, p: .p_adjusted, verdict}' report.json
 ```
 
 Pull the flaky rows with `jq`:

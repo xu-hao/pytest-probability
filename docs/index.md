@@ -103,7 +103,7 @@ def bench_triage(text, prompt):
 ```
 
 ```text
-$ pytest bench_triage.py --prob-runs=10
+$ pytest bench_triage.py --prob-runs=10 --prob-compare=prompt
 ...
   triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
   triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
@@ -112,12 +112,21 @@ $ pytest bench_triage.py --prob-runs=10
   Cost:    $0.0050
   Tokens:  m-small  1,200 in / 80 out / 640 cached  $0.0010
            m-large  4,800 in / 900 out              $0.0040
+=========================== probability: comparisons ===========================
+  triage[prompt]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47  1 paired  cost ×4.0
 ```
 
-That table is the whole decision: prompt B eliminates the flakiness at
-four times the price. Select one arm with `-k terse`, add a third
-prompt by adding a string, compare models the same way with a second
-axis.
+`--prob-compare=prompt` sets each prompt against the first on the same
+inputs. Here the honest reading is that the data can't tell yet: on
+one input, +20 points has a 95% interval from −11 to +51, and p = 0.47
+says a gap this big would turn up by chance about half the time even
+if the prompts were equally good. What the line does settle is the
+price: chain_of_thought costs four times as much per run. Add inputs
+and the comparison becomes a paired average over them; give it a
+`margin=` and it becomes a gate. Select one arm with `-k terse`, add a
+third prompt by adding a string (each is compared with the baseline),
+compare models the same way with a second axis. See
+[Comparisons](reference.md#comparisons).
 
 ## Benchmark-driven development
 

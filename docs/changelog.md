@@ -79,6 +79,37 @@
   `width_factor` (`null` when left out). `--prob-explain` explains ρ
   and the projection in words and bases its next step on them. New
   `stats.icc`, `stats.width_factor` and `stats.projected_width`.
+- **Comparisons:** `@pytest.mark.probability(compare="style")` (or
+  `--prob-compare=style` / `prob_compare` for every function with that
+  parametrize argument) compares each value of the axis — each *arm* —
+  with the baseline (the first value, or `baseline=`), paired by input
+  (the case's other parameters). A `probability: comparisons` block
+  prints one line per arm — `triage[style]  chain_of_thought − terse
+  +20 pp [−11, +51]  p=0.47  1 paired  cost ×4.0` — with the mean
+  difference in percentage points, its interval, a p-value, the pair
+  count (`, N unpaired` for inputs missing an arm, which are left out)
+  and the cost ratio per run. One input: that input's Newcombe interval
+  and Fisher's exact p. With at least `prob_min_inputs` pairs: a paired
+  cluster bootstrap over inputs (`prob_bootstrap`, `prob_seed`) and an
+  exact-when-cheap, else seeded Monte Carlo, sign-flip permutation p
+  (McNemar's exact test with one run per arm); in between, the
+  average and p, plus one line per input with its own interval.
+  `margin=0.02` makes it a non-inferiority gate (lower bound above −2
+  points) and `equivalence=True` an equivalence gate (interval within
+  ±2 points): the function's failing runs are xfailed and the verdicts
+  set the exit status, with `--prob-undecided` as for gates.
+  `--prob-adjust` / `prob_adjust` (`none`, `holm`, `bonferroni`, `bh`)
+  adjusts the session's p-values for the number of comparisons; under
+  the default `none`, several comparisons are labelled exploratory.
+  **JSON:** a new top-level `comparisons[]` (function, axis, baseline,
+  arm, pairs, unpaired, difference, ci, p, p_method, exact,
+  p_adjusted, adjustment, family, exploratory, margin, equivalence,
+  verdict, cost_ratio and per-input `inputs[]`). `--prob-explain`
+  reads each comparison in plain words, including what its p-value
+  means, and the hint also appears when comparisons are shown. Suites
+  without a compared function are unchanged apart from the empty
+  `comparisons` list. New `stats.sign_flip_test` and
+  `stats.adjust_pvalues`.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function

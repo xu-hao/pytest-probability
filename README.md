@@ -127,10 +127,30 @@ def bench_triage(text, style):
     assert response.answer == "billing"
 ```
 
+Name the axis and each arm is compared with the baseline (the first
+value; `baseline=` picks another) on the inputs both ran:
+
 ```
+$ pytest benchmarks/ --prob-runs=10 --prob-compare=style
+...
   triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
   triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
+...
+=========================== probability: comparisons ===========================
+  triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47  1 paired  cost ×4.0
 ```
+
+10/10 against 8/10 looks like a win, but it is one input: the
+difference is +20 points with a 95% interval from −11 to +51, and
+p = 0.47 — if the prompts were equally good, a gap this big would turn
+up by chance about half the time. The data can't tell yet which prompt
+is better; what it does show is that chain_of_thought costs four times
+as much per run. Add inputs: with 10 or more pairs the interval comes
+from a paired bootstrap over inputs and p from a sign-flip test on the
+per-input differences. `@pytest.mark.probability(compare="style",
+margin=0.02)` makes it a gate — the arm may be at most 2 points worse
+(`equivalence=True`: within ±2 points) — and `--prob-adjust=holm`
+corrects p for several arms.
 
 ### Gates: pass on a rate, not on every run
 
@@ -204,6 +224,8 @@ consistently right or wrong, so add inputs instead.
 | `--prob-explain` | CLI | ini or off | add a plain-language reading of the results (terminal and JSON) |
 | `--prob-bootstrap=N` | CLI | ini or 5000 | bootstrap resamples for function-level and overall intervals |
 | `--prob-seed=SEED` | CLI | ini or 0 | seed for every resampling procedure |
+| `--prob-compare=AXIS` | CLI | ini or none | compare the values of parametrize argument AXIS, each against the first |
+| `--prob-adjust=M` | CLI | ini or `none` | adjust comparison p-values: `none` (exploratory), `holm`, `bonferroni`, `bh` |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -218,8 +240,10 @@ consistently right or wrong, so add inputs instead.
 | `prob_explain` | ini | false | default for `--prob-explain` |
 | `prob_bootstrap` | ini | 5000 | default for `--prob-bootstrap` |
 | `prob_seed` | ini | 0 | default for `--prob-seed` |
-| `prob_min_inputs` | ini | 10 | fewest cases a function needs for its function-level interval |
-| `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior` |
+| `prob_min_inputs` | ini | 10 | fewest cases a function needs for its function-level interval (and fewest paired inputs for a comparison's) |
+| `prob_compare` | ini | — | default for `--prob-compare` |
+| `prob_adjust` | ini | `none` | default for `--prob-adjust` |
+| `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`) |
 
 ## JSON report
 
