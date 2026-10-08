@@ -22,9 +22,9 @@ How it fits together:
   with the line itself as its ``heading``, a few ``paragraphs`` of
   body, a ``tone`` (a verdict or status, for coloring) and the
   glossary ``terms`` it relied on. There is one function per kind of
-  line: ``gate_reading`` and ``row_reading`` today; later features add
-  their own (``aggregate_reading``, ``comparison_reading``, …) next to
-  them.
+  line: ``gate_reading``, ``row_reading`` and ``aggregate_reading``
+  today; later features add their own (``comparison_reading``, …) next
+  to them.
 - The *glossary* ("Methods used") lists only the terms the readings
   used. Each entry is a function registered with ``@glossary_entry``
   under a key; a reading names ``(key, detail)`` pairs in ``terms``,
@@ -37,8 +37,8 @@ How it fits together:
   JSON report carries.
 
 Everything is duck-typed on the plugin's objects (``GateResult``,
-``CaseStats``, ``StatsConfig``). The plugin imports this module only
-when it needs it, so the dependency runs one way.
+``CaseStats``, ``StatsConfig``, ``Aggregate``). The plugin imports this
+module only when it needs it, so the dependency runs one way.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterable
 
-from .plugin import FAIL, PASS, UNDECIDED, _pct, _pct_bar
+from .plugin import FAIL, PASS, UNDECIDED, _pct, _pct1, _pct_bar
 
 #: The last line of the normal summary when something deserves a
 #: closer look and ``--prob-explain`` is off.
@@ -375,6 +375,55 @@ def row_reading(
     return Reading(heading, tuple(paras), status, tuple(terms))
 
 
+def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
+    """A function-level (or Overall) line explained.
+
+    ``agg`` is an ``Aggregate``; ``min_inputs`` the session's
+    ``prob_min_inputs``. An aggregate without an interval (too few
+    inputs) only reaches the JSON report, and its reading says why.
+    """
+    n, est = agg.inputs, _pct1(agg.estimate)
+    heading = f"{agg.name}  {agg.size()}  {est}"
+    if agg.ci is not None:
+        heading += f"  [{_pct1(agg.ci[0])}, {_pct1(agg.ci[1])}]"
+    if agg.scope == "overall":
+        whose, subject = f"All {n} inputs in this session", "your code"
+    else:
+        whose, subject = f"{agg.name}'s {n} inputs", agg.name
+    terms = (("aggregate", (agg.level, agg.resamples, agg.seed, min_inputs)),)
+
+    first = (
+        f"{whose} passed {est} of their runs on average, each input counting"
+        " equally"
+    )
+    low, _, high = agg.runs
+    if low != high:
+        first += f" however many runs it had ({low} to {high})"
+    first += "."
+    if agg.ci is None:
+        paras = (
+            f"{first} No range is shown: with fewer than {min_inputs} inputs"
+            " (prob_min_inputs), a range worked out from the inputs alone comes"
+            " out too narrow.",
+            f"Next: add inputs (more parametrize cases) to reach {min_inputs}.",
+        )
+        return Reading(heading, paras, None, terms)
+    paras = (
+        f"{first} The true average pass rate is probably between"
+        f" {_pct1(agg.ci[0])} and {_pct1(agg.ci[1])}"
+        f" ({_pct_bar(agg.level)} confidence).",
+        f"That range treats these {n} inputs as a random sample of the inputs"
+        f" {subject} will meet, so it allows for other inputs doing better or"
+        " worse, not only for runs varying. If you picked the inputs by hand"
+        " rather than at random, it measures the cases you chose, not inputs"
+        " in general.",
+        "Next: to narrow the range, add inputs. More runs of the same inputs"
+        " narrow it less, often much less, because they can't show how other"
+        " inputs would do.",
+    )
+    return Reading(heading, paras, None, terms)
+
+
 # ---------------------------------------------------------------------------
 # Glossary ("Methods used")
 # ---------------------------------------------------------------------------
@@ -459,6 +508,26 @@ def _excluded_entry(_: list) -> str:
     return (
         f"Runs that errored ({_ERRORED}). Under prob_errors = exclude a gate"
         " leaves them out, so they count neither for nor against the case."
+    )
+
+
+@glossary_entry("aggregate", "N inputs × k")
+def _aggregate_entry(keys: list[tuple]) -> str:
+    return " ".join(
+        [
+            "An average over inputs: each input's share of passing runs,"
+            " averaged so every input counts equally. N is the number of"
+            " inputs and k the runs each had (a range when they differ). The"
+            " range beside it comes from re-drawing the set of inputs at random"
+            " many times, keeping each input's runs together, and seeing how"
+            " far the average moves.",
+            *(
+                f"(A bootstrap over inputs: {resamples:,} re-draws, seed {seed},"
+                f" {_pct_bar(level)} confidence. Shown only with {min_inputs} or"
+                " more inputs; with fewer, the range comes out too narrow.)"
+                for level, resamples, seed, min_inputs in keys
+            ),
+        ]
     )
 
 

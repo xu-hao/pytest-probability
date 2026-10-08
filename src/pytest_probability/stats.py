@@ -20,7 +20,8 @@ Contents:
   ``proportion_interval`` dispatcher keyed by method name.
 - **Two proportions** — ``newcombe`` (interval on p1 − p2) and
   ``fisher_exact`` (p-value).
-- **Resampling** — ``bootstrap`` (seeded) and ``percentile_interval``.
+- **Resampling** — ``bootstrap`` (seeded) and ``percentile_interval``,
+  with ``normal_interval`` on a mean as the cross-check.
 
 Conventions:
 
@@ -542,3 +543,22 @@ def percentile_interval(
         raise ValueError("samples must not be empty")
     ordered = sorted(samples)
     return _quantile(ordered, alpha / 2.0), _quantile(ordered, 1.0 - alpha / 2.0)
+
+
+def normal_interval(data: Sequence[float], level: float = 0.95) -> tuple[float, float]:
+    """Normal-approximation interval for the mean of ``data``.
+
+    mean ± z·s/√N, with s the sample standard deviation (N − 1
+    divisor). The textbook cross-check for a bootstrap interval on a
+    mean: the two agree closely once N is moderate, and a gap between
+    them says the bootstrap distribution is skewed — typically rates
+    near 0 or 1. Not clipped, unlike the proportion intervals above: a
+    bound past 0 or 1 is itself the sign that the approximation is
+    poor there.
+    """
+    z = _z(_check_level(level))
+    if len(data) < 2:
+        raise ValueError(f"data must have at least 2 values, got {len(data)}")
+    mean = statistics.fmean(data)
+    half = z * statistics.stdev(data, mean) / math.sqrt(len(data))
+    return mean - half, mean + half

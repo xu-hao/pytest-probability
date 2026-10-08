@@ -313,6 +313,89 @@ def test_about_rounds_up_to_two_figures(n, text):
     assert explain.about(n) == text
 
 
+def _agg(counts, scope="function", name="classify", **cfg):
+    """An aggregate reading over cases with these (passes, runs)."""
+    from pytest_probability.plugin import aggregate
+
+    cases = [
+        CaseStats(f"{name}::{i}", p, n - p) for i, (p, n) in enumerate(counts)
+    ]
+    cfg = StatsConfig(**cfg)
+    return explain.aggregate_reading(
+        aggregate(scope, name, cases, cfg), cfg.min_inputs
+    )
+
+
+AGG_CAVEAT = (
+    "That range treats these 12 inputs as a random sample of the inputs"
+    " {who} will meet, so it allows for other inputs doing better or"
+    " worse, not only for runs varying. If you picked the inputs by hand"
+    " rather than at random, it measures the cases you chose, not inputs in"
+    " general."
+)
+AGG_NEXT = (
+    "Next: to narrow the range, add inputs. More runs of the same inputs"
+    " narrow it less, often much less, because they can't show how other"
+    " inputs would do."
+)
+# 12 inputs passing 2, 4, 6, 8, 10, 2, ... of 10 runs.
+AGG_COUNTS = [(i % 5 * 2 + 2, 10) for i in range(12)]
+
+
+def test_aggregate_function_template():
+    r = _agg(AGG_COUNTS)
+    assert r.heading == "classify  N=12 inputs × k=10  55.0%  [40.0%, 71.7%]"
+    assert r.paragraphs == (
+        "classify's 12 inputs passed 55.0% of their runs on average, each"
+        " input counting equally. The true average pass rate is probably"
+        " between 40.0% and 71.7% (95% confidence).",
+        AGG_CAVEAT.format(who="classify"),
+        AGG_NEXT,
+    )
+    assert r.tone is None
+    assert r.terms == (("aggregate", (0.95, 5000, 0, 10)),)
+
+
+def test_aggregate_overall_template():
+    r = _agg(AGG_COUNTS, scope="overall", name="Overall", level=0.9, seed=3)
+    assert r.heading.startswith("Overall  N=12 inputs × k=10  55.0%  [")
+    assert r.paragraphs[0].startswith(
+        "All 12 inputs in this session passed 55.0% of their runs on average,"
+    )
+    assert "(90% confidence)" in r.paragraphs[0]
+    assert r.paragraphs[1] == AGG_CAVEAT.format(who="your code")
+    assert r.terms == (("aggregate", (0.9, 5000, 3, 10)),)
+
+
+def test_aggregate_uneven_runs_template():
+    r = _agg([(10, 10)] + [(0, 1)] * 9, name="mixed")
+    assert r.heading == "mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]"
+    assert r.paragraphs[0].startswith(
+        "mixed's 10 inputs passed 10.0% of their runs on average, each input"
+        " counting equally however many runs it had (1 to 10)."
+    )
+
+
+def test_aggregate_too_few_inputs_template():
+    r = _agg([(3, 4), (4, 4)], name="small")
+    assert r.heading == "small  N=2 inputs × k=4  87.5%"
+    assert r.text() == (
+        "small's 2 inputs passed 87.5% of their runs on average, each input"
+        " counting equally. No range is shown: with fewer than 10 inputs"
+        " (prob_min_inputs), a range worked out from the inputs alone comes"
+        " out too narrow.\n"
+        "Next: add inputs (more parametrize cases) to reach 10."
+    )
+
+
+def test_aggregate_avoids_jargon():
+    text = " ".join(
+        _agg(AGG_COUNTS).paragraphs + _agg([(1, 2), (2, 2)]).paragraphs
+    ).lower()
+    for word in ("null hypothesis", "reject", "significant", "alpha", "cluster"):
+        assert word not in text
+
+
 # ---------------------------------------------------------------------------
 # Glossary
 # ---------------------------------------------------------------------------
@@ -400,6 +483,28 @@ def test_glossary_entries_text():
         " failed assert). Under prob_errors = exclude a gate leaves them out,"
         " so they count neither for nor against the case.",
     }
+
+
+def test_glossary_aggregate_entry():
+    entries = _entries(("aggregate", (0.95, 5000, 0, 10)))
+    assert entries == {
+        "N inputs × k": "An average over inputs: each input's share of passing"
+        " runs, averaged so every input counts equally. N is the number of"
+        " inputs and k the runs each had (a range when they differ). The"
+        " range beside it comes from re-drawing the set of inputs at random"
+        " many times, keeping each input's runs together, and seeing how far"
+        " the average moves. (A bootstrap over inputs: 5,000 re-draws, seed"
+        " 0, 95% confidence. Shown only with 10 or more inputs; with fewer,"
+        " the range comes out too narrow.)"
+    }
+    # after the interval entry, which the table's column uses
+    labels = [
+        label
+        for label, _ in explain.glossary(
+            [("aggregate", (0.9, 100, 1, 5)), ("interval", ("exact", 0.9, None))]
+        )
+    ]
+    assert labels == ["[low, high]", "N inputs × k"]
 
 
 def test_glossary_registry_is_extensible():
@@ -854,3 +959,62 @@ def bench_shaky():
     assert [(r["explanation"], (r["gate"] or {}).get("explanation")) for r in s] == [
         (r["explanation"], (r["gate"] or {}).get("explanation")) for r in d
     ]
+
+
+BENCH_AGG = """
+import pytest
+
+_calls = {}
+
+# Under --prob-runs=2, input i passes its first i % 3 runs.
+@pytest.mark.parametrize("i", range(12))
+def bench_classify(i):
+    _calls[i] = _calls.get(i, 0) + 1
+    assert _calls[i] <= i % 3
+"""
+
+
+def test_aggregate_explained(pytester, columns):
+    pytester.makepyfile(bench_a=BENCH_AGG)
+    result = _run(pytester, "--prob-runs=2", "--prob-explain")
+    blocks = _blocks(_section(result))
+    # after the row readings, before the glossary
+    assert blocks[-2] == (
+        "  classify  N=12 inputs × k=2  50.0%  [29.2%, 75.0%]",
+        "    classify's 12 inputs passed 50.0% of their runs on average, each input",
+        "    counting equally. The true average pass rate is probably between 29.2% and",
+        "    75.0% (95% confidence).",
+        "    That range treats these 12 inputs as a random sample of the inputs classify",
+        "    will meet, so it allows for other inputs doing better or worse, not only for",
+        "    runs varying. If you picked the inputs by hand rather than at random, it",
+        "    measures the cases you chose, not inputs in general.",
+        "    Next: to narrow the range, add inputs. More runs of the same inputs narrow",
+        "    it less, often much less, because they can't show how other inputs would do.",
+    )
+    glossary = blocks[-1]
+    assert any(ln.startswith("    N inputs × k  An average over") for ln in glossary)
+
+
+def test_aggregate_not_explained_when_hidden(pytester, columns):
+    pytester.makepyfile(bench_a=BENCH_AGG)
+    result = _run(
+        pytester, "--prob-runs=2", "--prob-explain", "--prob-no-intervals"
+    )
+    text = "\n".join(_section(result))
+    assert "N=12 inputs" not in text and "N inputs × k" not in text
+
+
+def test_aggregate_json_explanations(pytester, columns):
+    pytester.makepyfile(bench_a=BENCH_AGG, bench_f=BENCH_FLAKY)
+    _run(pytester, "--prob-runs=2", "--prob-explain", "--prob-json=r.json")
+    aggs = json.loads((pytester.path / "r.json").read_text())["aggregates"]
+    by_name = {a["name"]: a["explanation"] for a in aggs}
+    assert by_name["classify"].startswith("classify's 12 inputs passed 50.0%")
+    assert by_name["classify"].endswith(
+        "because they can't show how other inputs would do."
+    )
+    # too few inputs for a range: JSON only, and it says why
+    assert by_name["wobbly"].endswith(
+        "Next: add inputs (more parametrize cases) to reach 10."
+    )
+    assert by_name["Overall"].startswith("All 13 inputs in this session passed")

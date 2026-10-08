@@ -655,6 +655,11 @@ def _cell(row):
     return re.sub(r"\s+", " ", re.search(r"\[[^]]*\]", row).group())
 
 
+# The bootstrap settings stats_config carries since function-level
+# intervals (#4), at their defaults.
+AGG_DEFAULTS = {"resamples": 5000, "seed": 0, "min_inputs": 10}
+
+
 def _expected_cell(x, n, level=0.95, method="exact", prior=(1.0, 1.0)):
     import math
 
@@ -779,6 +784,7 @@ def test_bayes_uses_prior(pytester):
         "method": "bayes",
         "level": 0.95,
         "prior": [0.5, 0.5],
+        **AGG_DEFAULTS,
     }
     row = next(r for r in data["rows"] if r["case"] == "classify::identify_pii")
     assert (row["ci"]["low"], row["ci"]["high"]) == pytest.approx(
@@ -819,6 +825,7 @@ def test_cli_beats_ini(pytester):
         "method": "wilson",
         "level": 0.99,
         "prior": [1.0, 1.0],
+        **AGG_DEFAULTS,
     }
     # ini prob_intervals = false still hides the column (no CLI to re-enable)
     assert not any("[" in r for r in _summary_rows(result))
@@ -835,6 +842,7 @@ def test_json_ci_and_stats_config_defaults(pytester):
         "method": "exact",
         "level": 0.95,
         "prior": [1.0, 1.0],
+        **AGG_DEFAULTS,
     }
     rows = {r["case"]: r for r in data["rows"]}
     ci = rows["classify::is_question"]["ci"]
@@ -1731,3 +1739,322 @@ def test_regular_suite_unchanged_by_global_gate(pytester):
     strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
     assert strip(base) == strip(gated)
     assert gated.ret == pytest.ExitCode.OK
+
+
+# ---------------------------------------------------------------------------
+# Function-level and overall intervals
+# ---------------------------------------------------------------------------
+
+# Pass or fail is fixed by the parameter, so results are the same in
+# any process and xdist may spread them however it likes. classify's 12
+# cases fail when i % 3 == 0 (8 of 12 pass), small's 6 when i < 3: so
+# classify gets a line (12 ≥ 10 inputs), small doesn't (6), and Overall
+# (18) does. Few failing runs on purpose: rendering their tracebacks is
+# what makes a pytester run slow.
+BENCH_AGG = """
+import pytest
+
+@pytest.mark.parametrize("i", range(12))
+def bench_classify(i):
+    assert i % 3
+
+@pytest.mark.parametrize("i", range(6))
+def bench_small(i):
+    assert i >= 3
+"""
+
+# Per-case (passes, runs), keyed by case id.
+AGG_COUNTS = {
+    **{f"classify::{i}": (int(i % 3 != 0), 1) for i in range(12)},
+    **{f"small::{i}": (int(i >= 3), 1) for i in range(6)},
+}
+
+
+def _aggregate_block(result):
+    """The aggregate lines between the rows and the footer ([] if none)."""
+    lines = result.stdout.lines
+    start = next(i for i, ln in enumerate(lines) if "= probability =" in ln)
+    rest = lines[start + 1 :]
+    after_rows = rest[rest.index("") + 1 :]
+    if after_rows[0].startswith("  Overall:"):
+        return []
+    return after_rows[: after_rows.index("")]
+
+
+def _expected_aggregate(cases, level=0.95, resamples=5000, seed=0):
+    """(estimate, ci, normal_ci) computed directly with the stats module:
+    per-case fractions in case-id order, resampled whole."""
+    import statistics
+
+    from pytest_probability import stats
+
+    values = [AGG_COUNTS[c][0] / AGG_COUNTS[c][1] for c in sorted(cases)]
+    samples = stats.bootstrap(values, resamples=resamples, seed=seed)
+    return (
+        statistics.fmean(values),
+        stats.percentile_interval(samples, level),
+        stats.normal_interval(values, level),
+    )
+
+
+def _p1(p):
+    import math
+
+    return f"{math.floor(p * 1000 + 0.5) / 10:.1f}%"
+
+
+def test_aggregate_lines_match_a_direct_bootstrap(pytester):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    result = _run(pytester)
+    classify = [c for c in AGG_COUNTS if c.startswith("classify")]
+    est, (lo, hi), _ = _expected_aggregate(classify)
+    o_est, (o_lo, o_hi), _ = _expected_aggregate(AGG_COUNTS)
+    assert _aggregate_block(result) == [
+        f"  classify  N=12 inputs × k=1  {_p1(est)}  [{_p1(lo)}, {_p1(hi)}]",
+        f"  Overall   N=18 inputs × k=1  {_p1(o_est)}  [{_p1(o_lo)}, {_p1(o_hi)}]",
+    ]
+    assert (_p1(est), _p1(o_est)) == ("66.7%", "61.1%")
+
+
+def test_aggregate_shown_only_with_min_inputs(pytester):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    def names(min_inputs):
+        result = _run(pytester, "-o", f"prob_min_inputs={min_inputs}")
+        return [ln.split()[0] for ln in _aggregate_block(result)]
+
+    assert names(10) == ["classify", "Overall"]  # the default
+    assert names(6) == ["classify", "small", "Overall"]
+    assert names(13) == ["Overall"]
+    assert names(19) == []
+
+
+def test_aggregate_hidden_for_small_suites(pytester):
+    # Fewer than prob_min_inputs cases: the summary is exactly as before.
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, "--prob-runs=10")
+    assert _aggregate_block(result) == []
+    lines = result.stdout.lines
+    at = lines.index("  classify::never          0/10  [ 0%,  31%]  FAIL")
+    assert lines[at + 1 : at + 3] == ["", "  Overall: 17/30 passed (57%)"]
+
+
+def test_single_function_has_no_overall_line(pytester):
+    # an empty parametrize list: bench_small has no cases
+    pytester.makepyfile(bench_agg=BENCH_AGG.replace("range(6)", "range(0)"))
+    result = _run(pytester, "--prob-json=r.json")
+    block = _aggregate_block(result)
+    assert [ln.split()[0] for ln in block] == ["classify"]
+    # ... but the JSON report still has it
+    assert [a["scope"] for a in _json(pytester)["aggregates"]] == [
+        "function",
+        "overall",
+    ]
+
+
+def test_aggregate_weights_inputs_equally(pytester):
+    # 10 inputs: one with 10/10, nine with 0/1. Pooled that is 10/19
+    # runs; per input it is 1 pass in 10 inputs.
+    pytester.makepyfile(
+        bench_w="""
+import pytest
+
+@pytest.mark.parametrize("i", [
+    pytest.param(0, marks=pytest.mark.probability(runs=10)),
+    *range(1, 10),
+])
+def bench_mixed(i):
+    assert i == 0
+"""
+    )
+    result = _run(pytester, "--prob-json=r.json")
+    assert _aggregate_block(result) == [
+        "  mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]"
+    ]
+    agg = _json(pytester)["aggregates"][0]
+    assert agg["estimate"] == pytest.approx(0.1)
+    assert agg["runs"] == {"min": 1, "mean": 1.9, "max": 10}
+
+
+def test_aggregate_counts_errors_as_non_passes(pytester):
+    # prob_errors is a gate setting: aggregates use every run, as rows do.
+    pytester.makepyfile(
+        bench_e="""
+import pytest
+
+@pytest.mark.parametrize("i", range(10))
+def bench_down(i):
+    if i < 5:
+        raise ConnectionError("API timeout")
+"""
+    )
+    for args in ([], ["-o", "prob_errors=exclude", "--prob-min-rate=0.5"]):
+        _run(pytester, "--prob-runs=2", "--prob-json=r.json", *args)
+        assert _json(pytester)["aggregates"][0]["estimate"] == 0.5
+
+
+def test_aggregate_json(pytester):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    _run(pytester, "--prob-json=r.json")
+    data = _json(pytester)
+    assert data["stats_config"] == {
+        "method": "exact",
+        "level": 0.95,
+        "prior": [1.0, 1.0],
+        **AGG_DEFAULTS,
+    }
+    aggs = {a["name"]: a for a in data["aggregates"]}
+    assert list(aggs) == ["classify", "small", "Overall"]
+    classify = aggs["classify"]
+    assert set(classify) == {
+        "scope", "name", "inputs", "runs", "estimate", "ci", "normal_ci",
+        "resamples", "seed", "resampling_unit", "note", "suppressed",
+    }
+    est, ci, normal = _expected_aggregate(
+        [c for c in AGG_COUNTS if c.startswith("classify")]
+    )
+    assert classify["scope"] == "function"
+    assert classify["inputs"] == 12
+    assert classify["runs"] == {"min": 1, "mean": 1.0, "max": 1}
+    assert classify["estimate"] == est
+    assert classify["ci"] == {"method": "bootstrap", "level": 0.95,
+                              "low": ci[0], "high": ci[1]}
+    assert classify["normal_ci"] == {"method": "normal", "level": 0.95,
+                                     "low": normal[0], "high": normal[1]}
+    assert (classify["resamples"], classify["seed"]) == (5000, 0)
+    assert classify["resampling_unit"] == "input"
+    assert classify["note"] == "inputs treated as a sample"
+    assert classify["suppressed"] is None
+    # too few inputs: the estimate is data, the interval is withheld
+    small = aggs["small"]
+    assert small["estimate"] == 0.5
+    assert small["ci"] is None and small["normal_ci"] is None
+    assert small["suppressed"] == "fewer than 10 inputs"
+    overall = aggs["Overall"]
+    assert overall["scope"] == "overall" and overall["inputs"] == 18
+    assert overall["estimate"] == _expected_aggregate(AGG_COUNTS)[0]
+    assert not any("explanation" in a for a in data["aggregates"])
+
+
+def test_aggregate_options(pytester):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    classify = [c for c in AGG_COUNTS if c.startswith("classify")]
+
+    def ci(*args):
+        _run(pytester, "--prob-json=r.json", *args)
+        agg = _json(pytester)["aggregates"][0]
+        return agg["resamples"], agg["seed"], (agg["ci"]["low"], agg["ci"]["high"])
+
+    # deterministic for a fixed seed
+    assert ci() == ci() == (5000, 0, _expected_aggregate(classify)[1])
+    want = _expected_aggregate(classify, resamples=200, seed=7)[1]
+    assert ci("--prob-bootstrap=200", "--prob-seed=7") == (200, 7, want)
+    pytester.makeini("[pytest]\nprob_bootstrap = 200\nprob_seed = 7\n")
+    assert ci() == (200, 7, want)
+    # the CLI beats the ini
+    assert ci("--prob-seed=3")[1] == 3
+    # one level for everything
+    want = _expected_aggregate(classify, level=0.8, resamples=200, seed=7)[1]
+    assert ci("--prob-confidence=0.8") == (200, 7, want)
+
+
+def test_seed_changes_the_interval(pytester):
+    # With few resamples the bounds depend visibly on the seed.
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    lines = {
+        tuple(
+            _aggregate_block(_run(pytester, "--prob-bootstrap=100", f"--prob-seed={s}"))
+        )
+        for s in (0, 1)
+    }
+    assert len(lines) == 2
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--prob-bootstrap=0"], "*--prob-bootstrap must be at least 1, got 0*"),
+        (["-o", "prob_bootstrap=many"], "*prob_bootstrap must be an integer*'many'*"),
+        (["-o", "prob_seed=1.5"], "*prob_seed must be an integer*'1.5'*"),
+        (["-o", "prob_min_inputs=1"], "*prob_min_inputs must be at least 2*"),
+        (["-o", "prob_min_inputs=ten"], "*prob_min_inputs must be an integer*"),
+        (["--prob-seed=x"], "*--prob-seed: invalid int value*"),
+    ],
+)
+def test_invalid_aggregate_options_are_usage_errors(pytester, args, message):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    result = _run(pytester, *args)
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([message])
+
+
+def test_no_intervals_hides_aggregates(pytester):
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    result = _run(pytester, "--prob-no-intervals", "--prob-json=r.json")
+    assert _aggregate_block(result) == []
+    # display only: the JSON report keeps them
+    assert _json(pytester)["aggregates"][0]["ci"] is not None
+
+
+def test_aggregate_order_independent():
+    # The bootstrap draws from case-id order, whatever order results
+    # arrived in, so a shuffled (xdist-like) arrival gives the same result.
+    import random
+
+    from pytest_probability.plugin import CaseStats, StatsConfig, aggregate
+
+    cases = [CaseStats(c, passes=p, fails=n - p) for c, (p, n) in AGG_COUNTS.items()]
+    want = aggregate("overall", "Overall", cases, StatsConfig())
+    rng = random.Random(1)
+    for _ in range(5):
+        rng.shuffle(cases)
+        assert aggregate("overall", "Overall", cases, StatsConfig()) == want
+    assert want.cases == tuple(sorted(AGG_COUNTS))
+
+
+def test_aggregate_value_hook():
+    # Later metrics (pass^k) average their own per-case value.
+    from pytest_probability.plugin import CaseStats, StatsConfig, aggregate
+
+    cases = [CaseStats(f"f::{i}", passes=i, fails=10 - i) for i in range(11)]
+    agg = aggregate("function", "f", cases, StatsConfig(), value=lambda c, n: c == n)
+    assert agg.estimate == pytest.approx(1 / 11)
+    assert agg.counts == tuple(
+        (int(c.removeprefix("f::")), 10) for c in agg.cases
+    )
+
+
+def test_function_of():
+    from pytest_probability.plugin import function_of
+
+    assert function_of("classify") == "classify"
+    assert function_of("classify::identify_pii") == "classify"
+    assert function_of("classify::a::b") == "classify"
+
+
+def test_xdist_aggregate_parity(pytester):
+    pytest.importorskip("xdist")
+    pytester.makepyfile(bench_agg=BENCH_AGG)
+    args = ("-o", "prob_min_inputs=6")
+    serial = _run(pytester, *args, "--prob-json=serial.json")
+    # the default --dist load spreads cases over both workers, so results
+    # arrive in a different order than in the serial run
+    dist = _run(pytester, *args, "--prob-json=dist.json", "-n", "2")
+    # rows follow result arrival; the aggregate block doesn't
+    assert sorted(_summary_rows(serial)) == sorted(_summary_rows(dist))
+    assert _aggregate_block(serial) == _aggregate_block(dist)
+    assert len(_aggregate_block(serial)) == 3
+    s = _json(pytester, "serial.json")["aggregates"]
+    assert s == _json(pytester, "dist.json")["aggregates"]
+
+
+def test_regular_suite_unchanged_by_aggregate_options(pytester):
+    pytester.makepyfile(test_plain=TEST_PLAIN)
+    base = _run(pytester, "-p", "no:cacheprovider")
+    with_opts = _run(
+        pytester,
+        "-p", "no:cacheprovider", "--prob-bootstrap=100", "--prob-seed=5",
+        "-o", "prob_min_inputs=2",
+    )
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert "= probability =" not in with_opts.stdout.str()

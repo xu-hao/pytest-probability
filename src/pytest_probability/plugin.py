@@ -30,6 +30,9 @@ Design notes:
   its interval instead. Its failing runs are reported as xfailed, the
   aggregator decides the verdict from the counts, and
   ``pytest_sessionfinish`` turns a failed gate into a failed session.
+- A function with enough cases also gets a function-level line: the
+  mean of its per-case fractions, with a seeded cluster-bootstrap
+  interval over its cases (``aggregate()``), and so does the session.
 """
 from __future__ import annotations
 
@@ -42,13 +45,14 @@ import importlib.util
 import inspect
 import json
 import math
+import statistics
 import sys
 import time
 import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 import pytest
 
@@ -216,6 +220,24 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Add a plain-language reading of the results to the summary"
         " and the JSON report (default: prob_explain ini or off)",
     )
+    group.addoption(
+        "--prob-bootstrap",
+        dest="prob_bootstrap",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Bootstrap resamples for function-level and overall intervals"
+        " (default: prob_bootstrap ini or 5000)",
+    )
+    group.addoption(
+        "--prob-seed",
+        dest="prob_seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="Seed for every resampling procedure, so the same results"
+        " always give the same intervals (default: prob_seed ini or 0)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -268,6 +290,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type="bool",
         default=False,
     )
+    parser.addini(
+        "prob_bootstrap",
+        "Bootstrap resamples for function-level and overall intervals",
+        default="5000",
+    )
+    parser.addini("prob_seed", "Seed for every resampling procedure", default="0")
+    parser.addini(
+        "prob_min_inputs",
+        "Fewest cases a function needs for its function-level interval",
+        default="10",
+    )
 
 
 def _runs(config: pytest.Config, marked: int | None = None) -> int:
@@ -310,15 +343,21 @@ def _explain(config: pytest.Config) -> bool:
 class StatsConfig:
     """The resolved statistical settings for a session.
 
-    One object so every consumer — row intervals, gate verdicts, the
-    explain section, the JSON ``stats_config`` block — reads the same
-    method, level and prior.
+    One object so every consumer — row intervals, gate verdicts,
+    function-level intervals, the explain section, the JSON
+    ``stats_config`` block — reads the same method, level and prior.
+    ``resamples``, ``seed`` and ``min_inputs`` drive the bootstrap
+    behind function-level and overall intervals (``aggregate()``), at
+    the same ``level``.
     """
 
     method: str = "exact"
     level: float = 0.95
     prior: tuple[float, float] = (1.0, 1.0)
     intervals: bool = True
+    resamples: int = 5000
+    seed: int = 0
+    min_inputs: int = 10
 
     def interval(self, passes: int, total: int) -> tuple[float, float]:
         """Interval on the pass probability; ``total`` must be ≥ 1."""
@@ -331,6 +370,9 @@ class StatsConfig:
             "method": self.method,
             "level": self.level,
             "prior": list(self.prior),
+            "resamples": self.resamples,
+            "seed": self.seed,
+            "min_inputs": self.min_inputs,
         }
 
 
@@ -373,6 +415,25 @@ def _parse_prior(raw: Any, source: str = "prob_prior") -> tuple[float, float]:
     return a, b
 
 
+def _parse_int(raw: Any, source: str, minimum: int | None = None) -> int:
+    # Option values arrive as ints (argparse) or strings (ini).
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise pytest.UsageError(f"{source} must be an integer, got {raw!r}") from None
+    if minimum is not None and value < minimum:
+        raise pytest.UsageError(f"{source} must be at least {minimum}, got {raw!r}")
+    return value
+
+
+def _option_or_ini(config: pytest.Config, name: str, flag: str) -> tuple[Any, str]:
+    # The CLI value and its spelling, else the ini value and its name.
+    raw = config.getoption(name)
+    if raw is None:
+        return config.getini(name), name
+    return raw, flag
+
+
 def _resolve_stats_config(config: pytest.Config) -> StatsConfig:
     method = config.getoption("prob_method")
     if method is None:
@@ -392,7 +453,23 @@ def _resolve_stats_config(config: pytest.Config) -> StatsConfig:
         intervals = False
     else:
         intervals = bool(config.getini("prob_intervals"))
-    return StatsConfig(method=method, level=level, prior=prior, intervals=intervals)
+    resamples = _parse_int(
+        *_option_or_ini(config, "prob_bootstrap", "--prob-bootstrap"), minimum=1
+    )
+    seed = _parse_int(*_option_or_ini(config, "prob_seed", "--prob-seed"))
+    # One input is no sample: resampling it gives a zero-width interval.
+    min_inputs = _parse_int(
+        config.getini("prob_min_inputs"), "prob_min_inputs", minimum=2
+    )
+    return StatsConfig(
+        method=method,
+        level=level,
+        prior=prior,
+        intervals=intervals,
+        resamples=resamples,
+        seed=seed,
+        min_inputs=min_inputs,
+    )
 
 
 def stats_config(config: pytest.Config) -> StatsConfig:
@@ -1265,6 +1342,152 @@ class CaseStats:
         return "flaky"
 
 
+# ---------------------------------------------------------------------------
+# Function-level and overall intervals
+# ---------------------------------------------------------------------------
+
+FUNCTION, OVERALL = "function", "overall"
+
+
+def function_of(case: str) -> str:
+    """The bench function (short name) a case id belongs to.
+
+    Case ids are ``<short>::<variant>`` or just ``<short>``, and a short
+    name is a Python identifier, so the first ``::`` always ends it —
+    even when a parametrize id contains ``::`` itself.
+    """
+    return case.split("::", 1)[0]
+
+
+def pass_fraction(passes: int, total: int) -> float:
+    """A case's pass fraction over every run — the row's own fraction."""
+    return passes / total
+
+
+@dataclass(frozen=True)
+class Aggregate:
+    """A function's (or the session's) average over its cases.
+
+    ``estimate`` is the mean of the per-case values (by default the pass
+    fraction), so every input counts equally whatever its run count.
+    ``ci`` is a percentile interval from a cluster bootstrap: whole
+    cases are resampled with replacement, keeping all their runs.
+    ``normal_ci`` is the normal-approximation cross-check (JSON only).
+    Both are ``None`` when ``suppressed`` says why there is no interval
+    — today, fewer than ``min_inputs`` cases.
+
+    ``cases`` and ``counts`` (``(passes, total)`` per case) are in
+    canonical order — sorted by case id — which is the order the
+    bootstrap draws from, so the result doesn't depend on the order
+    results arrived in (xdist).
+    """
+
+    scope: str
+    name: str
+    cases: tuple[str, ...]
+    counts: tuple[tuple[int, int], ...]
+    estimate: float
+    level: float
+    resamples: int
+    seed: int
+    ci: tuple[float, float] | None = None
+    normal_ci: tuple[float, float] | None = None
+    suppressed: str | None = None
+
+    @property
+    def inputs(self) -> int:
+        return len(self.cases)
+
+    @property
+    def runs(self) -> tuple[int, float, int]:
+        """Runs per case: ``(min, mean, max)``."""
+        totals = [n for _, n in self.counts]
+        return min(totals), statistics.fmean(totals), max(totals)
+
+    def size(self) -> str:
+        """``N=40 inputs × k=10``; ``k=5–10`` when run counts differ."""
+        low, _, high = self.runs
+        k = f"{low}" if low == high else f"{low}–{high}"
+        return f"N={self.inputs} inputs × k={k}"
+
+    def to_json(self) -> dict[str, Any]:
+        low, mean, high = self.runs
+
+        def interval(method: str, bounds: tuple[float, float] | None):
+            if bounds is None:
+                return None
+            return {
+                "method": method,
+                "level": self.level,
+                "low": bounds[0],
+                "high": bounds[1],
+            }
+
+        return {
+            "scope": self.scope,
+            "name": self.name,
+            "inputs": self.inputs,
+            "runs": {"min": low, "mean": mean, "max": high},
+            "estimate": self.estimate,
+            "ci": interval("bootstrap", self.ci),
+            "normal_ci": interval("normal", self.normal_ci),
+            "resamples": self.resamples,
+            "seed": self.seed,
+            "resampling_unit": "input",
+            "note": "inputs treated as a sample",
+            "suppressed": self.suppressed,
+        }
+
+
+def aggregate(
+    scope: str,
+    name: str,
+    cases: Iterable[CaseStats],
+    cfg: StatsConfig,
+    value: Callable[[int, int], float] = pass_fraction,
+) -> Aggregate:
+    """The ``Aggregate`` of ``cases`` (each with at least one run).
+
+    ``value(passes, total)`` is the per-case quantity averaged; later
+    metrics (pass^k) can pass their own. Since the statistic is a mean
+    of per-case values, resampling whole cases is resampling their
+    values: each value carries all its case's runs. The bootstrap uses
+    ``cfg``'s resamples, seed and level, through ``stats.bootstrap``'s
+    private generator — the global ``random`` state is never touched.
+
+    Every value counts as given: under ``prob_errors = exclude`` errored
+    runs still count as non-passes here, as they do in the row
+    fraction, because the exclusion is a gate setting.
+    """
+    ordered = sorted(cases, key=lambda s: s.case)
+    counts = tuple((s.passes, s.total) for s in ordered)
+    values = [value(c, n) for c, n in counts]
+    agg = Aggregate(
+        scope=scope,
+        name=name,
+        cases=tuple(s.case for s in ordered),
+        counts=counts,
+        estimate=statistics.fmean(values),
+        level=cfg.level,
+        resamples=cfg.resamples,
+        seed=cfg.seed,
+    )
+    if len(values) < cfg.min_inputs:
+        # Too few inputs: the bootstrap's spread underestimates the
+        # real uncertainty, so no interval rather than a misleading one.
+        return dataclasses.replace(
+            agg, suppressed=f"fewer than {cfg.min_inputs} inputs"
+        )
+    samples = stats.bootstrap(
+        values, statistics.fmean, resamples=cfg.resamples, seed=cfg.seed
+    )
+    return dataclasses.replace(
+        agg,
+        ci=stats.percentile_interval(samples, cfg.level),
+        normal_ci=stats.normal_interval(values, cfg.level),
+    )
+
+
 _MARKUP = {
     "pass": {"green": True},
     "flaky": {"yellow": True},
@@ -1300,6 +1523,19 @@ def _pct(p: float) -> str:
     return f"{pct}%"
 
 
+def _pct1(p: float) -> str:
+    """A probability to one decimal, rounded half up — ``81.4%`` — with
+    ``0.0%``/``100.0%`` reserved for exactly 0 and 1, as in ``_pct``.
+    For function-level lines, whose averages move in finer steps than
+    one case's fraction."""
+    tenths = math.floor(p * 1000 + 0.5)
+    if tenths >= 1000 and p < 1.0:
+        tenths = 999
+    elif tenths <= 0 and p > 0.0:
+        tenths = 1
+    return f"{tenths / 10:.1f}%"
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -1323,6 +1559,9 @@ class ProbabilityAggregator:
         self._records: list[dict[str, Any]] | None = (
             [] if self._json_path else None
         )
+        # aggregates(), computed once: the JSON report and the summary
+        # both need it, and a bootstrap is the one costly step here.
+        self._aggregates: list[Aggregate] | None = None
 
     def pytest_runtest_logreport(self, report) -> None:
         if getattr(report, "when", None) != "call":
@@ -1360,6 +1599,41 @@ class ProbabilityAggregator:
             for s in self._stats.values()
             if s.gate is not None
         }
+
+    def aggregates(self) -> list[Aggregate]:
+        """One ``Aggregate`` per bench function, by name, then the
+        ``Overall`` one over every case (``[]`` when no case ran).
+        Computed once, after every result is in. Nothing here depends on
+        the order results arrived in — not the values (see
+        ``Aggregate``), and not the list order, unlike the rows — so it
+        is identical with and without xdist."""
+        if self._aggregates is None:
+            cfg = stats_config(self._config)
+            by_function: dict[str, list[CaseStats]] = {}
+            for s in self._stats.values():
+                by_function.setdefault(function_of(s.case), []).append(s)
+            out = [
+                aggregate(FUNCTION, name, by_function[name], cfg)
+                for name in sorted(by_function)
+            ]
+            if self._stats:
+                out.append(aggregate(OVERALL, "Overall", self._stats.values(), cfg))
+            self._aggregates = out
+        return self._aggregates
+
+    def _shown_aggregates(self) -> list[Aggregate]:
+        """The aggregates the summary prints: those with an interval,
+        unless intervals are hidden. Overall is left out when it would
+        repeat the only function's line."""
+        if not stats_config(self._config).intervals:
+            return []
+        aggs = self.aggregates()
+        functions = sum(a.scope == FUNCTION for a in aggs)
+        return [
+            a
+            for a in aggs
+            if a.ci is not None and not (a.scope == OVERALL and functions == 1)
+        ]
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         # Under pytest-xdist this hook also fires on workers, which only
@@ -1417,6 +1691,7 @@ class ProbabilityAggregator:
                 }
                 for s in all_stats
             ],
+            "aggregates": [a.to_json() for a in self.aggregates()],
             "records": self._records or [],
         }
         if self._explain:
@@ -1426,6 +1701,8 @@ class ProbabilityAggregator:
                     row["gate"]["explanation"] = self._gate_reading(
                         s, results[s.case]
                     ).text()
+            for agg, entry in zip(self.aggregates(), payload["aggregates"]):
+                entry["explanation"] = self._aggregate_reading(agg).text()
         path = Path(self._json_path)
         if path.parent != Path(""):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1548,6 +1825,32 @@ class ProbabilityAggregator:
                 line += f"  ({r.excluded} errored, excluded)"
             tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
 
+    @staticmethod
+    def _aggregate_lines(shown: list[Aggregate]) -> list[str]:
+        """``classify  N=40 inputs × k=10  81.4%  [75.0%, 87.2%]``, one
+        line per shown aggregate, columns aligned across them."""
+        if not shown:
+            return []
+        name_col = max(len(a.name) for a in shown)
+        sizes = [a.size() for a in shown]
+        size_col = max(len(z) for z in sizes)
+        ests = [_pct1(a.estimate) for a in shown]
+        est_col = max(len(e) for e in ests)
+        bounds = [tuple(_pct1(v) for v in a.ci) for a in shown]
+        low_w = max(len(b[0]) for b in bounds)
+        high_w = max(len(b[1]) for b in bounds)
+        return [
+            f"  {a.name:<{name_col}}  {size:<{size_col}}  {est:>{est_col}}"
+            f"  [{low:>{low_w}}, {high:>{high_w}}]"
+            for a, size, est, (low, high) in zip(shown, sizes, ests, bounds)
+        ]
+
+    def _aggregate_reading(self, agg: Aggregate):
+        from . import explain
+
+        cfg = stats_config(self._config)
+        return explain.aggregate_reading(agg, cfg.min_inputs)
+
     def _gate_reading(self, s: CaseStats, result: GateResult):
         from . import explain
 
@@ -1590,6 +1893,7 @@ class ProbabilityAggregator:
                 readings.append(self._gate_reading(s, results[s.case]))
             elif s.status != "pass":
                 readings.append(self._row_reading(s))
+        readings.extend(self._aggregate_reading(a) for a in self._shown_aggregates())
         # The main table's interval column needs explaining even when no
         # row is notable.
         cfg = stats_config(self._config)
@@ -1623,6 +1927,12 @@ class ProbabilityAggregator:
             if status:
                 line += f"  {status}"
             tr.write_line(line.rstrip(), **_MARKUP.get(s.status, {}))
+
+        aggregate_lines = self._aggregate_lines(self._shown_aggregates())
+        if aggregate_lines:
+            tr.write_line("")
+            for line in aggregate_lines:
+                tr.write_line(line)
 
         total_passes = sum(s.passes for s in all_stats)
         total = sum(s.total for s in all_stats)
