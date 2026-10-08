@@ -173,8 +173,17 @@ methods get called with no global state.
   an `OrderedDict[case → CaseStats]` by its `outcome` class. Cost sums
   when present, and `usage` entries merge into a per-model aggregate
   on the row. Row order is therefore first-encounter order of results.
+- The statistical settings (`prob_method`, `prob_confidence`,
+  `prob_prior`, `prob_intervals`) are resolved and validated once in
+  `pytest_configure` into a frozen `StatsConfig` kept on
+  `config.stash`; `stats_config(config)` returns it. Intervals are
+  computed from `CaseStats` at render time, never shipped from
+  workers, so under xdist they come from the controller's own
+  options. Anything that needs an interval goes through
+  `StatsConfig.interval()`, so printed intervals and any later verdict
+  share one method and level.
 - `pytest_terminal_summary` renders the table with fractions
-  right-aligned across rows, colors by status (green/yellow/red), and
+  right-aligned across rows, an optional interval column, colors by status (green/yellow/red), and
   appends the `Overall`/`Cost`/`Tokens`/`Report` footer lines (the
   per-model `Tokens:` block merges every row's usage). It renders
   nothing when no benchmark items ran.

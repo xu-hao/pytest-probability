@@ -2,6 +2,19 @@
 
 ## 0.3.0 (unreleased)
 
+- **Visible output change:** with more than one run, every summary row
+  now shows a 95% interval for the case's pass probability between the
+  fraction and the cost — `classify::identify_pii   7/10  [35%,  93%]
+  $0.0020  FLAKY`. Scripts that parse the terminal table need
+  updating (the JSON report is the stable interface); single-run
+  output and regular pytest suites are unchanged.
+  `--prob-no-intervals` / `prob_intervals = false` restore the old
+  layout. Choose the method with `--prob-method` / `prob_method`
+  (`exact` Clopper-Pearson by default, `wilson`, or `bayes` with
+  `prob_prior`, default `1,1`) and the level with
+  `--prob-confidence` / `prob_confidence` (default 0.95).
+- **JSON:** rows gain `ci: {method, level, low, high}` (unrounded),
+  and a top-level `stats_config` records the method, level and prior.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function

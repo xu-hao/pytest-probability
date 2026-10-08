@@ -13,11 +13,11 @@ inside a green checkmark.
 $ pytest benchmarks/ --prob-runs=10
 ...
 ================================= probability ==================================
-  classify::is_question            10/10  $0.0020
-  classify::identify_pii            7/10  $0.0020  FLAKY
-  classify::extract_amount          0/10  $0.0020  FAIL
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  classify::is_question            10/10  [69%, 100%]  $0.0020
+  classify::identify_pii            7/10  [35%,  93%]  $0.0020  FLAKY
+  classify::extract_amount          0/10  [ 0%,  31%]  $0.0020  FAIL
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 
   Overall: 35/50 passed (70%)
   Cost:    $0.0110
@@ -105,8 +105,8 @@ def bench_triage(text, prompt):
 ```text
 $ pytest bench_triage.py --prob-runs=10
 ...
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 
   Overall: 18/20 passed (90%)
   Cost:    $0.0050

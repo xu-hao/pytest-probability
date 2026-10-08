@@ -36,6 +36,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import math
 import sys
 import time
 from collections import OrderedDict
@@ -44,6 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import pytest
+
+from . import stats
 
 # ---------------------------------------------------------------------------
 # Author-facing API
@@ -157,6 +160,31 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Run-major order: run 1 of every case, then run 2, ..."
         " (default: prob_transpose ini or case-major)",
     )
+    group.addoption(
+        "--prob-method",
+        dest="prob_method",
+        default=None,
+        choices=stats.METHODS,
+        help="Interval method for per-case pass rates: exact (Clopper-Pearson),"
+        " wilson, or bayes (default: prob_method ini or exact)",
+    )
+    group.addoption(
+        "--prob-confidence",
+        dest="prob_confidence",
+        type=float,
+        default=None,
+        metavar="LEVEL",
+        help="Two-sided confidence level for intervals, strictly between 0"
+        " and 1 (default: prob_confidence ini or 0.95)",
+    )
+    group.addoption(
+        "--prob-no-intervals",
+        dest="prob_no_intervals",
+        action="store_true",
+        default=None,
+        help="Hide the interval column in the summary"
+        " (default: prob_intervals ini or shown)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -166,6 +194,27 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "prob_pattern", "Glob pattern for benchmark files", default="bench_*.py"
+    )
+    parser.addini(
+        "prob_method",
+        "Interval method: exact (Clopper-Pearson), wilson, or bayes",
+        default="exact",
+    )
+    parser.addini(
+        "prob_confidence",
+        "Two-sided confidence level for intervals",
+        default="0.95",
+    )
+    parser.addini(
+        "prob_prior",
+        "Beta prior 'a,b' for the bayes method",
+        default="1,1",
+    )
+    parser.addini(
+        "prob_intervals",
+        "Show the interval column in the summary",
+        type="bool",
+        default=True,
     )
 
 
@@ -196,7 +245,104 @@ def _transpose(config: pytest.Config) -> bool:
     return transpose
 
 
+@dataclass(frozen=True)
+class StatsConfig:
+    """The resolved statistical settings for a session.
+
+    One object so every consumer — row intervals, gate verdicts, the
+    explain section, the JSON ``stats_config`` block — reads the same
+    method, level and prior.
+    """
+
+    method: str = "exact"
+    level: float = 0.95
+    prior: tuple[float, float] = (1.0, 1.0)
+    intervals: bool = True
+
+    def interval(self, passes: int, total: int) -> tuple[float, float]:
+        """Interval on the pass probability; ``total`` must be ≥ 1."""
+        return stats.proportion_interval(
+            passes, total, self.level, self.method, self.prior
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "level": self.level,
+            "prior": list(self.prior),
+        }
+
+
+_STATS_CONFIG = pytest.StashKey[StatsConfig]()
+
+
+def _parse_level(raw: Any, source: str) -> float:
+    try:
+        level = float(raw)
+    except (TypeError, ValueError):
+        raise pytest.UsageError(
+            f"{source} must be a number strictly between 0 and 1, got {raw!r}"
+        ) from None
+    # Positive test so NaN fails too.
+    if not 0.0 < level < 1.0:
+        hint = f" (did you mean {level / 100:g}?)" if 1.0 < level < 100.0 else ""
+        raise pytest.UsageError(
+            f"{source} must be strictly between 0 and 1, got {raw!r}{hint}"
+        )
+    return level
+
+
+def _parse_prior(raw: str) -> tuple[float, float]:
+    parts = [p.strip() for p in str(raw).split(",")]
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        a, b = float(parts[0]), float(parts[1])
+        if not all(v > 0.0 and math.isfinite(v) for v in (a, b)):
+            raise ValueError
+    except ValueError:
+        raise pytest.UsageError(
+            f"prob_prior must be two positive numbers 'a,b' (e.g. 1,1 or"
+            f" 0.5,0.5), got {raw!r}"
+        ) from None
+    return a, b
+
+
+def _resolve_stats_config(config: pytest.Config) -> StatsConfig:
+    method = config.getoption("prob_method")
+    if method is None:
+        method = str(config.getini("prob_method")).strip()
+        if method not in stats.METHODS:
+            raise pytest.UsageError(
+                f"prob_method must be one of {', '.join(stats.METHODS)},"
+                f" got {method!r}"
+            )
+    level = config.getoption("prob_confidence")
+    if level is None:
+        level = _parse_level(config.getini("prob_confidence"), "prob_confidence")
+    else:
+        level = _parse_level(level, "--prob-confidence")
+    prior = _parse_prior(config.getini("prob_prior"))
+    if config.getoption("prob_no_intervals"):
+        intervals = False
+    else:
+        intervals = bool(config.getini("prob_intervals"))
+    return StatsConfig(method=method, level=level, prior=prior, intervals=intervals)
+
+
+def stats_config(config: pytest.Config) -> StatsConfig:
+    """The session's resolved ``StatsConfig`` (validated at configure)."""
+    cfg = config.stash.get(_STATS_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_STATS_CONFIG] = _resolve_stats_config(config)
+    return cfg
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    # Resolve (and validate) up front so a bad value is a usage error
+    # before anything runs — on the xdist controller, which renders,
+    # as much as anywhere.
+    stats_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -598,6 +744,22 @@ _MARKUP = {
 }
 
 
+def _pct(p: float) -> str:
+    """A probability as a whole percent, rounded half up (JSON keeps
+    the unrounded value).
+
+    ``0%`` and ``100%`` are reserved for bounds that are exactly 0 or
+    1: an upper bound of 99.7% prints as ``99%``, so ``100%`` always
+    means the data could not rule out "never fails".
+    """
+    pct = math.floor(p * 100 + 0.5)
+    if pct >= 100 and p < 1.0:
+        pct = 99
+    elif pct <= 0 and p > 0.0:
+        pct = 1
+    return f"{pct}%"
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -650,9 +812,11 @@ class ProbabilityAggregator:
         if hasattr(session.config, "workerinput"):
             return
         all_stats = list(self._stats.values())
+        cfg = stats_config(session.config)
         payload = {
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "runs": _runs(session.config),
+            "stats_config": cfg.to_json(),
             "exit_status": int(exitstatus),
             "totals": {
                 "passes": sum(s.passes for s in all_stats),
@@ -678,6 +842,7 @@ class ProbabilityAggregator:
                     "total": s.total,
                     "pass_rate": s.passes / s.total * 100 if s.total else 0.0,
                     "status": s.status,
+                    "ci": self._ci_json(cfg, s),
                     "cost": s.cost,
                     "usage": s.usage,
                 }
@@ -691,12 +856,47 @@ class ProbabilityAggregator:
         path.write_text(json.dumps(payload, indent=2))
 
     @staticmethod
+    def _ci_json(cfg: StatsConfig, s: CaseStats) -> dict[str, Any] | None:
+        # Always computed (it is data, not display): --prob-no-intervals
+        # and the runs == 1 rule only affect the terminal.
+        if not s.total:
+            return None
+        low, high = cfg.interval(s.passes, s.total)
+        return {"method": cfg.method, "level": cfg.level, "low": low, "high": high}
+
+    @staticmethod
     def _model_totals(all_stats: list[CaseStats]) -> dict[str, dict[str, Any]]:
         totals: dict[str, dict[str, Any]] = {}
         for s in all_stats:
             for model, agg in s.usage.items():
                 _merge_usage(totals, {"model": model, **agg})
         return totals
+
+    @staticmethod
+    def _ci_cells(cfg: StatsConfig, all_stats: list[CaseStats]) -> list[str | None]:
+        """The interval column, one padded cell per row (or ``None``s
+        when the column is off).
+
+        A single run says almost nothing about a rate, so rows with one
+        run get a blank cell, and the column disappears entirely when no
+        row has more. Low and high are right-aligned separately so the
+        brackets and comma line up when widths vary.
+        """
+        if not cfg.intervals or all(s.total <= 1 for s in all_stats):
+            return [None] * len(all_stats)
+        bounds = [
+            tuple(_pct(v) for v in cfg.interval(s.passes, s.total))
+            if s.total > 1
+            else None
+            for s in all_stats
+        ]
+        low_w = max(len(b[0]) for b in bounds if b)
+        high_w = max(len(b[1]) for b in bounds if b)
+        width = low_w + high_w + 4  # "[", ", ", "]"
+        return [
+            f"[{b[0]:>{low_w}}, {b[1]:>{high_w}}]" if b else " " * width
+            for b in bounds
+        ]
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:
         del exitstatus, config
@@ -708,8 +908,11 @@ class ProbabilityAggregator:
 
         name_col = max(len(_row_name(s)) for s in all_stats)
         frac_col = max(len(f"{s.passes}/{s.total}") for s in all_stats)
-        for s in all_stats:
+        cis = self._ci_cells(stats_config(self._config), all_stats)
+        for s, ci in zip(all_stats, cis):
             line = f"  {_row_name(s):<{name_col}}  {f'{s.passes}/{s.total}':>{frac_col}}"
+            if ci is not None:
+                line += f"  {ci}"
             if s.cost:
                 line += f"  ${s.cost:.4f}"
             # Three run classes, spelled out: the status word names the
@@ -720,7 +923,7 @@ class ProbabilityAggregator:
                 line += f"  {s.status.upper()}"
                 if s.errors and s.status != "error":
                     line += f" ({s.errors} errored)"
-            tr.write_line(line, **_MARKUP.get(s.status, {}))
+            tr.write_line(line.rstrip(), **_MARKUP.get(s.status, {}))
 
         total_passes = sum(s.passes for s in all_stats)
         total = sum(s.total for s in all_stats)

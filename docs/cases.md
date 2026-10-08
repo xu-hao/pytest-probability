@@ -67,8 +67,8 @@ Each case gets its own summary row, namespaced by the function's short
 name so identical ids in different benchmarks never collide:
 
 ```text
-  classify::identify_pii   7/10  FLAKY
-  classify::is_question   10/10
+  classify::identify_pii   7/10  [35%,  93%]  FLAKY
+  classify::is_question   10/10  [69%, 100%]
 ```
 
 Dataset-driven suites are a comprehension away — a ragged payload is

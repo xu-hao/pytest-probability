@@ -24,8 +24,8 @@ def bench_triage(text, style):
 ```
 
 ```text
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 ```
 
 Two rows, one comparison: the cheap prompt is a coin flip, the

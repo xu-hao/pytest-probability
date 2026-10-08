@@ -24,6 +24,25 @@ All options live in the `probability` group of `pytest --help`.
   instead of the case-major default. Ordering is advisory under xdist.
   **Default:** the `prob_transpose` ini value, else off.
 
+`--prob-method={exact,wilson,bayes}`
+: How the per-row interval on the pass probability is computed:
+  `exact` (Clopper-Pearson; never under-covers), `wilson` (Wilson
+  score; narrower, close to nominal on average), or `bayes` (an
+  equal-tailed credible interval under the Beta prior `prob_prior`).
+  Any other value is a usage error.
+  **Default:** the `prob_method` ini value, else `exact`.
+
+`--prob-confidence=LEVEL`
+: Two-sided confidence (or credible) level for intervals, strictly
+  between 0 and 1 — `0.95`, not `95`. One level drives every interval
+  the plugin prints.
+  **Default:** the `prob_confidence` ini value, else `0.95`.
+
+`--prob-no-intervals`
+: Hide the interval column in the terminal summary. The JSON report
+  still carries `rows[].ci`.
+  **Default:** the `prob_intervals` ini value, else shown.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -46,6 +65,23 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 
 `prob_transpose` *(bool, default `false`)*
 : Default execution order; overridden by `--prob-transpose`.
+
+`prob_method` *(string, default `"exact"`)*
+: Default interval method; overridden by `--prob-method`.
+
+`prob_confidence` *(string, default `"0.95"`)*
+: Default confidence level; overridden by `--prob-confidence`.
+
+`prob_prior` *(string, default `"1,1"`)*
+: The Beta(a, b) prior for `bayes`, as `a,b` with both positive:
+  `1,1` is uniform, `0.5,0.5` is Jeffreys. Ignored by the other
+  methods. Ini only.
+
+`prob_intervals` *(bool, default `true`)*
+: Show the interval column; `--prob-no-intervals` turns it off.
+
+Invalid values for any of these four are reported as pytest usage
+errors before anything runs.
 
 ## Python API
 
@@ -154,8 +190,8 @@ the status word.
 
 ```text
 ================================= probability ==================================
-  classify::identify_pii   7/10  $0.0020  FLAKY
-   \_ function::case-id  \_ fraction  \_ cost  \_ status (omitted when pass)
+  classify::identify_pii   7/10  [35%,  93%]  $0.0020  FLAKY
+   \_ function::case-id  \_ fraction  \_ interval  \_ cost  \_ status (omitted when pass)
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Cost:    $0.0110                                 # only when cost was recorded
@@ -165,6 +201,24 @@ the status word.
 ```
 
 The section renders only when at least one benchmark item ran.
+
+### The interval column
+
+`[low, high]` is a two-sided interval for the case's true pass
+probability, at `prob_confidence` (95% by default) by `prob_method`
+(Clopper-Pearson by default). Every run counts toward it, exactly as
+in the fraction, so errors count as non-passes.
+
+- Bounds are whole percents, rounded half up; the JSON report keeps
+  the unrounded values. `0%` and `100%` appear only for bounds that
+  are exactly 0 or 1, so `9/10` reads `[55%,  99%]`, not
+  `[55%, 100%]`.
+- Low and high are right-aligned separately, so brackets, commas and
+  the columns after them line up when widths vary.
+- A row with a single run gets a blank cell; when no row has more than
+  one run the column is omitted, so `--prob-runs=1` output looks as it
+  did before intervals existed.
+- `--prob-no-intervals` / `prob_intervals = false` hide the column.
 
 ## Exit status
 

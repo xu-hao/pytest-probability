@@ -62,8 +62,8 @@ collected 20 items
 benchmarks/bench_greeting.py ...............F..F.               [100%]
 
 ============================= probability ==============================
-  classify::english  10/10
-  classify::german    8/10  FLAKY
+  classify::english  10/10  [69%, 100%]
+  classify::german    8/10  [44%,  97%]  FLAKY
 
   Overall: 18/20 passed (90%)
 ```
