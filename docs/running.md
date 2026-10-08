@@ -92,11 +92,15 @@ how to mark cases.
 Two flags deserve a caveat in fraction-land:
 
 - `-x` / `--maxfail` stop the session at the first failing *run*, so
-  fractions will be computed from a truncated sample.
+  fractions will be computed from a truncated sample. In a
+  [gated](#exit-status-and-gates) case, failing runs are xfailed and
+  don't stop the session; errors still do, unless `prob_errors =
+  exclude`.
 - `--lf` reruns only previously-failed runs; the resulting fractions
   cover just those items. Both are occasionally useful for debugging a
   specific failing run — just don't read the summary of a partial
-  session as a probability estimate.
+  session as a probability estimate. A failed gate leaves no failed
+  item behind, so `--lf` doesn't see it.
 
 ## Parallelism with pytest-xdist
 
@@ -119,14 +123,64 @@ The plugin was built xdist-aware:
   own executions).
 - Execution ordering (including `--prob-transpose`) is advisory under
   xdist: the scheduler assigns items to workers as they free up.
+- Gate verdicts are decided on the controller from the aggregated
+  counts — each run's record carries its case's gate — so they are the
+  same with and without `-n`.
+- Collection-time warnings, such as the gate feasibility warning, are
+  raised by every worker, so they show up once per worker.
 - `setup()`/`teardown()` run once per file *per worker that executes
   items from that file* — the same semantics xdist gives module-scoped
   fixtures. Keep them idempotent.
 
-## Exit status
+## Exit status and gates
 
-The session fails (exit code 1) if any run fails **or errors** — a
-flaky case, and a case with harness trouble, both fail CI by design.
-If you want a CI gate softer than "perfection" (say, alert only below
-80%), keep the session green by policy-checking the
-{doc}`JSON report <json-report>` in a follow-up step instead.
+Without gates, the session fails (exit code 1) if any run fails **or
+errors** — a flaky case, and a case with harness trouble, both fail CI
+by design.
+
+For a bar softer than "every run passes", gate the case on its pass
+rate instead:
+
+```python
+@pytest.mark.probability(min_rate=0.9)
+@pytest.mark.parametrize("text,expected", CASES)
+def bench_classify(text, expected):
+    assert my_classifier(text) == expected
+```
+
+```bash
+pytest benchmarks/ --prob-runs=40                     # gates from marks
+pytest benchmarks/ --prob-runs=40 --prob-min-rate=0.8 # or every case
+```
+
+A gated case passes when its whole interval lies above the bar, fails
+when it lies entirely below, and is UNDECIDED in between. Its failing
+runs are reported as xfailed, so `-x` doesn't stop on them and only the
+verdict decides the exit status:
+
+```text
+================================= probability ==================================
+  classify::is_question   40/40  [91%, 100%]
+  classify::identify_pii  37/40  [80%,  98%]  FLAKY
+  classify::never          3/40  [ 2%,  20%]  FLAKY
+
+  Overall: 80/120 passed (67%)
+  Gates:   1 passed, 1 failed, 1 undecided
+============================== probability: gates ==============================
+  classify::identify_pii  37/40  [80%, 98%]  ≥90%  UNDECIDED
+  classify::never          3/40  [ 2%, 20%]  ≥90%  FAIL
+======================== 80 passed, 40 xfailed in 2.91s ========================
+```
+
+That session exits 1: `never` failed its gate, and `identify_pii`
+doesn't have enough runs to tell (37/40 is 92.5%, but the interval
+reaches down to 80%). UNDECIDED fails by default;
+`--prob-undecided=pass` lets it through. Run more to decide it —
+the collection-time `InfeasibleGateWarning` tells you when a gate can't
+pass at all with the runs it has (`min_rate=0.9` needs at least 36).
+
+Errored runs still fail the session; set `prob_errors = exclude` to
+take them out of the gate's sample instead. Ungated cases in the same
+session behave exactly as before. See {doc}`reference` for the marker,
+the count rule (`min_passes=`), per-gate `confidence=`/`method=`, and
+the full exit-status table.

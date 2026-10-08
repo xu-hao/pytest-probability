@@ -18,19 +18,25 @@ pytest_collect_file            (file name matches prob_pattern)
        └─ yield BenchFunction per module-level bench_* callable
             └─ BenchFunction.collect()
                  ├─ expand parametrize marks into case variants
+                 ├─ resolve each case's runs and gate (_case_plan)
+                 ├─ warn about gates that can't pass (InfeasibleGateWarning)
                  └─ yield BenchItem per (case, run)
                                           (--prob-transpose reorders)
 
 BenchItem.runtest()            (one (case, run) execution)
   ├─ optional inter-run delay
   ├─ run the bench_* body; classify by exception type
-  ├─ publish ("probability", {...}) onto item.user_properties
-  └─ raise StepFailures / let exceptions propagate
+  ├─ publish ("probability", {..., "gate": {...}}) onto item.user_properties
+  └─ let exceptions propagate
+
+pytest_runtest_makereport      (hookwrapper)
+  └─ gated case: report a failing run as xfailed
 
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
-  ├─ pytest_terminal_summary:  render the fraction table
-  └─ pytest_sessionfinish:     write the JSON report (controller only)
+  ├─ pytest_sessionfinish:     decide gates → exit status, then write
+  │                            the JSON report (controller only)
+  └─ pytest_terminal_summary:  render the fraction table and gates block
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -90,6 +96,18 @@ exposed as the collector's own `setup()`/`teardown()`. pytest's
 chain and `teardown()` when leaving it — which is precisely
 once-per-file semantics, with no bookkeeping of our own.
 
+`probability` marks are resolved per case by `_case_plan()`, from the
+case's own marks (`pytest.param(marks=...)`) and then the function's,
+closest first (`_merge_probability_marks()`): a closer mark wins
+argument by argument, except that `min_rate`/`min_passes` are replaced
+as one rule. The result is the case's run count (`--prob-runs` >
+`runs=` > `prob_runs`) and a frozen `Gate` or `None`. Cases may
+therefore have different run counts; the case-major and run-major
+loops both handle that. Bad arguments raise `CollectError`, naming the
+case. A gate whose `verdict(runs, runs)` isn't PASS gets one
+`InfeasibleGateWarning` per distinct gate, issued with
+`warnings.warn_explicit` at the function's line, like `Node.warn` does.
+
 `indirect=True` is rejected territory: it routes parameters through
 fixtures, and `BenchItem` does not participate in the fixture system
 (no `FuncFixtureInfo`, no request object). Wiring that up is the single
@@ -113,6 +131,18 @@ inside a try that classifies the outcome:
 - **`BaseException` control flow** (`pytest.skip`, `pytest.fail`,
   KeyboardInterrupt) is not caught: those runs are not samples and are
   never recorded.
+
+A gated case's failing run is a sample, not a verdict. The module-level
+`pytest_runtest_makereport` hookwrapper (old-style `hookwrapper=True`,
+for pytest 7.4) finds the run's record in `report.user_properties` and,
+for a `"fail"` record — or an `"error"` one under `prob_errors =
+exclude` — sets `report.outcome = "skipped"` and `report.wasxfail` to
+a reason, which is exactly how pytest's own xfail reports look.
+`longrepr` keeps the traceback (`--xfail-tb` prints it), `-rx` shows
+the reason, and pytest's (and xdist's) `-x`/`--maxfail` accounting
+skips reports that carry `wasxfail`. Control flow has no record and is
+never converted, and `--runxfail` disables the conversion, as it does
+for xfail marks.
 
 Around the call, `runtest()` starts a `perf_counter` clock (the run's
 `elapsed`) and installs a `_RunRecorder` into a `ContextVar` —
@@ -145,8 +175,15 @@ throttles its own stream.
 ```python
 ("probability", {"case": case, "run": run_id, "outcome": "fail",
                  "message": ..., "error": None, "elapsed": 0.41,
-                 "cost": 0.0002, "usage": [ ... ]})
+                 "cost": 0.0002, "usage": [ ... ],
+                 "gate": {"rule": "rate", "min_rate": 0.9, ...}})
 ```
+
+The `gate` key is present only for gated cases. It is the case's
+`Gate.to_record()`, fully resolved on the worker (marker overrides plus
+the session's method, level, prior and `prob_errors`), because the
+xdist controller that decides verdicts never collects items and so has
+no other way to learn a case's gate.
 
 Alternatives considered and rejected:
 
@@ -187,10 +224,12 @@ methods get called with no global state.
   appends the `Overall`/`Cost`/`Tokens`/`Report` footer lines (the
   per-model `Tokens:` block merges every row's usage). It renders
   nothing when no benchmark items ran.
-- `pytest_sessionfinish` writes the JSON report. It returns early on
-  xdist workers, detected by the `workerinput` attribute on the config
-  — the standard idiom, used instead of importing xdist. Raw per-run
-  records are only retained in memory when `--prob-json` was requested.
+- `pytest_sessionfinish` returns early on xdist workers, detected by
+  the `workerinput` attribute on the config — the standard idiom, used
+  instead of importing xdist. On the process with every result it
+  decides the gates (below), then writes the JSON report. Raw per-run
+  records are only retained in memory when `--prob-json` was requested
+  (without their `gate` key; `rows[].gate` carries it once).
 
 The row `status` property names the combination of the three run
 classes (pass / fail / error): `pass` and `error` are the pure cases,
@@ -199,6 +238,44 @@ for a genuine pass/fail mixture, and `errored` marks passes marred
 only by errors. Fractions are `passes/total` — every run counts — and
 the status word plus the `(N errored)` annotation say which class made
 up the gap.
+
+## Gates
+
+The pieces, all in `plugin.py`:
+
+- `interval_verdict(low, high, bar)` — the one verdict rule: PASS when
+  `low > bar`, FAIL when `high < bar`, UNDECIDED otherwise. Later
+  margin and latency gates are meant to reuse it.
+- `GateConfig` / `gate_config(config)` — the session's global
+  `min_rate`, `undecided` policy and `errors` mode, validated in
+  `pytest_configure` and kept on `config.stash`.
+  `GateConfig.fails(verdict)` says whether a verdict fails the session.
+- `Gate` — one case's frozen gate: `rule` (`"rate"`/`"count"`), the
+  bar, `stats` (a `StatsConfig`: the session's settings with the
+  marker's `confidence`/`method`/`prior` applied through
+  `dataclasses.replace`), `errors` and the planned `runs`.
+  `judge(passes, total)` returns `(interval, verdict)`, computing the
+  interval with `stats.interval()`, so nothing else can compute it
+  differently. `evaluate(CaseStats)` picks the sample (errors out under
+  `exclude`) and returns a `GateResult`. `min_runs()` is the smallest n
+  with `verdict(n, n) == PASS`: n/n gets more convincing as n grows for
+  every method, so a doubling search plus bisection finds it.
+- `GateResult` — case, gate, sample (`passes`, `total`, `excluded`),
+  interval and verdict; `to_json()` is `rows[].gate`.
+
+`CaseStats.gate` is rebuilt from the first record of the case
+(`Gate.from_record`). `ProbabilityAggregator.gate_results()` evaluates
+every gated row from the aggregated counts, the same way in-process and
+on the xdist controller. `pytest_sessionfinish` sets
+`session.exitstatus = TESTS_FAILED` when a result fails and the status
+is still `OK`; any other status is left alone. This works because the
+plugin's hook runs inside the terminal reporter's
+`pytest_sessionfinish` wrapper, before it renders the summary, and
+`wrap_session` returns `session.exitstatus` as the process exit code.
+The summary adds a `Gates:` tally to the footer and a `probability:
+gates` section listing every non-PASS result with the gate's own
+fraction, interval and bar. The main table keeps the session's interval
+over every run, so its column means the same thing on every row.
 
 ## Invariants worth preserving
 
@@ -221,3 +298,13 @@ down and users rely on:
    pytest suites see zero output difference.
 7. The JSON report is written once, by the process that has all the
    results.
+8. Ungated cases are untouched by gates: no `gate` key in their
+   records, no xfail conversion, and the same terminal output and exit
+   status as without the gate options.
+9. Gate verdicts come only from aggregated counts and the gate spec in
+   the records, on the process that has every result, so they are the
+   same with and without xdist. Gates only ever change the exit status
+   from `OK` to `TESTS_FAILED`.
+10. A printed verdict always sits next to the interval it was computed
+    from: `Gate.judge()` is the only place a gate's interval is made,
+    and the gates block prints that interval.

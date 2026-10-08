@@ -15,6 +15,25 @@
   `--prob-confidence` / `prob_confidence` (default 0.95).
 - **JSON:** rows gain `ci: {method, level, low, high}` (unrounded),
   and a top-level `stats_config` records the method, level and prior.
+- **Gates:** `@pytest.mark.probability(min_rate=0.9)` (or
+  `--prob-min-rate` / `prob_min_rate` for every case) passes a case
+  when its whole interval lies above the bar, fails it when the
+  interval lies entirely below, and calls it UNDECIDED otherwise —
+  failing by default, `--prob-undecided=pass` / `prob_undecided` to
+  relax. `min_passes=` gates on a count instead; `runs=`,
+  `confidence=`, `method=` and `prior=` set one function's (or, via
+  `pytest.param` marks, one case's) run count and interval settings.
+  In a gated case, failing runs are reported as xfailed (`-rx` lists
+  them, `--xfail-tb` shows tracebacks, `-x` doesn't stop on them) and
+  the verdict sets the exit status; a `probability: gates` block lists
+  FAIL and UNDECIDED cases with their interval and bar, and the footer
+  counts verdicts. `prob_errors = exclude` takes errored runs out of a
+  gate's sample instead of counting them as non-passes. A
+  collection-time `InfeasibleGateWarning` flags gates that can't pass
+  with their run count. JSON rows gain `gate` (`null` when ungated),
+  and `exit_status` includes gate failures. Ungated suites are
+  unchanged. Known limitation: a failed gate has no failing item, so
+  JUnit XML and `--lf` don't see it.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function

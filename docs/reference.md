@@ -40,8 +40,20 @@ All options live in the `probability` group of `pytest --help`.
 
 `--prob-no-intervals`
 : Hide the interval column in the terminal summary. The JSON report
-  still carries `rows[].ci`.
+  still carries `rows[].ci`. The gates block always shows its
+  intervals.
   **Default:** the `prob_intervals` ini value, else shown.
+
+`--prob-min-rate=RATE`
+: Gate every benchmark case on its pass rate: see [Gates](#gates).
+  Strictly between 0 and 1. A `probability` mark that sets `min_rate`
+  or `min_passes` takes precedence for its cases.
+  **Default:** the `prob_min_rate` ini value, else no global gate.
+
+`--prob-undecided={fail,pass}`
+: Whether an UNDECIDED gate verdict fails the session. `pass` still
+  lists the case in the gates block.
+  **Default:** the `prob_undecided` ini value, else `fail`.
 
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
@@ -80,15 +92,142 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 `prob_intervals` *(bool, default `true`)*
 : Show the interval column; `--prob-no-intervals` turns it off.
 
-Invalid values for any of these four are reported as pytest usage
-errors before anything runs.
+`prob_min_rate` *(string, default empty)*
+: A global gate for every case; overridden by `--prob-min-rate`.
+  Empty means no global gate.
+
+`prob_undecided` *(string, default `"fail"`)*
+: `fail` or `pass`; overridden by `--prob-undecided`.
+
+`prob_errors` *(string, default `"count"`)*
+: How errored runs of a gated case are treated: `count` or `exclude`.
+  See [Errors in gated cases](#errors-in-gated-cases). Ini only; use
+  `-o prob_errors=exclude` for a one-off.
+
+Invalid values for the statistical and gate options are reported as
+pytest usage errors before anything runs.
+
+## The `probability` marker
+
+```python
+@pytest.mark.probability(min_rate=0.9)                               # exact, at prob_confidence
+@pytest.mark.probability(min_rate=0.9, method="bayes", prior=(1, 1))
+@pytest.mark.probability(min_passes=19, runs=20)                     # count rule
+@pytest.mark.probability(runs=40)                                    # run count only, no gate
+```
+
+| Argument | Meaning |
+|---|---|
+| `min_rate` | Gate on the pass rate: the case's interval must lie above it. Strictly between 0 and 1. |
+| `min_passes` | Gate on a count instead: the case passes when passes ≥ `min_passes`. A positive integer. |
+| `runs` | This function's (or case's) run count. A positive integer. |
+| `confidence` | The level of this gate's interval, instead of `prob_confidence`. |
+| `method` | `exact`, `wilson` or `bayes`, instead of `prob_method`. |
+| `prior` | The Beta prior for `bayes`, as `(a, b)`, instead of `prob_prior`. |
+
+- **Where it applies:** on a `bench_*` function, every case of it; on
+  one case with `pytest.param(..., marks=pytest.mark.probability(...))`.
+  A case's mark overrides the function's argument by argument, except
+  that `min_rate` and `min_passes` are one setting: a case mark that
+  names either replaces the function's rule.
+- **One rule per mark:** `min_rate` and `min_passes` can't be used
+  together.
+- **Run count precedence:** `--prob-runs` beats `runs=`, which beats
+  the `prob_runs` ini value.
+- **Gated or not:** a case is gated when its mark sets `min_rate` or
+  `min_passes`, or a global min rate is set. `runs=`, `confidence=`,
+  `method=` and `prior=` alone don't create a gate.
+- **Validation:** the marker is registered, so `--strict-markers`
+  accepts it. A bad argument is a collection error that names the
+  case, e.g. `classify::identify_pii: invalid probability mark: min_rate
+  must be strictly between 0 and 1, got 90 (did you mean 0.9?)`.
+
+## Gates
+
+A gate decides whether a case passes from its estimated pass
+probability, instead of requiring every run to pass.
+
+**The verdict rule** is the same for every method. The interval is the
+gate's (its `method`, `confidence` and `prior`) over the gate's sample,
+compared with unrounded bounds:
+
+| Interval vs `min_rate` | Verdict |
+|---|---|
+| Entirely above | PASS |
+| Entirely below | FAIL |
+| Straddles it | UNDECIDED |
+
+UNDECIDED means there isn't enough data to tell yet: run more. It
+fails the session by default; `--prob-undecided=pass` /
+`prob_undecided = pass` lets it through. Under the count rule
+(`min_passes`) there is no UNDECIDED: the case passes when passes ≥
+`min_passes`, and fails otherwise.
+
+**How runs are reported.** In a gated case, a run that fails an
+`assert` is a sample, not a verdict, so it is reported as *xfailed*:
+
+- `-rx` lists each one with its assert message as the reason
+  (`XFAIL …::identify_pii[run3] - probability gate: assert 'other' ==
+  'pii'`), and pytest 8's `--xfail-tb` prints the kept traceback.
+- `-x` / `--maxfail` don't stop on it.
+- `--runxfail` turns this off: gated failing runs are reported as
+  ordinary failures again. The gate is still judged.
+
+The verdicts are decided after every run is in, from the aggregated
+counts — in-process, or on the pytest-xdist controller, so they are the
+same with and without `-n`.
+
+### Errors in gated cases
+
+`prob_errors` decides what an errored run (any exception other than
+`AssertionError`) means for a gate:
+
+- `count` (default): errors fail the session as they always do, and
+  count as non-passes in the gate's sample.
+- `exclude`: errors leave the gate's sample (`7/10` with 3 errors is
+  judged as `7/7`) and are reported as xfailed, so they don't fail the
+  session. The summary row shows `(3 errored, excluded)`. A case whose
+  every run errored has no sample left and is UNDECIDED.
+
+Ungated cases are never affected.
+
+### Feasibility warning
+
+At collection, a gate that couldn't pass even if every run passed
+raises an `InfeasibleGateWarning`:
+
+```text
+InfeasibleGateWarning: classify::identify_pii: min_rate=0.9 at 95% needs ≥36 runs; this case has 10
+```
+
+Cases of one function that share a gate get one warning
+(`classify (3 cases): … each has 10`). With the exact method at 95%,
+`min_rate` needs at least:
+
+| `min_rate` | 0.8 | 0.9 | 0.95 | 0.99 |
+|---|---|---|---|---|
+| Runs | 17 | 36 | 72 | 368 |
+
+A count gate needs `min_passes` runs. The warning is an ordinary pytest
+warning: filter it with
+`-W ignore::pytest_probability.InfeasibleGateWarning`, or make it an
+error with `-W error::…`.
+
+### Known limitation
+
+A failed gate has no failing item: the runs passed or were xfailed. So
+JUnit XML (`--junitxml`) records no failure for it, and `--lf` has no
+failed items to rerun. The exit status and the JSON report do carry
+the verdict. Gate items for JUnit XML and `--lf` are planned.
 
 ## Python API
 
 Everything importable lives in the top-level package:
 
 ```python
-from pytest_probability import TokenUsage, record_cost, record_usage
+from pytest_probability import (
+    InfeasibleGateWarning, TokenUsage, record_cost, record_usage,
+)
 ```
 
 ### `record_usage(usage=None, /, **fields)`
@@ -120,6 +259,12 @@ class TokenUsage:
 
 Token accounting for one model's calls within a run. See {doc}`cost`
 for aggregation rules.
+
+### `InfeasibleGateWarning`
+
+A `pytest.PytestWarning` subclass, raised at collection for a gate that
+cannot pass even if every run passes. See
+[Feasibility warning](#feasibility-warning).
 
 ## Benchmark module contract
 
@@ -186,6 +331,13 @@ In the JSON report the question never arises: rows carry the three raw
 class counts, so every combination is exactly recoverable regardless of
 the status word.
 
+In a gated case under `prob_errors = exclude`, the error annotation
+reads `(N errored, excluded)` instead: `5/10  FLAKY (1 errored,
+excluded)`, `7/10  (3 errored, excluded)` for passes and errors only,
+`0/10  ERROR (10 errored, excluded)`. The fraction and interval on the
+row still count every run; the gates block shows the gate's own
+sample.
+
 ## Terminal summary anatomy
 
 ```text
@@ -194,6 +346,7 @@ the status word.
    \_ function::case-id  \_ fraction  \_ interval  \_ cost  \_ status (omitted when pass)
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
+  Gates:   3 passed, 1 failed, 1 undecided     # only when a case is gated
   Cost:    $0.0110                                 # only when cost was recorded
   Tokens:  m-small  1,200 in / 80 out / 640 cached  $0.0010   # per model,
            m-large  4,800 in / 900 out              $0.0040   # only with usage
@@ -201,6 +354,28 @@ the status word.
 ```
 
 The section renders only when at least one benchmark item ran.
+
+### The gates block
+
+When any gate is FAIL or UNDECIDED, a second section lists those cases
+with the interval and bar each verdict came from:
+
+```text
+============================== probability: gates ==============================
+  classify::identify_pii  37/40  [80%, 98%]  ≥90%        UNDECIDED
+  classify::never          3/40  [ 2%, 20%]  ≥90%        FAIL
+  triage::refund          17/20  [62%, 97%]  ≥19 passes  FAIL
+```
+
+- The fraction and interval are the gate's own: its `method`,
+  `confidence` and `prior`, over its sample (errored runs left out
+  under `prob_errors = exclude`, with a trailing `(N errored,
+  excluded)`). So a printed verdict always sits next to the interval it
+  was read from, even when the gate overrides the session settings.
+- Intervals are shown even with `--prob-no-intervals` or a single run:
+  the verdict depends on them.
+- PASS cases are only counted, on the `Gates:` line. `(allowed)` marks
+  UNDECIDED cases that `--prob-undecided=pass` lets through.
 
 ### The interval column
 
@@ -222,6 +397,25 @@ in the fraction, so errors count as non-passes.
 
 ## Exit status
 
-Standard pytest semantics: any failed or errored run makes the session
-exit nonzero. There is no "allowed flakiness" threshold in the plugin
-itself; build soft gates on the {doc}`JSON report <json-report>`.
+Without gates, standard pytest semantics: any failed or errored run
+makes the session exit nonzero.
+
+With gates, a gated case's failing runs are xfailed, so they never fail
+the session themselves; the gate's verdict does. After every run,
+`pytest_sessionfinish` sets exit code 1 (`TESTS_FAILED`) when any gate
+is FAIL, or UNDECIDED under `prob_undecided = fail`, and pytest would
+otherwise have exited 0.
+
+| Session | Exit code |
+|---|---|
+| Every gate PASS, nothing else failed | 0 |
+| UNDECIDED gates only, `--prob-undecided=pass` | 0 |
+| A gate FAIL, or UNDECIDED under the default `fail` | 1 |
+| An ungated run failed or errored (whatever the gates) | 1 |
+| An errored run in a gated case, `prob_errors = count` | 1 |
+| Interrupted, usage error, no tests… | pytest's own code, unchanged |
+
+pytest's last line counts runs, not gates, so a session can end
+`137 passed, 43 xfailed` and still exit 1: the `Gates:` line and the
+gates block say why. The JSON report's `exit_status` is the final code,
+gates included.

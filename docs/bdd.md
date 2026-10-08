@@ -131,13 +131,25 @@ point is you are making it with numbers.
 Promote v2, delete the v1 axis value, and keep the benchmark in CI —
 the incident case is now a permanent regression sentinel, and every
 future prompt tweak reruns it ten times. For a CI gate softer than
-perfection, check the {doc}`JSON report <json-report>`:
+perfection, gate the case on the contract's rate, so its verdict
+rather than each run decides the exit status:
 
-```bash
-pytest benchmarks/ --prob-runs=10 --prob-json=report.json || true
-jq -e '.rows[] | select(.case == "triage::refund") | .pass_rate >= 95' \
-  report.json > /dev/null || { echo "incident case regressed"; exit 1; }
+```python
+@pytest.mark.parametrize("text,expected", [
+    pytest.param("my card was charged twice", "billing", id="refund",
+                 marks=pytest.mark.probability(min_rate=0.95, runs=100)),
+    ...
+])
+def bench_triage(text, expected):
+    ...
 ```
+
+The case passes once its interval lies above 95%, fails when it lies
+entirely below, and stays UNDECIDED — failing CI by default — while the
+runs can't tell. Proving a high rate takes runs: 95% at 95% confidence
+needs at least 72 runs even if all of them pass, and the plugin warns
+at collection when a gate asks for more than its runs can show. See
+{doc}`running` for the exit status.
 
 ## The habit
 
