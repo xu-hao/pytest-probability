@@ -131,6 +131,17 @@ The plugin was built xdist-aware:
   raised by every worker, so they show up once per worker.
 - `--prob-plan` runs nothing, so it turns `-n` off and plans in one
   process; its output is the same with and without `-n`.
+- `--prob-stop=curtail` needs `--dist loadgroup`: a case can only stop
+  early in the process that runs all of its runs, so the plugin puts
+  each stoppable case in an `xdist_group` of its own (xdist appends it
+  to the node id: `…::never[run3]@classify::never`). With another
+  `--dist` it warns (`CurtailmentWarning`) and every run runs. The
+  controller rebuilds the stops from the reports, so the output
+  matches a serial run.
+
+  ```bash
+  pytest benchmarks/ --prob-runs=40 --prob-stop=curtail -n 8 --dist loadgroup
+  ```
 - `setup()`/`teardown()` run once per file *per worker that executes
   items from that file* — the same semantics xdist gives module-scoped
   fixtures. Keep them idempotent.
@@ -193,6 +204,52 @@ margin=0.02)`) works the same way for a whole function: its failing
 runs are xfailed, and the margin's verdict on each arm decides — see
 Comparisons in {doc}`reference`. Without a margin a comparison only
 reports.
+
+## Stopping early
+
+Runs cost money, and a gated case often settles long before its last
+one: once `never` above has 9 failures, no 31 remaining runs could
+lift it over 90%. `--prob-stop=curtail` (or `prob_stop = curtail`)
+skips a gated case's remaining runs as soon as its verdict can no
+longer change, whatever they would do:
+
+```bash
+pytest benchmarks/ --prob-runs=40 --prob-stop=curtail
+```
+
+```text
+================================= probability ==================================
+  classify::is_question   40/40  [91%, 100%]
+  classify::identify_pii  37/38  [86%,  99%]  FLAKY  decided after 38/40
+  classify::never          3/12  [ 5%,  57%]  FLAKY  decided after 12/40
+
+  Overall: 80/90 passed (89%)
+  Gates:   1 passed, 1 failed, 1 undecided
+  Stopped: 2 cases early, saving 30 of 120 runs (25%)
+============================== probability: gates ==============================
+  classify::identify_pii  37/38  [86%, 99%]  ≥90%  UNDECIDED  decided after 38/40
+  classify::never          3/12  [ 5%, 57%]  ≥90%  FAIL  decided after 12/40
+
+  Run with --prob-explain for a plain-language reading.
+================== 80 passed, 30 skipped, 10 xfailed in 0.88s ==================
+```
+
+- **The verdicts are exact:** the same as running every run, so the
+  exit status is too. A case stops only when every way its remaining
+  runs could go — pass, fail, error or skip — gives the same verdict.
+- The skipped runs are pytest skips (`-rs` shows `probability gate:
+  decided after 12/40 runs (FAIL)`), not samples, and the `Stopped:`
+  line counts the runs and, when cost was recorded, the cost saved.
+- A stopped case's fraction comes from fewer runs and leans toward its
+  verdict (3/12 above, against 3/40 for all the runs), so
+  function-level, metric, comparison and baseline intervals over a
+  stopped case are hidden, with a note.
+- Ungated cases always run every run, and so do gated cases whose runs
+  another verdict needs: a comparison `margin=`, `--prob-margin`
+  against a baseline, or a latency gate.
+- Under pytest-xdist it needs `--dist loadgroup` (below).
+
+See Early stopping in {doc}`reference` for the details.
 
 ## Budgeting runs before running them
 

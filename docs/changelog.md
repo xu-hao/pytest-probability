@@ -195,6 +195,34 @@
   estimate, `ci` with ranks and coverage, min_runs, max_latency,
   verdict). `--prob-explain` reads latency gates in plain words.
   Without these options nothing changes.
+- **Early stopping:** `--prob-stop=curtail` / `prob_stop = curtail`
+  (default `off`) skips a gated case's remaining runs as soon as its
+  verdict can no longer change, whatever they would do — PASS when it
+  would hold even if every remaining run failed, FAIL when even if
+  every one passed, UNDECIDED when neither is reachable. The
+  thresholds are computed from the gate (the fewest passes that PASS
+  and the most that FAIL, by bisection over its own verdict), so every
+  verdict, and the exit status, is the one all the runs would give;
+  errors under either `prob_errors` mode and runs that skip themselves
+  are accounted for. Skipped runs are pytest skips (`probability gate:
+  decided after 23/40 runs (FAIL)`), not samples; rows and the gates
+  block note `decided after 23/40`, and a `Stopped:` footer line counts
+  the cases, runs saved and cost avoided at each case's cost per run.
+  A stopped case's fraction leans toward its verdict, so
+  function-level and Overall intervals, metric lines, and comparison
+  and baseline lines over a stopped case show a note instead of an
+  interval (and p-value). Cases whose runs another verdict needs — a
+  comparison margin, `--prob-margin`, a latency gate — never stop.
+  Works in-process in either order (`--prob-transpose` too); under
+  pytest-xdist it needs `--dist loadgroup` (the plugin gives each
+  stoppable case its own `xdist_group`), and otherwise a new
+  `CurtailmentWarning` says so and every run runs. **JSON:** rows gain
+  `stopped` (`null`, or after, planned, skipped, verdict,
+  cost_avoided), aggregates, metric aggregates and comparisons gain
+  `stopped` counts, and a top-level `stopping` block summarizes.
+  `--prob-explain` says why each stopped case could stop and why
+  intervals are hidden. Without the option the terminal output and
+  exit status are unchanged, and the new JSON fields are `null` or 0.
 
 ## 0.2.0 (2026-07-08)
 

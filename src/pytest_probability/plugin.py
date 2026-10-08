@@ -43,6 +43,9 @@ Design notes:
   distribution-free order-statistic interval (``LatencySpec``);
   ``max_latency=`` gates on it (lower is better) and ``--prob-latency``
   shows it.
+- ``--prob-stop=curtail`` skips a gated case's remaining runs once
+  ``Gate.settled()`` finds that no way they could go changes its
+  verdict (``Curtailer``), so verdicts are those of running every run.
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ import ast
 import contextvars
 import dataclasses
 import fnmatch
+import functools
 import hashlib
 import importlib.util
 import inspect
@@ -63,7 +67,7 @@ import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, NamedTuple
+from typing import Any, Callable, Container, Iterable, Iterator, NamedTuple
 
 import pytest
 
@@ -338,6 +342,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         " mark's latency_quantile) with its interval"
         " (default: prob_latency ini or off)",
     )
+    group.addoption(
+        "--prob-stop",
+        dest="prob_stop",
+        default=None,
+        choices=STOP_MODES,
+        help="curtail: skip a gated case's remaining runs once its verdict can"
+        " no longer change; the verdicts are the same as running every run"
+        " (default: prob_stop ini or off)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -426,6 +439,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "prob_latency_quantile",
         "The latency quantile reported for cases whose mark sets none",
         default="0.95",
+    )
+    parser.addini(
+        "prob_stop",
+        "Early stopping: off, or curtail (skip a gated case's remaining runs"
+        " once its verdict can no longer change)",
+        default="off",
     )
 
 
@@ -630,6 +649,8 @@ def pytest_configure(config: pytest.Config) -> None:
     plan_config(config)
     baseline_of(config)
     latency_config(config)
+    if stop_config(config).curtails:
+        config.pluginmanager.register(Curtailer(), "probability-curtailer")
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -893,6 +914,78 @@ def latency_config(config: pytest.Config) -> LatencyConfig:
     return cfg
 
 
+STOP_MODES = ("off", "curtail")
+
+
+class CurtailmentWarning(pytest.PytestWarning):
+    """``--prob-stop=curtail`` can't stop cases early in this session:
+    under pytest-xdist it needs ``--dist loadgroup``."""
+
+
+@dataclass(frozen=True)
+class StopConfig:
+    """Early stopping, from ``--prob-stop``/``prob_stop``.
+
+    ``mode`` is ``"off"`` or ``"curtail"``. ``active`` says whether cases
+    can stop early in this session at all: in-process, or under
+    pytest-xdist with ``--dist loadgroup``, which keeps all of a case's
+    runs on one worker. ``curtails`` says whether *this* process decides
+    — the one running the items — and ``group`` whether it must put each
+    case's items in an ``xdist_group`` (an xdist worker under
+    ``--dist loadgroup``).
+    """
+
+    mode: str = "off"
+    active: bool = False
+    curtails: bool = False
+    group: bool = False
+
+
+_STOP_CONFIG = pytest.StashKey[StopConfig]()
+
+
+def _resolve_stop_config(config: pytest.Config) -> StopConfig:
+    mode = config.getoption("prob_stop")
+    if mode is None:
+        mode = str(config.getini("prob_stop")).strip()
+        if mode not in STOP_MODES:
+            raise pytest.UsageError(
+                f"prob_stop must be one of {', '.join(STOP_MODES)}, got {mode!r}"
+            )
+    if mode == "off":
+        return StopConfig()
+    if hasattr(config, "workerinput"):
+        # An xdist worker, where xdist turns --dist loadgroup into
+        # option.loadgroup (and resets option.dist).
+        grouped = bool(getattr(config.option, "loadgroup", False))
+        return StopConfig(mode, active=grouped, curtails=grouped, group=grouped)
+    dist = config.getoption("dist", "no")
+    if dist != "no" and config.getoption("tx", None):
+        # The xdist controller: the workers run the items and decide.
+        if dist == "loadgroup":
+            return StopConfig(mode, active=True)
+        # A worker would see only its share of a case's runs, so it
+        # couldn't tell when the verdict is settled.
+        config.issue_config_time_warning(
+            CurtailmentWarning(
+                f"--prob-stop={mode} needs --dist loadgroup under pytest-xdist,"
+                f" so that all runs of a case share a worker; with --dist {dist},"
+                " every case runs all its runs"
+            ),
+            stacklevel=2,
+        )
+        return StopConfig(mode)
+    return StopConfig(mode, active=True, curtails=True)
+
+
+def stop_config(config: pytest.Config) -> StopConfig:
+    """The session's resolved ``StopConfig`` (validated at configure)."""
+    cfg = config.stash.get(_STOP_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_STOP_CONFIG] = _resolve_stop_config(config)
+    return cfg
+
+
 def _pct_bar(rate: float) -> str:
     # A bar as the author wrote it: 0.9 -> "90%", 0.975 -> "97.5%".
     return f"{rate * 100:g}%"
@@ -1064,6 +1157,57 @@ class Gate:
                 return n
         return cap  # pragma: no cover - power(cap) ≥ target was checked
 
+    def cutoffs(self, total: int) -> tuple[int, int]:
+        """``(pass_at, fail_at)`` with ``total`` judged runs: the fewest
+        passes that PASS (``critical_passes``; ``total + 1`` when none
+        does) and the most that FAIL (``-1`` when none does); anything in
+        between is UNDECIDED.
+
+        With the number of runs fixed, every interval bound rises with
+        the passes, so the verdict only improves and bisection finds
+        both. Cached per gate and total: curtailment asks after every run.
+        """
+        return _cutoffs(self, total)
+
+    def settled(
+        self, passes: int, fails: int, errors: int, remaining: int
+    ) -> str | None:
+        """The case's verdict if its ``remaining`` runs can no longer
+        change it, else ``None``.
+
+        ``passes``, ``fails`` and ``errors`` are its runs so far. Each
+        remaining run may pass, fail, error or record nothing (a
+        ``pytest.skip``), so the final sample holds the judged runs so
+        far plus anywhere from none to all of the remaining ones. Bounds
+        rise with passes and fall with non-passes, so the two extremes
+        decide: PASS is certain when it holds even if every remaining run
+        fails, FAIL when it holds even if every one passes, and UNDECIDED
+        when neither is reachable. Whichever it is, the verdict on the
+        runs so far is already the same, which is what lets a stopped
+        case report it from the runs it has.
+
+        Never settled before a run is recorded: stopping then would
+        leave the case without a row. When every run so far errored
+        under ``exclude``, the remaining runs could all error too and
+        leave nothing to judge, so that verdict must agree as well.
+        """
+        if passes + fails + errors == 0:
+            return None
+        judged = passes + fails + (errors if self.errors == "count" else 0)
+        total = judged + remaining
+        pass_at, fail_at = self.cutoffs(total)
+        if passes >= pass_at:
+            verdict = PASS
+        elif passes + remaining <= fail_at:
+            verdict = FAIL
+        elif fail_at < passes and passes + remaining < pass_at:
+            verdict = UNDECIDED
+        else:
+            return None
+        if judged == 0 and self.verdict(0, 0) != verdict:
+            return None
+        return verdict
+
     def bar(self) -> str:
         """The bar as the gates block prints it: ``≥90%``, ``≥19 passes``."""
         if self.rule == "count":
@@ -1108,6 +1252,22 @@ class Gate:
             errors=rec["errors"],
             runs=rec["runs"],
         )
+
+
+@functools.lru_cache(maxsize=4096)
+def _cutoffs(gate: Gate, total: int) -> tuple[int, int]:
+    critical = gate.critical_passes(total)
+    pass_at = total + 1 if critical is None else critical
+    # FAIL holds up to fail_at and not above: bisect for the first count
+    # that doesn't FAIL (verdict(low) FAILs, verdict(high) doesn't).
+    low, high = -1, total + 1
+    while high - low > 1:
+        mid = (low + high) // 2
+        if gate.verdict(mid, total) != FAIL:
+            high = mid
+        else:
+            low = mid
+    return pass_at, high - 1
 
 
 @dataclass(frozen=True)
@@ -1859,6 +2019,7 @@ class BenchFunction(pytest.Collector):
             pairs = [
                 (plan, run_id) for plan in plans for run_id in range(1, plan.runs + 1)
             ]
+        group = stop_config(self.config).group
         for plan, run_id in pairs:
             if plan.variant_id:
                 name = (
@@ -1885,6 +2046,16 @@ class BenchFunction(pytest.Collector):
                 # (skip/xfail/-m all read these).
                 item.own_markers.append(mark)
                 item.keywords[mark.name] = mark
+            if (
+                group
+                and item.curtailable
+                and next(item.iter_markers("xdist_group"), None) is None
+            ):
+                # --dist loadgroup sends a group to one worker: then that
+                # worker runs every run of the case and can tell when its
+                # verdict is settled. A group of the author's own also
+                # keeps a case's runs together, so it is left alone.
+                item.add_marker(pytest.mark.xdist_group(_stop_group(plan.case)))
             yield item
 
     def _warn_infeasible(self, short: str, plans: list[_CasePlan]) -> None:
@@ -1997,6 +2168,8 @@ class BenchItem(pytest.Item):
         # still fail the session unless a rate gate or a margin judges
         # the case.
         self.latency = latency
+        # The skip reason once --prob-stop=curtail has settled the case.
+        self.stopped: str | None = None
 
     @property
     def judged(self) -> bool:
@@ -2010,7 +2183,28 @@ class BenchItem(pytest.Item):
         baseline = baseline_of(self.config)
         return baseline is not None and baseline.judges(self.case)
 
+    @property
+    def curtailable(self) -> bool:
+        """Whether ``--prob-stop=curtail`` may stop this case early: it is
+        gated, and no other verdict needs every one of its runs — not its
+        function's comparison margin, not ``--prob-margin`` against a
+        baseline, and not a latency gate (``max_latency``), whose sample
+        of run times skipped runs would shrink. Being conservative keeps
+        every verdict the one all the runs would give."""
+        if self.gate is None:
+            return False
+        if self.latency is not None and self.latency.gated:
+            return False
+        if self.compare and self.compare["margin"] is not None:
+            return False
+        baseline = baseline_of(self.config)
+        return not (baseline is not None and baseline.judges(self.case))
+
     def runtest(self) -> None:
+        if self.stopped is not None:
+            # The Curtailer's skip mark ends the run in setup; this
+            # covers -p no:skipping, which ignores skip marks.
+            pytest.skip(self.stopped)
         delay = _delay(self.config)
         if delay > 0:
             if self.config.stash.get(_DELAYED_ONCE, False):
@@ -2124,6 +2318,140 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
         return
     report.outcome = "skipped"
     report.wasxfail = reason
+
+
+# ---------------------------------------------------------------------------
+# Early stopping by curtailment
+# ---------------------------------------------------------------------------
+
+# The user property a run skipped by curtailment carries: its case, the
+# runs that had run when the verdict settled, the case's planned runs
+# and that verdict.
+STOP_KEY = "probability_stop"
+
+
+def _stop_group(case: str) -> str:
+    # The xdist_group name for a case. xdist splits a node id at its last
+    # "@" when no "]" follows it, so the name must contain neither.
+    return case.replace("@", "_").replace("]", "_")
+
+
+@dataclass
+class _Tally:
+    """One case's runs so far, in the process that runs all of them."""
+
+    gate: Gate
+    planned: int
+    seen: int = 0
+    passes: int = 0
+    fails: int = 0
+    errors: int = 0
+    # (verdict, runs seen when it settled) once it has.
+    decided: tuple[str, int] | None = None
+
+
+class Curtailer:
+    """``--prob-stop=curtail``: skip a gated case's remaining runs once
+    its verdict can no longer change.
+
+    Registered only in a process that runs every run of each case it
+    runs: in-process, or an xdist worker under ``--dist loadgroup``
+    (each case is one ``xdist_group``). It tallies each case's runs as
+    they finish, from the records they leave on ``user_properties``, and
+    asks ``Gate.settled()`` after every one; from then on the case's
+    runs are skipped with a ``skip`` mark and a ``STOP_KEY`` property,
+    so they are reported as skips — not samples — and the aggregator,
+    wherever it runs, can count them.
+
+    The cases it may stop are those whose every item is ``curtailable``
+    with the same gate; "remaining" is how many of their items are left
+    in ``session.items`` (after ``-k``/``-m``), in whatever order they
+    run.
+    """
+
+    def __init__(self) -> None:
+        self._tallies: dict[str, _Tally] | None = None
+
+    def _plan(self, items: list[pytest.Item]) -> dict[str, _Tally]:
+        by_case: dict[str, list[BenchItem]] = {}
+        for item in items:
+            if isinstance(item, BenchItem):
+                by_case.setdefault(item.case, []).append(item)
+        tallies = {}
+        for case, mine in by_case.items():
+            gate = mine[0].gate
+            # Two files may share a case id (one row): only stop the row
+            # if every item agrees on what judges it.
+            if all(i.curtailable and i.gate == gate for i in mine):
+                tallies[case] = _Tally(gate=gate, planned=len(mine))
+        return tallies
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_protocol(self, item: pytest.Item, nextitem):
+        if self._tallies is None:
+            self._tallies = self._plan(item.session.items)
+        tally = (
+            self._tallies.get(item.case) if isinstance(item, BenchItem) else None
+        )
+        if tally is None:
+            yield
+            return
+        if tally.decided is not None:
+            verdict, after = tally.decided
+            item.stopped = (
+                f"probability gate: decided after {after}/{tally.planned} runs"
+                f" ({verdict.upper()})"
+            )
+            item.user_properties.append(
+                (
+                    STOP_KEY,
+                    {
+                        "case": item.case,
+                        "run": item.run_id,
+                        "after": after,
+                        "planned": tally.planned,
+                        "verdict": verdict,
+                    },
+                )
+            )
+            item.add_marker(pytest.mark.skip(reason=item.stopped))
+        start = len(item.user_properties)
+        yield
+        tally.seen += 1
+        if tally.decided is not None:
+            return
+        for name, record in item.user_properties[start:]:
+            if name != "probability":
+                continue
+            if record["outcome"] == "pass":
+                tally.passes += 1
+            elif record["outcome"] == "error":
+                tally.errors += 1
+            else:
+                tally.fails += 1
+        if tally.seen < tally.planned:
+            verdict = tally.gate.settled(
+                tally.passes, tally.fails, tally.errors, tally.planned - tally.seen
+            )
+            if verdict is not None:
+                tally.decided = (verdict, tally.seen)
+
+
+@dataclass
+class Stop:
+    """A case that stopped early, as the aggregator rebuilds it from the
+    skipped runs' ``STOP_KEY`` properties: its verdict settled after
+    ``after`` of its ``planned`` runs, and ``skipped`` were skipped."""
+
+    case: str
+    after: int
+    planned: int
+    verdict: str
+    skipped: int = 0
+
+    def label(self) -> str:
+        """``decided after 12/40``: the note on its rows."""
+        return f"decided after {self.after}/{self.planned}"
 
 
 # ---------------------------------------------------------------------------
@@ -2241,6 +2569,10 @@ class Aggregate:
     are ``None`` when ρ is not defined (every case run once, or every
     run with the same outcome). ``cost`` is the cases' recorded cost,
     which prices ``projection()``.
+
+    ``stopped`` counts the cases that stopped early under
+    ``--prob-stop=curtail`` (``suppress_stopped()``); with any, there is
+    no interval.
     """
 
     scope: str
@@ -2259,6 +2591,7 @@ class Aggregate:
     cost: float = 0.0
     # One per --prob-metric, in option order.
     metrics: tuple[MetricAggregate, ...] = ()
+    stopped: int = 0
 
     @property
     def inputs(self) -> int:
@@ -2319,6 +2652,7 @@ class Aggregate:
             "icc": self.icc,
             "width_factor": self.width_factor,
             "metrics": {m.metric.name: m.to_json() for m in self.metrics},
+            "stopped": self.stopped,
         }
 
 
@@ -2362,6 +2696,11 @@ class MetricAggregate:
             return f"no input with at least {self.metric.k} runs"
         return self.aggregate.suppressed
 
+    @property
+    def stopped(self) -> int:
+        """Inputs behind it that stopped early (``--prob-stop``)."""
+        return self.aggregate.stopped if self.aggregate is not None else 0
+
     def to_json(self) -> dict[str, Any]:
         agg = self.aggregate
         level = agg.level if agg is not None else None
@@ -2375,6 +2714,7 @@ class MetricAggregate:
                 "normal", level, agg.normal_ci if agg is not None else None
             ),
             "suppressed": self.suppressed,
+            "stopped": self.stopped,
         }
 
 
@@ -2459,6 +2799,39 @@ def _metric_aggregate(
     )
 
 
+def suppress_stopped(agg: Aggregate, stopped: Container[str]) -> Aggregate:
+    """``agg`` without its intervals when any of its cases is in
+    ``stopped`` — stopped early by ``--prob-stop=curtail`` — and with
+    ``stopped`` counting them; unchanged otherwise.
+
+    A case stops as soon as its verdict is certain, so its fraction
+    comes from fewer runs and leans toward that verdict: an average over
+    such cases would mislead. The estimate, ρ and the per-case counts
+    stay, as data. Each metric's own aggregate is treated the same way,
+    over the cases it kept. An interval already suppressed (too few
+    inputs) keeps its reason.
+    """
+    n = sum(case in stopped for case in agg.cases)
+    if not n:
+        return agg
+    metrics = tuple(
+        dataclasses.replace(m, aggregate=suppress_stopped(m.aggregate, stopped))
+        if m.aggregate is not None
+        else m
+        for m in agg.metrics
+    )
+    if agg.ci is None:
+        return dataclasses.replace(agg, stopped=n, metrics=metrics)
+    return dataclasses.replace(
+        agg,
+        ci=None,
+        normal_ci=None,
+        suppressed=f"{_cases(n)} stopped early",
+        stopped=n,
+        metrics=metrics,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Paired comparisons
 # ---------------------------------------------------------------------------
@@ -2538,6 +2911,10 @@ class Comparison:
     Newcombe/Fisher) and ``unpaired`` are sorted by input id: the
     bootstrap draws from that order, so the result doesn't depend on
     the order results arrived in.
+
+    ``stopped`` counts the cases behind it that stopped early under
+    ``--prob-stop=curtail`` (``suppress_stopped_comparison()``); with
+    any, there is neither an interval nor a p-value.
     """
 
     function: str
@@ -2560,6 +2937,7 @@ class Comparison:
     p_adjusted: float | None = None
     adjustment: str = "none"
     family: int = 1
+    stopped: int = 0
 
     @property
     def pairs(self) -> int:
@@ -2616,7 +2994,32 @@ class Comparison:
             "seed": self.seed,
             "cost_ratio": self.cost_ratio,
             "inputs": [i.to_json(self.level) for i in self.inputs],
+            "stopped": self.stopped,
         }
+
+
+def suppress_stopped_comparison(cmp: Comparison, stopped: int) -> Comparison:
+    """``cmp`` without its interval and p-value: ``stopped`` of the cases
+    behind it stopped early (``--prob-stop=curtail``), so their
+    fractions lean toward their verdicts and so would a difference
+    between arms. The difference and the per-input entries stay, as
+    data. With no interval a margin would be UNDECIDED, but a function
+    with a margin never stops early (``BenchItem.curtailable``).
+    Adjust the session's p-values after this: the family is the
+    comparisons that keep one.
+    """
+    return dataclasses.replace(
+        cmp,
+        ci=None,
+        ci_method=None,
+        p=None,
+        p_method=None,
+        exact=None,
+        p_adjusted=None,
+        suppressed=f"{_cases(stopped)} stopped early",
+        stopped=stopped,
+        verdict=cmp.spec.verdict(None),
+    )
 
 
 def _mean_difference(sample: list[tuple[float, float]]) -> float:
@@ -3303,8 +3706,9 @@ def _pp_decimals(cmp: Any) -> int:
 
 def _difference_cell(cmp: Any) -> tuple[str, tuple[str, str] | None]:
     """``("+20 pp", ("−11", "+51"))``; the interval part is ``None``
-    when there is none, and the difference ``""`` with no pairs."""
-    if cmp.estimate is None:
+    when there is none, and the difference ``""`` with no pairs or when
+    cases behind it stopped early."""
+    if cmp.estimate is None or cmp.stopped:
         return "", None
     dec = _pp_decimals(cmp)
     bounds = None
@@ -3323,10 +3727,11 @@ def _comparison_lines(
 
     A comparison with no interval but several pairs (fewer than
     ``prob_min_inputs``) is followed by one indented line per input
-    with that input's own interval and p. When the session makes more
-    than one comparison, a closing line says whether the p-values were
-    adjusted for that. ``label`` names a comparison's line (default:
-    ``function[axis]``).
+    with that input's own interval and p. One with cases that stopped
+    early shows neither, only ``interval hidden: 2 cases stopped
+    early``. When the session makes more than one comparison, a closing
+    line says whether the p-values were adjusted for that. ``label``
+    names a comparison's line (default: ``function[axis]``).
     """
     if label is None:
         label = lambda c: f"{c.function}[{c.axis}]"  # noqa: E731
@@ -3379,11 +3784,13 @@ def _comparison_lines(
         ]
         if widths["cost"]:
             parts.append(f"{cost:<{widths['cost']}}")
+        if c.stopped:
+            parts.append(f"interval hidden: {c.suppressed}")
         if c.verdict is not None:
             parts.append(f"{bar:<{widths['bar']}}  {c.verdict.upper()}")
         # Columns no comparison uses are left out altogether.
         lines.append(("  " + "  ".join(x for x in parts if x).rstrip(), c.verdict))
-        if c.ci is None and c.pairs > 1:
+        if c.ci is None and c.pairs > 1 and not c.stopped:
             lines.extend((ln, None) for ln in _input_lines(c))
     family = comparisons[0].family if comparisons else 0
     if family > 1:
@@ -3472,20 +3879,34 @@ def _metric_lines(
     the aggregate's name only on its first line. The interval is left
     out when there is none (fewer than ``prob_min_inputs`` inputs with k
     runs) or ``intervals`` is off; ``2 left out (fewer than 5 runs)``
-    counts the cases too short for the metric."""
+    counts the cases too short for the metric. When some of the inputs
+    stopped early (``--prob-stop=curtail``) the line shows neither
+    estimate nor interval, only ``hidden: 2 cases stopped early``."""
     names, prev = [], None
     for agg, _ in entries:
         names.append(agg.name if agg is not prev else "")
         prev = agg
     metrics = [m.metric.name for _, m in entries]
     sizes = [f"N={m.inputs} input{'' if m.inputs == 1 else 's'}" for _, m in entries]
-    ests = [_pct1(m.estimate) if m.estimate is not None else "" for _, m in entries]
+    ests = [
+        _pct1(m.estimate) if m.estimate is not None and not m.stopped else ""
+        for _, m in entries
+    ]
     bounds = [
         (_pct1(m.ci[0]), _pct1(m.ci[1])) if intervals and m.ci is not None else None
         for _, m in entries
     ]
     notes = [
-        f"{m.left_out} left out (fewer than {m.metric.k} runs)" if m.left_out else ""
+        ", ".join(
+            note
+            for note in (
+                f"hidden: {_cases(m.stopped)} stopped early" if m.stopped else "",
+                f"{m.left_out} left out (fewer than {m.metric.k} runs)"
+                if m.left_out
+                else "",
+            )
+            if note
+        )
         for _, m in entries
     ]
 
@@ -3612,9 +4033,15 @@ class ProbabilityAggregator:
         self._baseline_result: BaselineResult | None = None
         # latency_results(), likewise.
         self._latency: dict[str, LatencyResult] | None = None
+        # Cases stopped early (--prob-stop=curtail), from the skipped
+        # runs' reports, in the order they stopped.
+        self._stops: dict[str, Stop] = {}
 
     def pytest_runtest_logreport(self, report) -> None:
-        if getattr(report, "when", None) != "call":
+        when = getattr(report, "when", None)
+        if when in ("setup", "call") and report.skipped:
+            self._note_stop(report)
+        if when != "call":
             return
         for name, value in report.user_properties:
             if name != "probability":
@@ -3657,6 +4084,73 @@ class ProbabilityAggregator:
             for usage in value.get("usage", ()):
                 _merge_usage(st.usage, usage)
 
+    def _note_stop(self, report) -> None:
+        # A run the Curtailer skipped (normally in setup, by its mark).
+        for name, value in report.user_properties:
+            if name != STOP_KEY:
+                continue
+            stop = self._stops.get(value["case"])
+            if stop is None:
+                stop = self._stops[value["case"]] = Stop(
+                    case=value["case"],
+                    after=value["after"],
+                    planned=value["planned"],
+                    verdict=value["verdict"],
+                )
+            stop.skipped += 1
+
+    def stops(self) -> dict[str, Stop]:
+        """The cases that stopped early, by case id."""
+        return self._stops
+
+    def _cost_avoided(self, stop: Stop) -> float | None:
+        """A stopped case's skipped runs priced at its recorded cost per
+        run; ``None`` when it recorded none."""
+        s = self._stats.get(stop.case)
+        if s is None or not s.cost or not s.total:
+            return None
+        return s.cost / s.total * stop.skipped
+
+    def _stopping_json(self) -> dict[str, Any]:
+        stops = list(self._stops.values())
+        costs = [c for c in map(self._cost_avoided, stops) if c is not None]
+        scfg = stop_config(self._config)
+        skipped = sum(st.skipped for st in stops)
+        return {
+            "mode": scfg.mode,
+            "active": scfg.active,
+            "cases": len(stops),
+            "runs_skipped": skipped,
+            "runs_planned": sum(s.total for s in self._stats.values()) + skipped,
+            "cost_avoided": math.fsum(costs) if costs else None,
+        }
+
+    def _stop_json(self, case: str) -> dict[str, Any] | None:
+        stop = self._stops.get(case)
+        if stop is None:
+            return None
+        return {
+            "after": stop.after,
+            "planned": stop.planned,
+            "skipped": stop.skipped,
+            "verdict": stop.verdict,
+            "cost_avoided": self._cost_avoided(stop),
+        }
+
+    def _stop_line(self) -> str | None:
+        """The footer's ``Stopped:`` line; ``None`` when nothing stopped."""
+        if not self._stops:
+            return None
+        info = self._stopping_json()
+        skipped, planned = info["runs_skipped"], info["runs_planned"]
+        line = (
+            f"  Stopped: {_cases(info['cases'])} early, saving {skipped} of"
+            f" {planned} runs ({skipped / planned * 100:.0f}%)"
+        )
+        if info["cost_avoided"]:
+            line += f" and about ${info['cost_avoided']:.4f}"
+        return line
+
     def gate_results(self) -> dict[str, GateResult]:
         """The verdict for every gated row, from the aggregated counts."""
         return {
@@ -3692,7 +4186,8 @@ class ProbabilityAggregator:
         Computed once, after every result is in. Nothing here depends on
         the order results arrived in — not the values (see
         ``Aggregate``), and not the list order, unlike the rows — so it
-        is identical with and without xdist."""
+        is identical with and without xdist. Those over a case that
+        stopped early have no interval (``suppress_stopped``)."""
         if self._aggregates is None:
             cfg = stats_config(self._config)
             by_function: dict[str, list[CaseStats]] = {}
@@ -3709,53 +4204,110 @@ class ProbabilityAggregator:
                         OVERALL, "Overall", self._stats.values(), cfg, metrics=metrics
                     )
                 )
+            if self._stops:
+                out = [suppress_stopped(a, self._stops) for a in out]
             self._aggregates = out
         return self._aggregates
 
     def comparisons(self) -> list[Comparison]:
         """Every comparison (``comparisons_of``), computed once after
         every result is in; like ``aggregates()``, independent of the
-        order results arrived in."""
+        order results arrived in. One whose arm or baseline has a paired
+        case that stopped early has no interval or p-value
+        (``suppress_stopped_comparison``)."""
         if self._comparisons is None:
-            self._comparisons = comparisons_of(
-                self._stats.values(),
-                stats_config(self._config),
-                compare_config(self._config).adjust,
+            adjust = compare_config(self._config).adjust
+            out = comparisons_of(
+                self._stats.values(), stats_config(self._config), adjust
             )
+            stopped = self._stopped_per_comparison(out)
+            if any(stopped):
+                out = adjust_comparisons(
+                    [
+                        suppress_stopped_comparison(c, n) if n else c
+                        for c, n in zip(out, stopped)
+                    ],
+                    adjust,
+                )
+            self._comparisons = out
         return self._comparisons
 
     def baseline_result(self) -> BaselineResult | None:
         """This run against ``--prob-baseline`` (``None`` without it),
         computed once after every result is in; like ``comparisons()``,
-        independent of the order results arrived in."""
+        independent of the order results arrived in. A function whose
+        paired cases include one that stopped early has no interval or
+        p-value (``suppress_stopped_comparison``)."""
         baseline = baseline_of(self._config)
         if baseline is None:
             return None
         if self._baseline_result is None:
-            self._baseline_result = compare_with_baseline(
-                self._stats.values(),
-                baseline,
-                stats_config(self._config),
-                compare_config(self._config).adjust,
+            adjust = compare_config(self._config).adjust
+            result = compare_with_baseline(
+                self._stats.values(), baseline, stats_config(self._config), adjust
             )
+            stopped = [
+                sum(
+                    function_of(case) == c.function
+                    and _variant(case) in {i.input for i in c.inputs}
+                    for case in self._stops
+                )
+                for c in result.comparisons
+            ]
+            if any(stopped):
+                result = dataclasses.replace(
+                    result,
+                    comparisons=tuple(
+                        adjust_comparisons(
+                            [
+                                suppress_stopped_comparison(c, n) if n else c
+                                for c, n in zip(result.comparisons, stopped)
+                            ],
+                            adjust,
+                        )
+                    ),
+                )
+            self._baseline_result = result
         return self._baseline_result
 
     def _baseline_comparisons(self) -> tuple[Comparison, ...]:
         result = self.baseline_result()
         return result.comparisons if result is not None else ()
 
+    def _stopped_per_comparison(self, comparisons: list[Comparison]) -> list[int]:
+        # How many of each comparison's paired cases stopped early.
+        if not self._stops:
+            return [0] * len(comparisons)
+        stopped = [
+            self._stats[case]
+            for case in self._stops
+            if case in self._stats and self._stats[case].compare is not None
+        ]
+        return [
+            sum(
+                function_of(s.case) == c.function
+                and s.compare["arm"] in (c.arm, c.baseline)
+                and s.compare["input"] in {i.input for i in c.inputs}
+                for s in stopped
+            )
+            for c in comparisons
+        ]
+
     def _shown_aggregates(self) -> list[Aggregate]:
-        """The aggregates the summary prints: those with an interval,
-        unless intervals are hidden. Overall is left out when it would
-        repeat the only function's line."""
-        if not stats_config(self._config).intervals:
+        """The aggregates the summary prints: those with an interval, and
+        those that would have one but for cases that stopped early (as a
+        note), unless intervals are hidden. Overall is left out when it
+        would repeat the only function's line."""
+        cfg = stats_config(self._config)
+        if not cfg.intervals:
             return []
         aggs = self.aggregates()
         functions = sum(a.scope == FUNCTION for a in aggs)
         return [
             a
             for a in aggs
-            if a.ci is not None and not (a.scope == OVERALL and functions == 1)
+            if (a.ci is not None or (a.stopped and a.inputs >= cfg.min_inputs))
+            and not (a.scope == OVERALL and functions == 1)
         ]
 
     def _shown_metrics(self) -> list[tuple[Aggregate, MetricAggregate]]:
@@ -3841,6 +4393,7 @@ class ProbabilityAggregator:
                     "cost": s.cost,
                     "usage": s.usage,
                     "metrics": {m.name: m.of(s) for m in metrics},
+                    "stopped": self._stop_json(s.case),
                 }
                 for s in all_stats
             ],
@@ -3851,6 +4404,7 @@ class ProbabilityAggregator:
                 if self.baseline_result() is not None
                 else None
             ),
+            "stopping": self._stopping_json(),
             "records": self._records or [],
         }
         if self._explain:
@@ -4012,6 +4566,9 @@ class ProbabilityAggregator:
             line += f"  {bar:<{bar_col}}  {r.verdict.upper()}"
             if r.excluded:
                 line += f"  ({r.excluded} errored, excluded)"
+            stop = self._stops.get(r.case)
+            if stop is not None:
+                line += f"  {stop.label()}"
             lines.append((line, r.verdict))
         return lines
 
@@ -4066,19 +4623,31 @@ class ProbabilityAggregator:
         one line per shown aggregate, columns aligned across them. An
         aggregate with a ρ gets a continuation line under its size —
         ``runs ×2 → interval −2%  ·  inputs ×2 → −29%`` — priced when
-        cost was recorded."""
+        cost was recorded. One without an interval (cases stopped early)
+        is a note instead: ``classify  N=12 inputs × k=3–20  interval
+        hidden: 2 cases stopped early``."""
         if not shown:
             return []
         name_col = max(len(a.name) for a in shown)
         sizes = [a.size() for a in shown]
         size_col = max(len(z) for z in sizes)
-        ests = [_pct1(a.estimate) for a in shown]
+        with_ci = [a for a in shown if a.ci is not None]
+        ests = [_pct1(a.estimate) if a.ci is not None else "" for a in shown]
         est_col = max(len(e) for e in ests)
-        bounds = [tuple(_pct1(v) for v in a.ci) for a in shown]
-        low_w = max(len(b[0]) for b in bounds)
-        high_w = max(len(b[1]) for b in bounds)
+        bounds = [
+            tuple(_pct1(v) for v in a.ci) if a.ci is not None else ("", "")
+            for a in shown
+        ]
+        low_w = max((len(_pct1(a.ci[0])) for a in with_ci), default=0)
+        high_w = max((len(_pct1(a.ci[1])) for a in with_ci), default=0)
         lines = []
         for a, size, est, (low, high) in zip(shown, sizes, ests, bounds):
+            if a.ci is None:
+                lines.append(
+                    f"  {a.name:<{name_col}}  {size:<{size_col}}"
+                    f"  interval hidden: {a.suppressed}"
+                )
+                continue
             line = (
                 f"  {a.name:<{name_col}}  {size:<{size_col}}  {est:>{est_col}}"
                 f"  [{low:>{low_w}}, {high:>{high_w}}]"
@@ -4146,6 +4715,7 @@ class ProbabilityAggregator:
             undecided_fails=gate_config(self._config).fails(UNDECIDED),
             settle=settle,
             cap=_SETTLE_CAP,
+            stop=self._stops.get(s.case),
         )
 
     def _row_reading(self, s: CaseStats):
@@ -4160,7 +4730,9 @@ class ProbabilityAggregator:
             or bool(s.compare and s.compare["margin"] is not None)
             or (baseline is not None and baseline.judges(s.case))
         )
-        return explain.row_reading(s, interval, cfg, gated=judged)
+        return explain.row_reading(
+            s, interval, cfg, gated=judged, stop=self._stops.get(s.case)
+        )
 
     def _latency_reading(self, result: LatencyResult):
         from . import explain
@@ -4324,6 +4896,9 @@ class ProbabilityAggregator:
             status = self._status_text(s)
             if status:
                 line += f"  {status}"
+            stop = self._stops.get(s.case)
+            if stop is not None:
+                line += f"  {stop.label()}"
             tr.write_line(line.rstrip(), **_MARKUP.get(s.status, {}))
 
         aggregate_lines = self._aggregate_lines(self._shown_aggregates())
@@ -4348,6 +4923,9 @@ class ProbabilityAggregator:
         if verdicts:
             tally, markup = self._gate_tally(verdicts)
             tr.write_line(tally, **markup)
+        stop_line = self._stop_line()
+        if stop_line is not None:
+            tr.write_line(stop_line)
         total_cost = sum(s.cost for s in all_stats)
         if total_cost:
             tr.write_line(f"  Cost:    ${total_cost:.4f}")
@@ -4381,6 +4959,7 @@ class ProbabilityAggregator:
             or self._shown_metrics()
             or self._baseline_comparisons()
             or any(v != PASS for v in verdicts)
+            or self._stops
         ):
             from .explain import HINT
 

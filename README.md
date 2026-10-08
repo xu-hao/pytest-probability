@@ -268,6 +268,30 @@ is entirely above. The interval needs enough runs to have an upper end
 can't pass yet). A latency gate judges speed only: failing asserts
 still fail the session unless the case also has a rate gate.
 
+### Stopping early: skip runs that can't change the verdict
+
+Once `never` has failed 9 of its 40 runs, no remaining run can lift it
+over a 90% bar. `--prob-stop=curtail` skips a gated case's remaining
+runs as soon as its verdict can no longer change — so the verdicts,
+and the exit status, are exactly those of running every run:
+
+```
+$ pytest benchmarks/ --prob-runs=40 --prob-stop=curtail
+...
+  classify::is_question   40/40  [91%, 100%]
+  classify::identify_pii  37/38  [86%,  99%]  FLAKY  decided after 38/40
+  classify::never          3/12  [ 5%,  57%]  FLAKY  decided after 12/40
+
+  Overall: 80/90 passed (89%)
+  Gates:   1 passed, 1 failed, 1 undecided
+  Stopped: 2 cases early, saving 30 of 120 runs (25%)
+```
+
+The skipped runs are pytest skips, not samples. A stopped case's
+fraction leans toward its verdict, so function-level, metric and
+comparison intervals over it are hidden, with a note. Under xdist it
+needs `--dist loadgroup`, so that one worker runs all of a case's runs.
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -294,6 +318,7 @@ still fail the session unless the case also has a rate gate.
 | `--prob-baseline=PATH` | CLI | none | compare every function with an earlier `--prob-json` report, pairing cases by id |
 | `--prob-margin=MARGIN` | CLI | none (report only) | with `--prob-baseline`: fail a function whose pass rate may have dropped by more than MARGIN |
 | `--prob-latency` | CLI | ini or off | show each case's latency quantile and its interval |
+| `--prob-stop={off,curtail}` | CLI | ini or `off` | `curtail`: skip a gated case's remaining runs once its verdict can no longer change (same verdicts; under xdist needs `--dist loadgroup`) |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -314,6 +339,7 @@ still fail the session unless the case also has a rate gate.
 | `prob_metric` | ini | — | default for `--prob-metric` (comma- or space-separated) |
 | `prob_latency` | ini | false | default for `--prob-latency` |
 | `prob_latency_quantile` | ini | 0.95 | latency quantile for cases whose mark sets none |
+| `prob_stop` | ini | `off` | default for `--prob-stop` |
 | `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`); latency (`latency_quantile`, `max_latency`) |
 
 ## JSON report
