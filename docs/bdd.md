@@ -79,9 +79,9 @@ def bench_triage(text, expected):
 ```text
 $ pytest bench_triage.py --prob-runs=10
 ...
-  triage::refund-v1     6/10  $0.0002  FLAKY
-  triage::password-v1   8/10  $0.0002  FLAKY
-  triage::late_box-v1  10/10  $0.0002
+  triage::refund-v1     6/10  [26%,  88%]  $0.0002  FLAKY
+  triage::password-v1   8/10  [44%,  97%]  $0.0002  FLAKY
+  triage::late_box-v1  10/10  [69%, 100%]  $0.0002
 
   Overall: 24/30 passed (80%)
 ```
@@ -113,12 +113,12 @@ def bench_triage(text, expected, prompt):
 ```
 
 ```text
-  triage::refund-v1     6/10  $0.0002  FLAKY
-  triage::refund-v2    10/10  $0.0006
-  triage::password-v1   8/10  $0.0002  FLAKY
-  triage::password-v2   9/10  $0.0006  FLAKY
-  triage::late_box-v1  10/10  $0.0002
-  triage::late_box-v2  10/10  $0.0006
+  triage::refund-v1     6/10  [26%,  88%]  $0.0002  FLAKY
+  triage::refund-v2    10/10  [69%, 100%]  $0.0006
+  triage::password-v1   8/10  [44%,  97%]  $0.0002  FLAKY
+  triage::password-v2   9/10  [55%,  99%]  $0.0006  FLAKY
+  triage::late_box-v1  10/10  [69%, 100%]  $0.0002
+  triage::late_box-v2  10/10  [69%, 100%]  $0.0006
 ```
 
 Now the decision is a table, not a vibe: v2 fixes the incident case

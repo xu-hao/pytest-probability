@@ -26,11 +26,11 @@ sentinel. The worked loop:
 $ pytest benchmarks/ --prob-runs=10
 ...
 ================================= probability ==================================
-  classify::is_question            10/10  $0.0020
-  classify::identify_pii            7/10  $0.0020  FLAKY
-  classify::extract_amount          0/10  $0.0020  FAIL
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  classify::is_question            10/10  [69%, 100%]  $0.0020
+  classify::identify_pii            7/10  [35%,  93%]  $0.0020  FLAKY
+  classify::extract_amount          0/10  [ 0%,  31%]  $0.0020  FAIL
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 
   Overall: 35/50 passed (70%)
   Cost:    $0.0110
@@ -128,8 +128,8 @@ def bench_triage(text, style):
 ```
 
 ```
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 ```
 
 ## Options
@@ -140,10 +140,17 @@ def bench_triage(text, style):
 | `--prob-json=PATH` | CLI | — | write a JSON report to PATH |
 | `--prob-delay=SECONDS` | CLI | ini or 0 | sleep between case executions |
 | `--prob-transpose` | CLI | ini or off | run-major order: run 1 of everything, then run 2, … |
+| `--prob-method=M` | CLI | ini or `exact` | row interval method: `exact` (Clopper-Pearson), `wilson`, or `bayes` |
+| `--prob-confidence=LEVEL` | CLI | ini or 0.95 | two-sided level for intervals |
+| `--prob-no-intervals` | CLI | ini or shown | hide the interval column |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
 | `prob_pattern` | ini | `bench_*.py` | glob for benchmark files |
+| `prob_method` | ini | `exact` | default for `--prob-method` |
+| `prob_confidence` | ini | 0.95 | default for `--prob-confidence` |
+| `prob_prior` | ini | `1,1` | Beta prior `a,b` for `bayes` |
+| `prob_intervals` | ini | true | show the interval column |
 
 ## JSON report
 

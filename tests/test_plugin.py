@@ -2,6 +2,8 @@
 
 import time
 
+import pytest
+
 BENCH_OK = """
 import pytest
 
@@ -258,7 +260,7 @@ def test_fraction_and_flaky_in_summary(pytester):
     result.assert_outcomes(passed=1, failed=1)
     assert result.ret == 1
     result.stdout.fnmatch_lines(
-        ["*= probability =*", "*check::wobbly  1/2  FLAKY*"]
+        ["*= probability =*", "*check::wobbly  1/2  ?1%, 99%?  FLAKY*"]
     )
     result.stdout.fnmatch_lines(["*Overall: 1/2 passed (50%)*"])
 
@@ -324,7 +326,7 @@ def bench_check(word):
     result.assert_outcomes(passed=2, failed=1)
     # three run classes: 2 pass, 0 fail, 1 error -> 2/3 with the error
     # class named, never a 100%-looking row
-    result.stdout.fnmatch_lines(["*shaky_api  2/3  1 ERRORED*"])
+    result.stdout.fnmatch_lines(["*shaky_api  2/3  ?9%, 99%?  1 ERRORED*"])
     result.stdout.fnmatch_lines(["*Overall: 2/3 passed (67%), 1 errored*"])
 
     data = json.loads((pytester.path / "report.json").read_text())
@@ -605,3 +607,313 @@ def test_no_probability_section_without_items(pytester):
     result = pytester.runpytest()
     result.assert_outcomes(passed=1)
     assert "= probability =" not in result.stdout.str()
+
+
+# ---------------------------------------------------------------------------
+# Row intervals
+# ---------------------------------------------------------------------------
+
+# Deterministic pass counts per case under --prob-runs=10: each case
+# passes its first k runs. Counters are per process, so the xdist test
+# keeps a file on one worker with --dist loadfile.
+BENCH_COUNTS = """
+import pytest
+
+_calls = {}
+
+@pytest.mark.parametrize("case,k", [
+    pytest.param("is_question", 10, id="is_question"),
+    pytest.param("identify_pii", 7, id="identify_pii"),
+    pytest.param("never", 0, id="never"),
+])
+def bench_classify(case, k):
+    _calls[case] = _calls.get(case, 0) + 1
+    assert _calls[case] <= k
+"""
+
+
+def _run(pytester, *args):
+    # Tracebacks of the deliberately failing runs are noise here.
+    return pytester.runpytest("--tb=no", *args)
+
+
+def _summary_rows(result):
+    lines = result.stdout.lines
+    start = next(i for i, ln in enumerate(lines) if "= probability =" in ln)
+    rows = []
+    for ln in lines[start + 1 :]:
+        if not ln.strip():
+            break
+        rows.append(ln)
+    return rows
+
+
+def _cell(row):
+    """The interval cell of a summary row, alignment padding removed."""
+    import re
+
+    return re.sub(r"\s+", " ", re.search(r"\[[^]]*\]", row).group())
+
+
+def _expected_cell(x, n, level=0.95, method="exact", prior=(1.0, 1.0)):
+    import math
+
+    from pytest_probability.stats import proportion_interval
+
+    low, high = proportion_interval(x, n, level, method, prior)
+    return tuple(
+        f"{min(max(math.floor(v * 100 + 0.5), v > 0), 100 - (v < 1))}%"
+        for v in (low, high)
+    )
+
+
+def test_interval_column_matches_issue_example(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, "--prob-runs=10")
+    assert _summary_rows(result) == [
+        "  classify::is_question   10/10  [69%, 100%]",
+        "  classify::identify_pii   7/10  [35%,  93%]  FLAKY",
+        "  classify::never          0/10  [ 0%,  31%]  FAIL",
+    ]
+
+
+def test_interval_columns_align_with_cost(pytester):
+    pytester.makepyfile(
+        bench_cost=BENCH_COUNTS.replace(
+            "import pytest\n",
+            "import pytest\nfrom pytest_probability import record_cost\n",
+        ).replace("    _calls[case] =", "    record_cost(0.0002)\n    _calls[case] =")
+    )
+    result = _run(pytester, "--prob-runs=10")
+    rows = _summary_rows(result)
+    assert rows[1] == "  classify::identify_pii   7/10  [35%,  93%]  $0.0020  FLAKY"
+    # brackets, comma and the cost column sit at the same offset on every row
+    for ch in "[,]$":
+        assert len({r.index(ch) for r in rows}) == 1, (ch, rows)
+
+
+def test_interval_endpoints_reserved_for_exact_bounds(pytester):
+    pytester.makepyfile(
+        bench_nine=BENCH_COUNTS.replace('"identify_pii", 7', '"identify_pii", 9')
+    )
+    result = _run(pytester, "--prob-runs=10")
+    # 9/10's exact upper bound is 99.7%: printed 99%, never 100%
+    assert _cell(_summary_rows(result)[1]) == "[55%, 99%]"
+    assert _cell(_summary_rows(result)[0]) == "[69%, 100%]"
+
+
+def test_interval_hidden_for_single_runs(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester)
+    rows = _summary_rows(result)
+    assert rows[0] == "  classify::is_question   1/1"
+    assert not any("[" in r for r in rows)
+
+
+def test_single_run_row_is_blank_in_mixed_table(pytester):
+    # -k keeps only run1 of one case: that row has one run, the others ten
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(
+        pytester,
+        "--prob-runs=10", "-k", "not identify_pii or run1]"
+    )
+    rows = _summary_rows(result)
+    pii = next(r for r in rows if "identify_pii" in r)
+    assert pii.rstrip().endswith("1/1")
+    assert "[" not in pii
+    assert any("[69%, 100%]" in r for r in rows)
+
+
+def test_no_intervals_flag_and_ini(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, "--prob-runs=10", "--prob-no-intervals")
+    assert _summary_rows(result)[1] == "  classify::identify_pii   7/10  FLAKY"
+
+    pytester.makeini("[pytest]\nprob_intervals = false\n")
+    result = _run(pytester, "--prob-runs=10")
+    assert not any("[" in r for r in _summary_rows(result))
+
+
+@pytest.mark.parametrize("method", ["exact", "wilson", "bayes"])
+def test_each_method(pytester, method):
+    import json
+
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(
+        pytester,
+        "--prob-runs=10", f"--prob-method={method}", "--prob-json=r.json"
+    )
+    low, high = _expected_cell(7, 10, method=method)
+    pii = next(r for r in _summary_rows(result) if "identify_pii" in r)
+    assert _cell(pii) == f"[{low}, {high}]"
+
+    data = json.loads((pytester.path / "r.json").read_text())
+    from pytest_probability.stats import proportion_interval
+
+    row = next(r for r in data["rows"] if r["case"] == "classify::identify_pii")
+    assert row["ci"]["method"] == method
+    assert (row["ci"]["low"], row["ci"]["high"]) == pytest.approx(
+        proportion_interval(7, 10, 0.95, method)
+    )
+
+
+def test_methods_give_different_intervals(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    cells = set()
+    for method in ("exact", "wilson", "bayes"):
+        result = _run(pytester, "--prob-runs=10", f"--prob-method={method}")
+        cells.add(next(r for r in _summary_rows(result) if "identify_pii" in r))
+    assert len(cells) == 3
+
+
+def test_bayes_uses_prior(pytester):
+    import json
+
+    pytester.makeini("[pytest]\nprob_method = bayes\nprob_prior = 0.5, 0.5\n")
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    _run(pytester, "--prob-runs=10", "--prob-json=r.json")
+    data = json.loads((pytester.path / "r.json").read_text())
+    from pytest_probability.stats import beta_credible
+
+    assert data["stats_config"] == {
+        "method": "bayes",
+        "level": 0.95,
+        "prior": [0.5, 0.5],
+    }
+    row = next(r for r in data["rows"] if r["case"] == "classify::identify_pii")
+    assert (row["ci"]["low"], row["ci"]["high"]) == pytest.approx(
+        beta_credible(7, 10, 0.95, (0.5, 0.5))
+    )
+
+
+def test_confidence_level(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, "--prob-runs=10", "--prob-confidence=0.8")
+    low, high = _expected_cell(7, 10, level=0.8)
+    assert _cell(_summary_rows(result)[1]) == f"[{low}, {high}]"
+    assert (low, high) != _expected_cell(7, 10)
+
+
+def test_cli_beats_ini(pytester):
+    import json
+
+    pytester.makeini(
+        "[pytest]\nprob_method = bayes\nprob_confidence = 0.9\n"
+        "prob_intervals = false\n"
+    )
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    _run(pytester, "--prob-runs=10", "--prob-json=ini.json")
+    data = json.loads((pytester.path / "ini.json").read_text())
+    assert data["stats_config"]["method"] == "bayes"
+    assert data["stats_config"]["level"] == 0.9
+
+    result = _run(
+        pytester,
+        "--prob-runs=10",
+        "--prob-method=wilson",
+        "--prob-confidence=0.99",
+        "--prob-json=cli.json",
+    )
+    data = json.loads((pytester.path / "cli.json").read_text())
+    assert data["stats_config"] == {
+        "method": "wilson",
+        "level": 0.99,
+        "prior": [1.0, 1.0],
+    }
+    # ini prob_intervals = false still hides the column (no CLI to re-enable)
+    assert not any("[" in r for r in _summary_rows(result))
+
+
+def test_json_ci_and_stats_config_defaults(pytester):
+    import json
+
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    # hiding the column is display-only: JSON always carries ci
+    _run(pytester, "--prob-runs=10", "--prob-no-intervals", "--prob-json=r.json")
+    data = json.loads((pytester.path / "r.json").read_text())
+    assert data["stats_config"] == {
+        "method": "exact",
+        "level": 0.95,
+        "prior": [1.0, 1.0],
+    }
+    rows = {r["case"]: r for r in data["rows"]}
+    ci = rows["classify::is_question"]["ci"]
+    assert set(ci) == {"method", "level", "low", "high"}
+    assert ci["method"] == "exact" and ci["level"] == 0.95
+    assert ci["high"] == 1.0 and 0.69 < ci["low"] < 0.70
+    assert rows["classify::never"]["ci"]["low"] == 0.0
+
+
+def test_json_ci_present_for_single_run(pytester):
+    import json
+
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    _run(pytester, "--prob-json=r.json")
+    data = json.loads((pytester.path / "r.json").read_text())
+    assert all(r["ci"]["low"] <= r["ci"]["high"] for r in data["rows"])
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--prob-confidence=95"], "*--prob-confidence must be strictly between 0 and 1*0.95?*"),
+        (["--prob-confidence=1"], "*--prob-confidence must be strictly between 0 and 1*"),
+        (["-o", "prob_confidence=high"], "*prob_confidence must be a number*'high'*"),
+        (["-o", "prob_method=frequentist"], "*prob_method must be one of exact, wilson, bayes*"),
+        (["-o", "prob_prior=1"], "*prob_prior must be two positive numbers*"),
+        (["-o", "prob_prior=0,1"], "*prob_prior must be two positive numbers*"),
+    ],
+)
+def test_invalid_stats_options_are_usage_errors(pytester, args, message):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, *args)
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([message])
+
+
+def test_invalid_method_flag_rejected(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    result = _run(pytester, "--prob-method=frequentist")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*invalid choice*frequentist*"])
+
+
+def test_regular_suite_output_unchanged_by_stats_options(pytester):
+    pytester.makepyfile(test_plain="def test_ok():\n    assert True\n")
+    base = _run(pytester, "-p", "no:cacheprovider")
+    with_opts = _run(
+        pytester,
+        "-p", "no:cacheprovider", "--prob-method=wilson", "--prob-confidence=0.9"
+    )
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert "= probability =" not in with_opts.stdout.str()
+
+
+def test_xdist_parity(pytester):
+    import json
+
+    pytest.importorskip("xdist")
+    pytester.makepyfile(bench_cls=BENCH_COUNTS)
+    serial = _run(
+        pytester,
+        "--prob-runs=10", "--prob-method=wilson", "--prob-json=serial.json"
+    )
+    dist = _run(
+        pytester,
+        "--prob-runs=10",
+        "--prob-method=wilson",
+        "--prob-json=dist.json",
+        "-n",
+        "2",
+        "--dist",
+        "loadfile",
+    )
+    assert sorted(_summary_rows(serial)) == sorted(_summary_rows(dist))
+    s = json.loads((pytester.path / "serial.json").read_text())
+    d = json.loads((pytester.path / "dist.json").read_text())
+    assert s["stats_config"] == d["stats_config"]
+    key = lambda r: r["case"]  # noqa: E731
+    assert [r["ci"] for r in sorted(s["rows"], key=key)] == [
+        r["ci"] for r in sorted(d["rows"], key=key)
+    ]

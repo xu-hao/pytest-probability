@@ -27,6 +27,7 @@ only the controller writes it, with the full result set.
 {
   "created": "2026-07-07T21:43:18",
   "runs": 10,
+  "stats_config": {"method": "exact", "level": 0.95, "prior": [1.0, 1.0]},
   "exit_status": 1,
   "totals": {
     "passes": 35,
@@ -51,6 +52,8 @@ only the controller writes it, with the full result set.
       "total": 10,
       "pass_rate": 80.0,
       "status": "flaky",
+      "ci": {"method": "exact", "level": 0.95,
+             "low": 0.4439045376923587, "high": 0.9747892736731666},
       "cost": 0.001,
       "usage": {
         "m-small": {"input_tokens": 1200, "output_tokens": 80,
@@ -82,6 +85,7 @@ Top level:
 |---|---|---|
 | `created` | `str` | Local timestamp, `YYYY-MM-DDTHH:MM:SS` |
 | `runs` | `int` | The configured `--prob-runs` value |
+| `stats_config` | object | The session's statistical settings: `method` (`"exact"`, `"wilson"` or `"bayes"`), `level` (two-sided, e.g. `0.95`), `prior` (`[a, b]`, the configured `prob_prior`; used only by `bayes`) |
 | `exit_status` | `int` | pytest's exit code for the session |
 | `totals` | object | Aggregates over every row: `passes`, `fails`, `errors`, `count`, `pass_rate`, `cost`, `usage` |
 | `rows` | array | One entry per case, in encounter order |
@@ -96,6 +100,7 @@ Top level:
 | `total` | `int` | All three counts summed |
 | `pass_rate` | `float` | `passes / total * 100` |
 | `status` | `str` | `"pass"`, `"flaky"`, `"errored"`, `"fail"`, or `"error"` — see the status table in {doc}`reference` |
+| `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
 
@@ -117,6 +122,12 @@ executed (e.g. after `-x`), are absent — the report describes what
 actually ran.
 
 ## Recipes
+
+Flag cases whose interval cannot rule out a pass rate below 80%:
+
+```bash
+jq '.rows[] | select(.ci.low < 0.8) | {case, low: .ci.low, high: .ci.high}' report.json
+```
 
 Pull the flaky rows with `jq`:
 

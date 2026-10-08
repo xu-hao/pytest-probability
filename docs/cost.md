@@ -5,8 +5,8 @@ calls a paid API. The plugin makes spend visible next to the fractions
 it bought — per row, in total, and broken down by model and token type:
 
 ```text
-  triage::refund-terse              8/10  $0.0010  FLAKY
-  triage::refund-chain_of_thought  10/10  $0.0040
+  triage::refund-terse              8/10  [44%,  97%]  $0.0010  FLAKY
+  triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 
   Overall: 18/20 passed (90%)
   Cost:    $0.0050
