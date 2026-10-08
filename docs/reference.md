@@ -58,8 +58,21 @@ All options live in the `probability` group of `pytest --help`.
 `--prob-explain`
 : Add a [plain-language reading](#the-explain-section) of the results
   after the summary, and an `explanation` string to the JSON report's
-  rows and gates.
+  rows, gates and aggregates.
   **Default:** the `prob_explain` ini value, else off.
+
+`--prob-bootstrap=N`
+: How many times the bootstrap behind
+  [function-level intervals](#function-level-intervals) re-draws the
+  inputs. A positive integer; more resamples make the bounds less
+  sensitive to the seed, at a cost of about 0.3 s per 5,000 resamples
+  of 1,000 cases.
+  **Default:** the `prob_bootstrap` ini value, else `5000`.
+
+`--prob-seed=SEED`
+: Seed for every resampling procedure, so the same results always
+  print the same intervals. Any integer.
+  **Default:** the `prob_seed` ini value, else `0`.
 
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
@@ -113,8 +126,20 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 `prob_explain` *(bool, default `false`)*
 : Default for `--prob-explain`.
 
-Invalid values for the statistical and gate options are reported as
-pytest usage errors before anything runs.
+`prob_bootstrap` *(string, default `"5000"`)*
+: Default for `--prob-bootstrap`.
+
+`prob_seed` *(string, default `"0"`)*
+: Default for `--prob-seed`.
+
+`prob_min_inputs` *(string, default `"10"`)*
+: The fewest cases a function (or the session, for Overall) needs
+  before its [function-level interval](#function-level-intervals) is
+  shown. At least 2. Ini only; use `-o prob_min_inputs=20` for a
+  one-off.
+
+Invalid values for the statistical, bootstrap and gate options are
+reported as pytest usage errors before anything runs.
 
 ## The `probability` marker
 
@@ -354,6 +379,9 @@ sample.
   classify::identify_pii   7/10  [35%,  93%]  $0.0020  FLAKY
    \_ function::case-id  \_ fraction  \_ interval  \_ cost  \_ status (omitted when pass)
 
+  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]   # functions with ≥10 cases,
+  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]   # then all of them
+
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Gates:   3 passed, 1 failed, 1 undecided     # only when a case is gated
   Cost:    $0.0110                                 # only when cost was recorded
@@ -438,6 +466,9 @@ interval method and level actually in effect:
   so instead.
 - Count gates (`min_passes`) are explained in counts; errored runs
   left out under `prob_errors = exclude` are called out.
+- Each [function-level line](#function-level-intervals) gets a reading
+  too: the average, its range, the "inputs treated as a sample"
+  caveat, and a next step.
 - Under pytest-xdist the controller writes the section from the
   aggregated counts, so it reads the same as a serial run.
 
@@ -458,6 +489,52 @@ in the fraction, so errors count as non-passes.
   one run the column is omitted, so `--prob-runs=1` output looks as it
   did before intervals existed.
 - `--prob-no-intervals` / `prob_intervals = false` hide the column.
+
+### Function-level intervals
+
+Below the rows, each bench function with at least `prob_min_inputs`
+cases (10 by default) gets one line for the function as a whole, and
+an `Overall` line covers every case in the session:
+
+```text
+  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]
+  triage    N=15 inputs × k=5–10  71.3%  [61.3%, 80.7%]
+  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]
+```
+
+- **N inputs × k:** the number of cases (inputs) and the runs each
+  had; a range like `k=5–10` when run counts differ.
+- **The estimate** is the mean of the per-case pass fractions, so
+  every input counts equally however many runs it had. When every
+  case has the same number of runs it equals the pooled rate on the
+  `Overall:` footer line.
+- **The interval** treats the cases as a sample of inputs and each
+  case's runs as one correlated group: a cluster bootstrap re-draws the
+  cases with replacement — keeping all of a case's runs together —
+  `--prob-bootstrap` times (5,000), and the line shows the percentile
+  interval of the re-drawn means at `prob_confidence`. Runs of one
+  input tend to pass or fail together, so treating them as independent
+  would give a range that is too narrow. More inputs narrow it; more
+  runs of the same inputs narrow it less.
+- **Inputs treated as a sample:** the range allows for a different set
+  of inputs doing better or worse. If the cases were picked by hand
+  rather than drawn at random, it measures the cases chosen, not inputs
+  in general.
+- **Too few inputs:** with fewer than `prob_min_inputs` cases the
+  bootstrap underestimates the uncertainty, so no line is shown; the
+  JSON report still has the estimate, with `suppressed` saying why.
+- **Errored runs** count as non-passes, as in the row fraction, even
+  under `prob_errors = exclude` (a gate setting).
+- **Deterministic:** the bootstrap is seeded (`--prob-seed`, default
+  0) and draws from the cases sorted by id, and functions are listed
+  by name, so the same results print the same lines — with or without
+  pytest-xdist. Bounds have one decimal; `0.0%` and `100.0%` mean
+  exactly 0 and 1.
+- The `Overall` line is left out when the session has a single bench
+  function (it would repeat that function's line), and
+  `--prob-no-intervals` hides the whole block. The JSON report's
+  `aggregates[]` always has every function and Overall, with a
+  normal-approximation interval as a cross-check.
 
 ## Exit status
 

@@ -36,8 +36,9 @@ ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
   ├─ pytest_sessionfinish:     decide gates → exit status, then write
   │                            the JSON report (controller only)
-  └─ pytest_terminal_summary:  render the fraction table, gates block
-                               and (--prob-explain) explain section
+  └─ pytest_terminal_summary:  render the fraction table, function-level
+                               lines, gates block and (--prob-explain)
+                               explain section
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -212,7 +213,8 @@ methods get called with no global state.
   when present, and `usage` entries merge into a per-model aggregate
   on the row. Row order is therefore first-encounter order of results.
 - The statistical settings (`prob_method`, `prob_confidence`,
-  `prob_prior`, `prob_intervals`) are resolved and validated once in
+  `prob_prior`, `prob_intervals`, and the bootstrap's
+  `prob_bootstrap`, `prob_seed`, `prob_min_inputs`) are resolved and validated once in
   `pytest_configure` into a frozen `StatsConfig` kept on
   `config.stash`; `stats_config(config)` returns it. Intervals are
   computed from `CaseStats` at render time, never shipped from
@@ -278,6 +280,44 @@ gates` section listing every non-PASS result with the gate's own
 fraction, interval and bar. The main table keeps the session's interval
 over every run, so its column means the same thing on every row.
 
+## Function-level intervals
+
+Also in `plugin.py`, after `CaseStats`:
+
+- `function_of(case)` — the bench function a row belongs to: the case
+  id up to its first `::` (a short name is an identifier, so a `::`
+  inside a parametrize id can't confuse it).
+- `aggregate(scope, name, cases, cfg, value=pass_fraction)` — one
+  frozen `Aggregate` over some `CaseStats`. The estimate is the mean
+  of `value(passes, total)` per case (each input counts equally). The
+  interval is a cluster bootstrap: since the statistic is a mean of
+  per-case values, resampling whole cases with all their runs is
+  resampling their values, so it is `stats.bootstrap(values,
+  statistics.fmean, resamples, seed)` then `stats.percentile_interval`
+  at `cfg.level` — the one confidence level. `stats.normal_interval`
+  is the JSON-only cross-check. With fewer than `cfg.min_inputs` cases
+  both are `None` and `suppressed` says why. `value` is the hook for
+  per-case metrics other than the pass fraction (pass^k).
+- `Aggregate` keeps `cases` and `counts` (`(passes, total)` per case)
+  in **canonical order — sorted by case id** — which is the order the
+  bootstrap draws from. Result arrival order differs under xdist, so
+  without the sort the same seed would resample a different list.
+  `to_json()` is one `aggregates[]` entry.
+- `ProbabilityAggregator.aggregates()` groups rows by `function_of`
+  (sorted by function name — unlike rows, which follow arrival order,
+  so the block and `aggregates[]` are identical under xdist), adds the
+  `OVERALL` aggregate over every case, and caches the list: the JSON
+  report and the summary both use it, and the bootstrap is the one
+  costly step (about 0.3 s for 1,000 cases × 5,000 resamples).
+  `_shown_aggregates()` is the terminal's subset: those with an
+  interval, without Overall when there is a single function, and none
+  under `--prob-no-intervals`.
+
+Errored runs count as non-passes in an aggregate even under
+`prob_errors = exclude`: aggregates use the row's fraction, and the
+exclusion is a gate setting. Aggregates never touch gate verdicts or
+the exit status.
+
 ## Explanations
 
 `--prob-explain` keeps its wording out of `plugin.py`: every sentence
@@ -290,8 +330,9 @@ it needs it).
 - A `Reading` is one explained line: `heading` (the line itself),
   `paragraphs` (the last one usually `Next: …`), a `tone` for coloring
   and the glossary `terms` it used. There is one function per kind of
-  line — `gate_reading(GateResult, …)` and `row_reading(CaseStats, …)`
-  — and a new kind of output line gets a new function beside them.
+  line — `gate_reading(GateResult, …)`, `row_reading(CaseStats, …)`
+  and `aggregate_reading(Aggregate, min_inputs)` — and a new kind of
+  output line gets a new function beside them.
 - The glossary is a registry: `@glossary_entry(key, label)` registers
   `fn(details) -> text`. A reading lists `(key, detail)` pairs, and
   each entry receives the distinct details — `("interval",
@@ -341,3 +382,9 @@ down and users rely on:
 10. A printed verdict always sits next to the interval it was computed
     from: `Gate.judge()` is the only place a gate's interval is made,
     and the gates block prints that interval.
+11. Function-level and overall intervals are a function of the
+    aggregated counts, the seed and the settings only: `aggregate()`
+    draws from cases sorted by id, with `stats.bootstrap`'s private
+    seeded generator, on the process that has every result. The same
+    results give the same intervals, with and without xdist, and the
+    global `random` state is never touched.

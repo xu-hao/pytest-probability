@@ -343,6 +343,29 @@ def test_percentile_interval_matches_numpy():
             assert close(lo, float(want[0])) and close(hi, float(want[1]))
 
 
+def test_normal_interval_matches_scipy(scipy_stats):
+    rng = random.Random(4)
+    for size in (2, 3, 10, 400):
+        data = [rng.randint(0, 10) / 10 for _ in range(size)]
+        for level in LEVELS:
+            low, high = stats.normal_interval(data, level)
+            want = scipy_stats.norm.interval(
+                level,
+                loc=sum(data) / size,
+                scale=scipy_stats.sem(data),
+            )
+            assert close(low, want[0], rel=1e-12, abs_=1e-14)
+            assert close(high, want[1], rel=1e-12, abs_=1e-14)
+
+
+def test_normal_interval_is_unclipped():
+    # One of 20 inputs passes: the lower bound goes below 0, which is the
+    # cross-check's way of saying the approximation is poor there.
+    low, high = stats.normal_interval([1.0] + [0.0] * 19)
+    assert low < 0.0 < 0.05 < high
+    assert stats.normal_interval([0.5, 0.5, 0.5]) == (0.5, 0.5)
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -375,6 +398,8 @@ def test_percentile_interval_matches_numpy():
         lambda: stats.bootstrap([1.0], resamples=0),
         lambda: stats.bootstrap([1.0], seed=1.5),
         lambda: stats.percentile_interval([]),
+        lambda: stats.normal_interval([0.5]),
+        lambda: stats.normal_interval([0.5, 1.0], level=1.0),
     ],
 )
 def test_invalid_input_raises_value_error(call):
@@ -419,6 +444,84 @@ def test_interval_coverage(record_property):
     # average, below it at some p.
     assert 0.93 < wilson_mean < 0.96
     assert min(wilson_cov) < level
+
+
+def _clustered_cases(rng, n_inputs, runs, theta, concentration):
+    """Correlated pass/fail data with a known true rate.
+
+    Each input's own pass probability is drawn from a Beta with mean
+    ``theta``; its runs are Bernoulli draws at that probability. So runs
+    of one input are correlated (intraclass correlation 1 / (1 +
+    concentration)), and the mean of the per-input probabilities over
+    the population is exactly ``theta``.
+    """
+    from pytest_probability.plugin import CaseStats
+
+    a, b = theta * concentration, (1 - theta) * concentration
+    cases = []
+    for i in range(n_inputs):
+        p = rng.betavariate(a, b)
+        passes = sum(rng.random() < p for _ in range(runs))
+        cases.append(CaseStats(f"f::{i}", passes=passes, fails=runs - passes))
+    return cases
+
+
+# (inputs, runs per input, true rate, Beta concentration): strongly and
+# weakly correlated runs, and a rate near 1 with more inputs.
+COVERAGE_SCENARIOS = [
+    (100, 10, 0.8, 2.0),
+    (100, 5, 0.6, 10.0),
+    (200, 10, 0.9, 1.0),
+]
+
+
+@pytest.mark.slow
+def test_cluster_bootstrap_coverage(record_property):
+    """#4: coverage within 1.5 pp of nominal for N ≥ 100 on clustered
+    data with a known true rate.
+
+    Goes through ``plugin.aggregate`` — the code the summary uses — with
+    1,000 resamples instead of the default 5,000 to keep the run time
+    reasonable. The data stream and every bootstrap are seeded, so the
+    coverage figure is a fixed number, not a flaky one.
+    """
+    from pytest_probability.plugin import StatsConfig, aggregate
+
+    level, reps = 0.95, 1000
+    rng = random.Random(2026)
+    for n_inputs, runs, theta, concentration in COVERAGE_SCENARIOS:
+        hits = 0
+        for rep in range(reps):
+            cases = _clustered_cases(rng, n_inputs, runs, theta, concentration)
+            cfg = StatsConfig(level=level, resamples=1000, seed=rep)
+            low, high = aggregate("function", "f", cases, cfg).ci
+            hits += low <= theta <= high
+        coverage = hits / reps
+        label = f"N={n_inputs} k={runs} theta={theta} conc={concentration}"
+        record_property(f"coverage {label}", coverage)
+        print(f"cluster bootstrap coverage {coverage:.3f} ({label}, level {level})")
+        assert abs(coverage - level) <= 0.015, (label, coverage)
+
+
+def test_cluster_bootstrap_performance():
+    """#4: 1,000 cases × 5,000 resamples in under 0.5 s of plain Python.
+
+    Best of three, in process CPU time, so a busy machine (or ``-n``
+    workers on the same cores) doesn't make it flaky.
+    """
+    import time
+
+    from pytest_probability.plugin import StatsConfig, aggregate
+
+    cases = _clustered_cases(random.Random(0), 1000, 10, 0.8, 2.0)
+    cfg = StatsConfig(resamples=5000)
+    best = math.inf
+    for _ in range(3):
+        start = time.process_time()
+        agg = aggregate("function", "f", cases, cfg)
+        best = min(best, time.process_time() - start)
+    assert agg.ci is not None and agg.inputs == 1000
+    assert best < 0.5, f"{best:.3f} s"
 
 
 # ---------------------------------------------------------------------------

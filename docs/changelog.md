@@ -45,14 +45,35 @@
   FAIL or UNDECIDED gate ends with a one-line hint,
   `Run with --prob-explain for a plain-language reading.`; nothing
   else changes.
+- **Function-level intervals:** each bench function with at least
+  `prob_min_inputs` cases (default 10) gets a line below the rows —
+  `classify  N=40 inputs × k=10  83.0%  [75.5%, 89.8%]` — and an
+  `Overall` line covers every case (left out when there is a single
+  function). The estimate is the mean of the per-case pass fractions,
+  so every input counts equally; the interval is a percentile interval
+  from a cluster bootstrap that re-draws whole cases with all their
+  runs, at `prob_confidence`. `--prob-bootstrap` / `prob_bootstrap`
+  sets the resamples (default 5000) and `--prob-seed` / `prob_seed`
+  the seed (default 0); the cases are drawn in case-id order, so the
+  output is the same for the same results, with or without xdist.
+  `--prob-no-intervals` hides the lines. Suites with fewer than 10
+  cases see no change. **JSON:** a new top-level `aggregates[]` (every
+  function and Overall: inputs, runs min/mean/max, estimate, `ci`, a
+  normal-approximation `normal_ci` cross-check, resamples, seed,
+  `resampling_unit: "input"`, the note "inputs treated as a sample",
+  and `suppressed` when there are too few inputs), and `stats_config`
+  gains `resamples`, `seed` and `min_inputs`. `--prob-explain` reads
+  each line in plain words, including what treating the inputs as a
+  sample means for a hand-picked suite.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function
   and its inverse, Clopper-Pearson / Wilson / Beta-credible intervals
   for one proportion, the Newcombe interval and Fisher's exact test for
-  two, and a seeded bootstrap. No user-visible change yet; pytest is
-  still the only runtime dependency. The test suite cross-checks it
-  against scipy and statsmodels, available as the `test` extra.
+  two, a seeded bootstrap, and a normal-approximation interval for a
+  mean. No user-visible change yet; pytest is still the only runtime
+  dependency. The test suite cross-checks it against scipy and
+  statsmodels, available as the `test` extra.
 
 ## 0.2.0 (2026-07-08)
 

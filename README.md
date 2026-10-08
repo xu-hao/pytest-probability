@@ -166,6 +166,19 @@ $ pytest benchmarks/ --prob-runs=40
 A collection-time warning flags gates that can't pass with the runs
 they have (`min_rate=0.9` needs at least 36 at 95%).
 
+### Function-level intervals
+
+A function with at least 10 cases also gets a line for the function as
+a whole — the mean of its per-case pass fractions, with an interval
+from a seeded bootstrap that re-draws whole cases, since runs of one
+input are correlated — and the session gets an `Overall` line:
+
+```
+  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]
+  triage    N=15 inputs × k=5–10  71.3%  [61.3%, 80.7%]
+  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]
+```
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -180,6 +193,8 @@ they have (`min_rate=0.9` needs at least 36 at 95%).
 | `--prob-min-rate=RATE` | CLI | ini or none | gate every case on its pass rate |
 | `--prob-undecided={fail,pass}` | CLI | ini or `fail` | whether an UNDECIDED gate fails the session |
 | `--prob-explain` | CLI | ini or off | add a plain-language reading of the results (terminal and JSON) |
+| `--prob-bootstrap=N` | CLI | ini or 5000 | bootstrap resamples for function-level and overall intervals |
+| `--prob-seed=SEED` | CLI | ini or 0 | seed for every resampling procedure |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -192,6 +207,9 @@ they have (`min_rate=0.9` needs at least 36 at 95%).
 | `prob_undecided` | ini | `fail` | default for `--prob-undecided` |
 | `prob_errors` | ini | `count` | errored runs in gated cases: `count` as non-passes, or `exclude` |
 | `prob_explain` | ini | false | default for `--prob-explain` |
+| `prob_bootstrap` | ini | 5000 | default for `--prob-bootstrap` |
+| `prob_seed` | ini | 0 | default for `--prob-seed` |
+| `prob_min_inputs` | ini | 10 | fewest cases a function needs for its function-level interval |
 | `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior` |
 
 ## JSON report
