@@ -18,6 +18,7 @@ pytest_collect_file            (file name matches prob_pattern)
        └─ yield BenchFunction per module-level bench_* callable
             └─ BenchFunction.collect()
                  ├─ expand parametrize marks into case variants
+                 ├─ resolve the function's comparison (_compare_plan)
                  ├─ resolve each case's runs and gate (_case_plan)
                  ├─ warn about gates that can't pass (InfeasibleGateWarning)
                  └─ yield BenchItem per (case, run)
@@ -26,19 +27,20 @@ pytest_collect_file            (file name matches prob_pattern)
 BenchItem.runtest()            (one (case, run) execution)
   ├─ optional inter-run delay
   ├─ run the bench_* body; classify by exception type
-  ├─ publish ("probability", {..., "gate": {...}}) onto item.user_properties
+  ├─ publish ("probability", {..., "gate": {...}, "compare": {...}})
+  │   onto item.user_properties
   └─ let exceptions propagate
 
 pytest_runtest_makereport      (hookwrapper)
-  └─ gated case: report a failing run as xfailed
+  └─ gated case, or margin comparison: report a failing run as xfailed
 
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
-  ├─ pytest_sessionfinish:     decide gates → exit status, then write
-  │                            the JSON report (controller only)
+  ├─ pytest_sessionfinish:     decide gates and margins → exit status,
+  │                            then write the JSON report (controller only)
   └─ pytest_terminal_summary:  render the fraction table, function-level
-                               lines, gates block and (--prob-explain)
-                               explain section
+                               lines, comparisons block, gates block and
+                               (--prob-explain) explain section
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -185,7 +187,10 @@ The `gate` key is present only for gated cases. It is the case's
 `Gate.to_record()`, fully resolved on the worker (marker overrides plus
 the session's method, level, prior and `prob_errors`), because the
 xdist controller that decides verdicts never collects items and so has
-no other way to learn a case's gate.
+no other way to learn a case's gate. The `compare` key, present only
+for cases of a compared function, is the same idea for comparisons:
+the function's `CompareSpec.to_record()` (axis, baseline, margin,
+equivalence) plus the case's `input`, `arm` and `arm_index`.
 
 Alternatives considered and rejected:
 
@@ -335,6 +340,53 @@ Errored runs count as non-passes in an aggregate even under
 exclusion is a gate setting. Aggregates never touch gate verdicts or
 the exit status.
 
+## Comparisons
+
+Also in `plugin.py`, after the aggregates:
+
+- **At collection**, `_parametrize_variants()` returns each variant's
+  `parts` — `(value id, value index)` per decorator, the pieces its id
+  is joined from — and `_compare_plan()` resolves the function's
+  comparison from its own `probability` marks (`compare=` beats
+  `--prob-compare`/`prob_compare`): the decorator holding the axis, the
+  arm ids in value order, the baseline (default: the first) and the
+  margin. Each case's arm is its piece from that decorator and its
+  input the other pieces joined with `-`. A mark naming a missing axis,
+  an axis with one value, duplicate arm ids or a bad
+  baseline/margin is a `CollectError`; an axis from the command line
+  that a function lacks just leaves it uncompared. Comparison
+  arguments on a `pytest.param` mark are rejected: they describe the
+  function.
+- `CompareSpec` is the frozen spec; `verdict(interval)` applies
+  `margin_verdict()`, which is `interval_verdict(low, high, −margin)`
+  for non-inferiority and `equivalence_verdict()` — PASS strictly
+  inside ±margin, FAIL entirely outside, else UNDECIDED — for
+  equivalence. No interval is UNDECIDED.
+- `compare_pairs(function, spec, arm, pairs, cfg, unpaired=, cost_ratio=)`
+  is the pure core: `Pair(input, (passes, total), (passes, total))`s in,
+  one frozen `Comparison` out. Pairs are sorted by input id (the
+  bootstrap's draw order). One pair: that input's `stats.newcombe` and
+  `stats.fisher_exact`. More: the mean difference and
+  `stats.sign_flip_test`, plus — with at least `cfg.min_inputs` pairs
+  — a percentile interval from `stats.bootstrap` over
+  `(baseline, arm)` fraction pairs. Nothing in it depends on where
+  the pairs came from, which is what a regression gate against a
+  stored report can reuse.
+- `comparisons_of(cases, cfg, adjust)` groups `CaseStats` with a
+  `compare` dict by function (sorted by name), then by input and arm;
+  for each arm in `arm_index` order it pairs inputs that have both
+  arms (pooling duplicate ids), lists the rest as unpaired, prices
+  `_cost_ratio()`, and finally `adjust_comparisons()` applies
+  `stats.adjust_pvalues` over every comparison with a p-value — the
+  session is one family.
+- `ProbabilityAggregator.comparisons()` caches that list for the JSON
+  report, the block (`_comparison_lines()`) and the readings.
+  `pytest_sessionfinish` adds margin verdicts to the gate verdicts it
+  passes through `GateConfig.fails()`.
+- `BenchItem.judged` is true for a gated case or a case of a
+  comparison with a margin; the makereport wrapper xfails failing runs
+  of judged items. Errors are only excluded by a case gate.
+
 ## Explanations
 
 `--prob-explain` keeps its wording out of `plugin.py`: every sentence
@@ -347,9 +399,10 @@ it needs it).
 - A `Reading` is one explained line: `heading` (the line itself),
   `paragraphs` (the last one usually `Next: …`), a `tone` for coloring
   and the glossary `terms` it used. There is one function per kind of
-  line — `gate_reading(GateResult, …)`, `row_reading(CaseStats, …)`
-  and `aggregate_reading(Aggregate, min_inputs)` (which adds the ρ and
-  runs-vs-inputs paragraphs when the aggregate has a ρ) — and a new kind of
+  line — `gate_reading(GateResult, …)`, `row_reading(CaseStats, …)`,
+  `aggregate_reading(Aggregate, min_inputs)` (which adds the ρ and
+  runs-vs-inputs paragraphs when the aggregate has a ρ) and
+  `comparison_reading(Comparison, …)` — and a new kind of
   output line gets a new function beside them.
 - The glossary is a registry: `@glossary_entry(key, label)` registers
   `fn(details) -> text`. A reading lists `(key, detail)` pairs, and
@@ -407,3 +460,11 @@ down and users rely on:
     results give the same intervals, with and without xdist, and the
     global `random` state is never touched. ρ and its projection are
     exact functions of the same counts.
+12. Comparisons are a function of the aggregated counts, the `compare`
+    specs in the records, the seed and the settings only: inputs are
+    sorted by id, functions by name and arms by parametrize index, and
+    the bootstrap and sign-flip test use private seeded generators.
+    Suites without a compared function get no comparisons block, no
+    `compare` key in records and the same exit status; a comparison
+    without a margin never changes the exit status, and a margin only
+    ever changes it from `OK` to `TESTS_FAILED`.

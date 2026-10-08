@@ -74,6 +74,19 @@ All options live in the `probability` group of `pytest --help`.
   print the same intervals. Any integer.
   **Default:** the `prob_seed` ini value, else `0`.
 
+`--prob-compare=AXIS`
+: [Compare](#comparisons) the values of the parametrize argument AXIS
+  in every bench function that has one, each against the first value.
+  Functions without it are not compared. A `probability(compare=...)`
+  mark takes precedence for its function.
+  **Default:** the `prob_compare` ini value, else no comparison.
+
+`--prob-adjust={none,holm,bonferroni,bh}`
+: Adjust the p-values of the session's comparisons for how many there
+  are: Holm, Bonferroni, or Benjamini-Hochberg. `none` leaves them as
+  they are and labels them exploratory when there is more than one.
+  **Default:** the `prob_adjust` ini value, else `none`.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -135,8 +148,15 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 `prob_min_inputs` *(string, default `"10"`)*
 : The fewest cases a function (or the session, for Overall) needs
   before its [function-level interval](#function-level-intervals) is
-  shown. At least 2. Ini only; use `-o prob_min_inputs=20` for a
-  one-off.
+  shown, and the fewest paired inputs a [comparison](#comparisons)
+  needs for its bootstrap interval. At least 2. Ini only; use
+  `-o prob_min_inputs=20` for a one-off.
+
+`prob_compare` *(string, default empty)*
+: Default for `--prob-compare`. Empty means no comparison.
+
+`prob_adjust` *(string, default `"none"`)*
+: Default for `--prob-adjust`.
 
 Invalid values for the statistical, bootstrap and gate options are
 reported as pytest usage errors before anything runs.
@@ -148,6 +168,9 @@ reported as pytest usage errors before anything runs.
 @pytest.mark.probability(min_rate=0.9, method="bayes", prior=(1, 1))
 @pytest.mark.probability(min_passes=19, runs=20)                     # count rule
 @pytest.mark.probability(runs=40)                                    # run count only, no gate
+@pytest.mark.probability(compare="style", baseline="terse")          # compare the arms of an axis
+@pytest.mark.probability(compare="style", margin=0.02)               # non-inferiority gate
+@pytest.mark.probability(compare="style", margin=0.02, equivalence=True)
 ```
 
 | Argument | Meaning |
@@ -158,6 +181,10 @@ reported as pytest usage errors before anything runs.
 | `confidence` | The level of this gate's interval, instead of `prob_confidence`. |
 | `method` | `exact`, `wilson` or `bayes`, instead of `prob_method`. |
 | `prior` | The Beta prior for `bayes`, as `(a, b)`, instead of `prob_prior`. |
+| `compare` | A parametrize argument whose values (the *arms*) are [compared](#comparisons), each against the baseline. Instead of `--prob-compare`. |
+| `baseline` | The arm the others are compared with, by its id. Default: the first value in the parametrize list. |
+| `margin` | Make the comparison a gate: the arm may be at most `margin` worse than the baseline (non-inferiority). Strictly between 0 and 1: `0.02` is 2 percentage points. |
+| `equivalence` | With `margin`: the arm must be within ±`margin` of the baseline instead. `True` or `False`. |
 
 - **Where it applies:** on a `bench_*` function, every case of it; on
   one case with `pytest.param(..., marks=pytest.mark.probability(...))`.
@@ -171,6 +198,11 @@ reported as pytest usage errors before anything runs.
 - **Gated or not:** a case is gated when its mark sets `min_rate` or
   `min_passes`, or a global min rate is set. `runs=`, `confidence=`,
   `method=` and `prior=` alone don't create a gate.
+- **Comparison arguments are per function:** `compare`, `baseline`,
+  `margin` and `equivalence` go on the bench function's mark, together
+  (`baseline=` without `compare=` is an error), and are rejected on a
+  `pytest.param` mark. `confidence=`, `method=` and `prior=` don't apply
+  to comparisons, which use the session's level.
 - **Validation:** the marker is registered, so `--strict-markers`
   accepts it. A bad argument is a collection error that names the
   case, e.g. `classify::identify_pii: invalid probability mark: min_rate
@@ -253,6 +285,107 @@ A failed gate has no failing item: the runs passed or were xfailed. So
 JUnit XML (`--junitxml`) records no failure for it, and `--lf` has no
 failed items to rerun. The exit status and the JSON report do carry
 the verdict. Gate items for JUnit XML and `--lf` are planned.
+
+## Comparisons
+
+A comparison sets the values of one parametrize argument — the
+*arms*: prompts, models, thresholds — against a *baseline* arm, on the
+same inputs:
+
+```python
+@pytest.mark.probability(compare="style")          # or --prob-compare=style
+@pytest.mark.parametrize("style", ["terse", "chain_of_thought", "few_shot"])
+@pytest.mark.parametrize("text", CASES)
+def bench_triage(text, style):
+    assert my_classifier(text, prompt_style=style) == "billing"
+```
+
+```text
+=========================== probability: comparisons ===========================
+  triage[style]  chain_of_thought − terse  +12.0 pp [+6.3, +18.0]  p<0.001  40 paired  cost ×4.0
+  triage[style]  few_shot − terse           +2.8 pp [−3.2,  +8.5]  p=0.41   40 paired  cost ×1.0
+
+  p not adjusted for 2 comparisons: exploratory (--prob-adjust=holm adjusts them)
+```
+
+**Pairing.** At collection every case gets an *arm* — its id on the
+compared axis (`chain_of_thought`) — and an *input* — the ids of its
+other parameters, joined with `-` as in the case id (`refund`, or
+`refund-m1` with a `model` axis too). Each arm other than the
+baseline, in parametrize order, is compared with the baseline over the
+inputs that ran in both. The baseline is the first value of the axis
+unless `baseline=` names another by its id. An input that ran in only
+one of the two — after `-k`, `-m` or a skip — is left out and counted:
+`38 paired, 2 unpaired`.
+
+**The difference** is the arm's pass fraction minus the baseline's, in
+percentage points, averaged over the paired inputs so each input
+counts equally. Every run counts and errored runs count as non-passes,
+as in the row fraction, whatever `prob_errors` says. How the interval
+and p-value are made depends on the number of pairs:
+
+| Paired inputs | Interval | p-value | Line |
+|---|---|---|---|
+| 1 | Newcombe (hybrid score), from that input's runs | Fisher's exact test | whole points: `+20 pp [−11, +51]` |
+| 2 to `prob_min_inputs` − 1 | none: too few inputs to resample | sign-flip | the average, then one line per input with its own Newcombe interval and Fisher p |
+| `prob_min_inputs` or more | paired bootstrap over inputs | sign-flip | one decimal: `+12.0 pp [+6.3, +18.0]` |
+
+- **One input:** the two arms' runs are independent samples, so the
+  interval and test are for two proportions. They describe that input
+  only.
+- **Paired bootstrap:** the inputs are re-drawn with replacement
+  `--prob-bootstrap` times, each keeping both arms' runs together, and
+  the line shows the percentile interval of the mean difference at
+  `prob_confidence`. Like a [function-level
+  interval](#function-level-intervals), it treats the inputs as a
+  sample, and it is not shown with fewer than `prob_min_inputs` pairs,
+  where it comes out too narrow.
+- **Sign-flip test:** if the arms were interchangeable, each input's
+  difference would be as likely to come out negated. p is the share of
+  the 2^N ways of flipping signs whose total is at least as far from 0
+  as the observed one. It is exact (every pattern counted) when that is
+  cheap — a couple of dozen inputs, a few hundred with 10 runs per arm,
+  over a thousand with one — and otherwise estimated from
+  `--prob-bootstrap` random patterns seeded by `--prob-seed`. With one
+  run per arm it is McNemar's exact test.
+- p and the interval come from different procedures and can disagree
+  at the edge (`p=0.04` beside an interval that just touches 0).
+  Verdicts come from the interval only.
+- **Cost:** `cost ×4.0` is the arm's recorded cost per run over the
+  baseline's, on the paired inputs; shown when both recorded cost.
+
+**More than two arms:** each arm is compared with the baseline, and
+the comparisons of the whole session form one family.
+`--prob-adjust=holm` (or `bonferroni`, or `bh` for Benjamini-Hochberg)
+adjusts their p-values for it, and the block says so. With the default
+`none` and more than one comparison, the p-values are labelled
+exploratory. Adjustment changes p only: intervals and margin verdicts
+stay at `prob_confidence`, the one level everything uses. The
+per-input lines' p-values are never adjusted.
+
+### Margins
+
+`margin=` turns a comparison into a gate, with the verdict read off
+the interval printed beside it, as for [Gates](#gates):
+
+| Rule | PASS | FAIL | UNDECIDED |
+|---|---|---|---|
+| Non-inferiority: `margin=0.02`, shown `≥−2 pp` | lower bound > −2 pp | upper bound < −2 pp | otherwise |
+| Equivalence: `margin=0.02, equivalence=True`, shown `±2 pp` | −2 pp < lower and upper < +2 pp | upper < −2 pp or lower > +2 pp | otherwise |
+
+- Bounds are compared unrounded; a bound exactly on a margin is not
+  past it.
+- A 95% two-sided interval makes each side a 2.5% test: the usual
+  non-inferiority convention, and stricter for equivalence than the
+  90% interval of the two one-sided tests.
+- With no interval — fewer than `prob_min_inputs` pairs, or none at
+  all — the verdict is UNDECIDED.
+- As in a gated case, the function's failing runs are reported as
+  xfailed (`-rx` lists them as `probability comparison: …`), and the
+  verdicts set the exit status: FAIL fails the session, and UNDECIDED
+  does unless `--prob-undecided=pass`. Errored runs still fail it.
+- Without a margin a comparison only reports: failing runs fail the
+  session as usual, and the exit status is the same as without it.
 
 ## Python API
 
@@ -392,7 +525,9 @@ sample.
   Report:  report.json                             # only with --prob-json
 ```
 
-The section renders only when at least one benchmark item ran.
+The section renders only when at least one benchmark item ran. When a
+function is [compared](#comparisons), a `probability: comparisons`
+section follows it, before the gates block.
 
 ### The gates block
 
@@ -418,7 +553,8 @@ with the interval and bar each verdict came from:
 
 ### The explain section
 
-When any gate is FAIL or UNDECIDED, the summary ends with a hint:
+When any gate is FAIL or UNDECIDED, or any comparison is shown, the
+summary ends with a hint:
 
 ```text
   Run with --prob-explain for a plain-language reading.
@@ -475,6 +611,11 @@ interval method and level actually in effect:
   this function, how much doubling the runs or the inputs would narrow
   the range and what that would cost, and the next step follows from
   those numbers.
+- Each [comparison](#comparisons) gets a reading: the difference and
+  what its range says about which arm is better, what "one input" or
+  "a sample of inputs" means for it, p as how often a gap this big
+  would turn up by chance if there were no real difference, any
+  adjustment, the cost ratio, the margin's verdict, and a next step.
 - Under pytest-xdist the controller writes the section from the
   aggregated counts, so it reads the same as a serial run.
 
@@ -616,11 +757,13 @@ otherwise have exited 0.
 | Every gate PASS, nothing else failed | 0 |
 | UNDECIDED gates only, `--prob-undecided=pass` | 0 |
 | A gate FAIL, or UNDECIDED under the default `fail` | 1 |
+| A comparison's margin FAIL, or UNDECIDED under the default `fail` | 1 |
 | An ungated run failed or errored (whatever the gates) | 1 |
 | An errored run in a gated case, `prob_errors = count` | 1 |
 | Interrupted, usage error, no tests… | pytest's own code, unchanged |
 
 pytest's last line counts runs, not gates, so a session can end
 `137 passed, 43 xfailed` and still exit 1: the `Gates:` line and the
-gates block say why. The JSON report's `exit_status` is the final code,
+gates block (or the verdicts in the comparisons block) say why.
+Comparisons without a margin never change the exit status. The JSON report's `exit_status` is the final code,
 gates included.

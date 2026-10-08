@@ -2263,3 +2263,573 @@ def test_xdist_icc_parity(pytester):
     s = _json(pytester, "serial.json")["aggregates"]
     assert s == _json(pytester, "dist.json")["aggregates"]
     assert all(a["icc"] is not None and "ρ = " in a["explanation"] for a in s)
+
+
+# ---------------------------------------------------------------------------
+# Paired comparisons (#6)
+# ---------------------------------------------------------------------------
+
+# The README's A/B example: terse fails runs 3 and 7, chain_of_thought
+# passes all 10 and costs four times as much per run. A per-process
+# counter, so xdist runs need --dist loadfile.
+BENCH_AB = """
+import pytest
+from pytest_probability import record_cost
+
+_calls = {}
+
+@pytest.mark.parametrize("style", ["terse", "chain_of_thought"])
+@pytest.mark.parametrize("text", [
+    pytest.param("my card was charged twice", id="refund"),
+])
+def bench_triage(text, style):
+    _calls[style] = _calls.get(style, 0) + 1
+    record_cost(0.0001 if style == "terse" else 0.0004)
+    assert style != "terse" or _calls[style] not in (3, 7)
+"""
+
+AB_LINE = (
+    "  triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47"
+    "  1 paired  cost ×4.0"
+)
+
+# Pass or fail is fixed by (input, arm), so results are the same in any
+# process. Against alpha (fails inputs 0, 4, 8): beta passes everything
+# (+1 on 3 inputs), gamma also fails input 1 (−1 on one), never fails
+# everything (−1 on 9), same is alpha again.
+PAIR_RULES = {
+    "alpha": lambda i: i % 4 != 0,
+    "beta": lambda i: True,
+    "gamma": lambda i: i % 4 != 0 and i != 1,
+    "never": lambda i: False,
+    "same": lambda i: i % 4 != 0,
+}
+
+
+def _paired_bench(mark='compare="arm"', arms=("alpha", "beta", "gamma"), runs=2):
+    return f"""
+import pytest
+
+PASS = {{
+    "alpha": lambda i: i % 4 != 0,
+    "beta": lambda i: True,
+    "gamma": lambda i: i % 4 != 0 and i != 1,
+    "never": lambda i: False,
+    "same": lambda i: i % 4 != 0,
+}}
+
+@pytest.mark.probability({mark}, runs={runs})
+@pytest.mark.parametrize("arm", {list(arms)!r})
+@pytest.mark.parametrize("i", range(12))
+def bench_pair(i, arm):
+    assert PASS[arm](i)
+"""
+
+
+def _comparison_block(result):
+    """The lines of the ``probability: comparisons`` block ([] when absent)."""
+    lines = result.stdout.lines
+    try:
+        start = next(
+            i for i, ln in enumerate(lines) if "= probability: comparisons =" in ln
+        )
+    except StopIteration:
+        return []
+    out = []
+    for ln in lines[start + 1 :]:
+        if ln.startswith("=") or ln.strip().startswith("Run with --prob-explain"):
+            break
+        out.append(ln)
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+def _expected_comparison(arm, base="alpha", runs=2, inputs=range(12), **cfg):
+    from pytest_probability.plugin import (
+        CompareSpec,
+        Pair,
+        StatsConfig,
+        compare_pairs,
+    )
+
+    pairs = [
+        Pair(
+            str(i),
+            (runs * PAIR_RULES[base](i), runs),
+            (runs * PAIR_RULES[arm](i), runs),
+        )
+        for i in inputs
+    ]
+    spec = CompareSpec(axis="arm", baseline=base)
+    return compare_pairs("pair", spec, arm, pairs, StatsConfig(**cfg))
+
+
+def test_readme_ab_example(pytester):
+    # The acceptance criterion: 8/10 vs 10/10 is +20 pp [−11, +51], p = 0.47.
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    result = _run(pytester, "--prob-runs=10", "--prob-compare=style")
+    assert _comparison_block(result) == [AB_LINE]
+    assert result.ret == pytest.ExitCode.TESTS_FAILED  # terse's failing runs
+    # the marker gives the same comparison
+    pytester.makepyfile(
+        bench_ab=BENCH_AB.replace(
+            '@pytest.mark.parametrize("style"',
+            '@pytest.mark.probability(compare="style")\n'
+            '@pytest.mark.parametrize("style"',
+        )
+    )
+    assert _comparison_block(_run(pytester, "--prob-runs=10")) == [AB_LINE]
+
+
+def test_no_comparison_block_without_compare(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    result = _run(pytester, "--prob-runs=10", "--prob-json=r.json")
+    assert _comparison_block(result) == []
+    assert _json(pytester)["comparisons"] == []
+
+
+def test_baseline_override(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    pytester.makeini("[pytest]\nprob_compare = style\n")
+    assert _comparison_block(_run(pytester, "--prob-runs=10")) == [AB_LINE]
+    pytester.makepyfile(
+        bench_ab=BENCH_AB.replace(
+            '@pytest.mark.parametrize("style"',
+            '@pytest.mark.probability(compare="style", baseline="chain_of_thought")\n'
+            '@pytest.mark.parametrize("style"',
+        )
+    )
+    assert _comparison_block(_run(pytester, "--prob-runs=10")) == [
+        "  triage[style]  terse − chain_of_thought  −20 pp [−51, +11]  p=0.47"
+        "  1 paired  cost ×0.25"
+    ]
+
+
+def test_marker_axis_beats_cli_and_cli_skips_functions_without_it(pytester):
+    pytester.makepyfile(
+        bench_pair=_paired_bench(arms=("alpha", "beta")),
+        bench_ab=BENCH_AB,
+    )
+    # --prob-compare=style reaches triage; bench_pair's mark keeps "arm"
+    result = _run(pytester, "--prob-runs=10", "--prob-compare=style")
+    block = _comparison_block(result)
+    assert [ln.split()[0] for ln in block[:2]] == ["pair[arm]", "triage[style]"]
+    assert block[-1].startswith("  p not adjusted for 2 comparisons")
+    # an axis no function has compares nothing, silently
+    result = _run(pytester, "--prob-runs=10", "--prob-compare=model")
+    assert [ln.split()[0] for ln in _comparison_block(result)] == ["pair[arm]"]
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+
+def test_function_level_comparison(pytester):
+    pytester.makepyfile(bench_pair=_paired_bench())
+    result = _run(pytester, "--prob-json=r.json")
+    beta, gamma = _expected_comparison("beta"), _expected_comparison("gamma")
+    assert beta.ci_method == "bootstrap" and beta.p_method == "sign-flip"
+    assert (_pp1(beta.ci[0]), _pp1(beta.ci[1])) == ("0.0", "+50.0")
+    assert (_pp1(gamma.ci[0]), _pp1(gamma.ci[1])) == ("−25.0", "0.0")
+    assert _comparison_block(result) == [
+        "  pair[arm]  beta − alpha   +25.0 pp [  0.0, +50.0]  p=0.25  12 paired",
+        "  pair[arm]  gamma − alpha   −8.3 pp [−25.0,   0.0]  p=1     12 paired",
+        "",
+        "  p not adjusted for 2 comparisons: exploratory"
+        " (--prob-adjust=holm adjusts them)",
+    ]
+    # exact sign-flip: 3 of 12 inputs differ, all by +1 → 2/8
+    assert beta.p == 0.25 and beta.exact
+    assert gamma.p == 1.0
+    data = _json(pytester)["comparisons"]
+    assert [c["arm"] for c in data] == ["beta", "gamma"]
+    assert data[0]["ci"]["low"] == beta.ci[0] and data[0]["ci"]["high"] == beta.ci[1]
+    # failing runs of an exploratory comparison fail as usual
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.assert_outcomes(passed=58, failed=14)
+
+
+def _pp1(v):
+    from pytest_probability.plugin import _pp
+
+    return _pp(v, 1)
+
+
+def test_bootstrap_matches_a_direct_paired_bootstrap():
+    import statistics
+
+    from pytest_probability import stats as st
+
+    cmp = _expected_comparison("beta", resamples=2000, seed=7)
+    diffs = [(PAIR_RULES["beta"](i) - PAIR_RULES["alpha"](i)) * 1.0 for i in
+             sorted(range(12), key=str)]
+    pairs = [(PAIR_RULES["alpha"](i) * 1.0, PAIR_RULES["beta"](i) * 1.0)
+             for i in sorted(range(12), key=str)]
+    samples = st.bootstrap(
+        pairs, lambda s: statistics.fmean(b - a for a, b in s), resamples=2000, seed=7
+    )
+    assert cmp.ci == st.percentile_interval(samples, 0.95)
+    assert cmp.estimate == statistics.fmean(diffs)
+    assert cmp.inputs[0].input == "0" and cmp.inputs[2].input == "10"
+
+
+def test_compare_pairs_regimes():
+    from pytest_probability import stats as st
+    from pytest_probability.plugin import (
+        UNDECIDED,
+        CompareSpec,
+        Pair,
+        StatsConfig,
+        compare_pairs,
+    )
+
+    spec = CompareSpec(axis="x", baseline="a", margin=0.1)
+    cfg = StatsConfig(min_inputs=4)
+    none = compare_pairs("f", spec, "b", [], cfg, unpaired=["z", "y"])
+    assert none.estimate is None and none.ci is None and none.p is None
+    assert none.unpaired == ("y", "z") and none.verdict == UNDECIDED
+    one = compare_pairs("f", spec, "b", [Pair("r", (8, 10), (10, 10))], cfg)
+    assert one.ci == st.newcombe(10, 10, 8, 10, 0.95)
+    assert one.p == st.fisher_exact(10, 10, 8, 10) and one.p_method == "fisher"
+    assert one.verdict == UNDECIDED  # [−11, +51] straddles −10
+    few = [Pair(str(i), (5, 10), (9, 10)) for i in range(3)]
+    some = compare_pairs("f", spec, "b", few, cfg)
+    assert some.ci is None and some.suppressed == "fewer than 4 paired inputs"
+    assert some.p == 0.25 and some.p_method == "sign-flip"  # 2 of 8 patterns
+    assert some.verdict == UNDECIDED and len(some.inputs) == 3
+    many = compare_pairs("f", spec, "b", few + [Pair("9", (5, 10), (8, 10))], cfg)
+    assert many.ci_method == "bootstrap" and many.ci[0] > 0
+    assert many.verdict == "pass"
+    # canonical order: the result doesn't depend on the order of the pairs
+    assert compare_pairs("f", spec, "b", (few + [Pair("9", (5, 10), (8, 10))])[::-1], cfg) == many
+
+
+@pytest.mark.parametrize(
+    "interval, margin, equivalence, verdict",
+    [
+        ((-0.01, 0.2), 0.02, False, "pass"),
+        ((-0.03, 0.2), 0.02, False, "undecided"),
+        ((-0.3, -0.021), 0.02, False, "fail"),
+        ((-0.02, 0.01), 0.02, False, "undecided"),  # bound on the bar: not above
+        ((-0.01, 0.015), 0.02, True, "pass"),
+        ((-0.01, 0.02), 0.02, True, "undecided"),  # touches the margin
+        ((-0.01, 0.05), 0.02, True, "undecided"),
+        ((0.03, 0.05), 0.02, True, "fail"),
+        ((-0.2, -0.03), 0.02, True, "fail"),
+        ((-0.2, 0.2), 0.02, True, "undecided"),  # wider than the band
+        (None, 0.02, False, "undecided"),
+        (None, 0.02, True, "undecided"),
+    ],
+)
+def test_margin_verdicts(interval, margin, equivalence, verdict):
+    from pytest_probability.plugin import margin_verdict
+
+    assert margin_verdict(interval, margin, equivalence) == verdict
+
+
+@pytest.mark.parametrize(
+    "d, decimals, text",
+    [(0.2, 0, "+20"), (-0.1124, 0, "−11"), (0.0, 0, "0"), (0.11745, 1, "+11.7"),
+     (-0.0833, 1, "−8.3"), (0.0, 1, "0.0"), (0.004, 0, "+0"), (-1.0, 1, "−100.0")],
+)
+def test_pp_format(d, decimals, text):
+    from pytest_probability.plugin import _pp
+
+    assert _pp(d, decimals) == text
+
+
+@pytest.mark.parametrize(
+    "p, text",
+    [(0.4737, "0.47"), (0.004, "0.004"), (0.0004, "<0.001"), (1.0, "1"),
+     (0.999, "0.99"), (0.05, "0.05"), (0.0099, "0.010")],
+)
+def test_p_format(p, text):
+    from pytest_probability.plugin import _p
+
+    assert _p(p) == text
+
+
+def test_margin_gates_the_function(pytester):
+    # A margin judges the cases: their failing runs are xfailed and the
+    # verdicts set the exit status.
+    pytester.makepyfile(
+        bench_pair=_paired_bench('compare="arm", margin=0.05', ("alpha", "beta"))
+    )
+    result = _run(pytester, "-rx")
+    result.assert_outcomes(passed=42, xfailed=6)
+    assert result.ret == pytest.ExitCode.OK
+    assert _comparison_block(result)[0].endswith("≥−5 pp  PASS")
+    result.stdout.fnmatch_lines(["XFAIL *::0-alpha?run1? - probability comparison: *"])
+
+
+@pytest.mark.parametrize(
+    "arms, mark, args, ret, verdicts",
+    [
+        (("alpha", "gamma"), "margin=0.05", [], 1, ["UNDECIDED"]),
+        (("alpha", "gamma"), "margin=0.05", ["--prob-undecided=pass"], 0, ["UNDECIDED"]),
+        (("alpha", "never"), "margin=0.05", ["--prob-undecided=pass"], 1, ["FAIL"]),
+        (("alpha", "same"), "margin=0.05, equivalence=True", [], 0, ["PASS"]),
+        (("alpha", "beta"), "margin=0.05, equivalence=True", [], 1, ["UNDECIDED"]),
+        (("alpha", "never", "same"), "margin=0.05", ["--prob-undecided=pass"], 1,
+         ["FAIL", "PASS"]),
+    ],
+)
+def test_margin_verdicts_and_exit_status(pytester, arms, mark, args, ret, verdicts):
+    pytester.makepyfile(
+        bench_pair=_paired_bench(f'compare="arm", {mark}', arms, runs=1)
+    )
+    result = _run(pytester, "--prob-json=r.json", *args)
+    assert result.ret == ret
+    lines = [ln for ln in _comparison_block(result) if ln.startswith("  pair")]
+    assert [ln.split()[-1] for ln in lines] == verdicts
+    data = _json(pytester)
+    assert [c["verdict"] for c in data["comparisons"]] == [v.lower() for v in verdicts]
+    assert data["exit_status"] == ret
+    if "equivalence" in mark:
+        assert all("±5 pp" in ln for ln in lines)
+
+
+def test_margin_does_not_hide_ungated_errors(pytester):
+    pytester.makepyfile(
+        bench_pair=_paired_bench('compare="arm", margin=0.05', ("alpha", "same"), 1)
+        .replace("assert PASS[arm](i)", "assert PASS[arm](i)\n    if i == 5: raise OSError('down')")
+    )
+    result = _run(pytester)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.assert_outcomes(passed=16, xfailed=6, failed=2)
+
+
+def test_more_arms_and_adjustments(pytester):
+    from pytest_probability import stats as st
+
+    # the margin xfails the failing runs, which keeps the five sessions quick
+    pytester.makepyfile(
+        bench_pair=_paired_bench(
+            'compare="arm", margin=0.5', ("alpha", "beta", "gamma", "never"), runs=1
+        )
+    )
+    _run(pytester, "--prob-json=none.json")
+    for method in ("holm", "bonferroni", "bh"):
+        result = _run(pytester, f"--prob-adjust={method}", f"--prob-json={method}.json")
+        assert _comparison_block(result)[-1] == f"  p adjusted for 3 comparisons ({method})"
+        data = _json(pytester, f"{method}.json")["comparisons"]
+        raw = [c["p"] for c in data]
+        assert [c["p_adjusted"] for c in data] == st.adjust_pvalues(raw, method)
+        assert all(c["adjustment"] == method and c["family"] == 3 for c in data)
+        assert not any(c["exploratory"] for c in data)
+        shown = [ln.split("p=")[1].split()[0] for ln in _comparison_block(result)[:3]]
+        from pytest_probability.plugin import _p
+
+        assert shown == [_p(c["p_adjusted"]) for c in data]
+    none = _json(pytester, "none.json")["comparisons"]
+    assert [c["arm"] for c in none] == ["beta", "gamma", "never"]  # parametrize order
+    assert all(c["exploratory"] and c["p_adjusted"] == c["p"] for c in none)
+    pytester.makeini("[pytest]\nprob_adjust = holm\n")
+    result = _run(pytester)
+    assert _comparison_block(result)[-1].endswith("(holm)")
+
+
+def test_invalid_adjust_options(pytester):
+    pytester.makepyfile(bench_pair=_paired_bench())
+    result = _run(pytester, "-o", "prob_adjust=fdr")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*prob_adjust must be one of none, holm, bonferroni, bh*"])
+    result = _run(pytester, "--prob-adjust=fdr")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+
+
+def test_inputs_missing_an_arm_are_counted(pytester):
+    pytester.makepyfile(bench_pair=_paired_bench(arms=("alpha", "beta", "gamma")))
+    result = _run(pytester, "-k", "not (3-beta or 7-beta)", "--prob-json=r.json")
+    block = _comparison_block(result)
+    assert "10 paired, 2 unpaired" in block[0]
+    assert "12 paired" in block[1]
+    beta = _json(pytester)["comparisons"][0]
+    assert beta["pairs"] == 10 and beta["unpaired"] == ["3", "7"]
+    expected = _expected_comparison("beta", inputs=[i for i in range(12) if i not in (3, 7)])
+    assert (beta["ci"]["low"], beta["ci"]["high"]) == expected.ci
+    # no baseline at all: nothing to pair
+    result = _run(pytester, "-k", "not alpha", "--prob-json=r.json")
+    assert all("0 paired, 12 unpaired" in ln for ln in _comparison_block(result))
+    assert [c["pairs"] for c in _json(pytester)["comparisons"]] == [0, 0]
+
+
+def test_few_inputs_list_each_input(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB.replace(
+        'pytest.param("my card was charged twice", id="refund"),',
+        'pytest.param("my card was charged twice", id="refund"),\n'
+        '    pytest.param("reset my password", id="password"),',
+    ))
+    result = _run(pytester, "--prob-runs=10", "--prob-compare=style")
+    # password's terse runs share the counter, so it sees calls 11-20
+    assert _comparison_block(result) == [
+        "  triage[style]  chain_of_thought − terse  +10.0 pp  p=1  2 paired"
+        "  cost ×4.0",
+        "      password  10/10 vs 10/10    0 pp [−28, +28]  p=1",
+        "      refund     10/10 vs 8/10  +20 pp [−11, +51]  p=0.47",
+    ]
+
+
+def test_comparison_shown_with_no_intervals(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    result = _run(pytester, "--prob-runs=10", "--prob-compare=style", "--prob-no-intervals")
+    assert _comparison_block(result) == [AB_LINE]
+
+
+@pytest.mark.parametrize(
+    "mark, message",
+    [
+        ('compare="model"', "compare='model' is not a parametrize argument (its arguments are i, arm)"),
+        ('compare="i", baseline="alpha"', "baseline='alpha' is not a value of 'i'; expected one of 0, 1, *"),
+        ('compare="arm", margin=2', "margin must be strictly between 0 and 1, got 2 (did you mean 0.02?)"),
+        ('compare="arm", margin="0.1"', "margin must be a number, got '0.1'"),
+        ('compare="arm", equivalence=True', "equivalence=True needs a margin="),
+        ('compare="arm", margin=0.1, equivalence=1', "equivalence must be True or False, got 1"),
+        ('baseline="alpha"', "baseline needs compare= on the same function"),
+        ('compare=3', "compare must be a parametrize argument name, got 3"),
+    ],
+)
+def test_invalid_compare_marks(pytester, mark, message):
+    pytester.makepyfile(bench_pair=_paired_bench(mark))
+    result = pytester.runpytest()
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    result.stdout.fnmatch_lines([f"*pair: invalid probability mark: {message}"])
+
+
+def test_compare_needs_two_distinct_arms(pytester):
+    pytester.makepyfile(bench_pair=_paired_bench(arms=("alpha",)))
+    result = pytester.runpytest()
+    result.stdout.fnmatch_lines(["*compare='arm' needs at least two values to compare"])
+    # from the command line, a one-value axis is simply not compared
+    pytester.makepyfile(bench_pair=_paired_bench("min_passes=None", arms=("alpha",)))
+    result = _run(pytester, "--prob-compare=arm")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED and not _comparison_block(result)
+    pytester.makepyfile(bench_pair=_paired_bench().replace(
+        "'gamma'])", "'gamma'], ids=['x', 'x', 'y'])"
+    ))
+    result = pytester.runpytest()
+    result.stdout.fnmatch_lines(["*the values of 'arm' need distinct ids to be compared, got x, x, y"])
+
+
+def test_compare_args_on_a_case_mark_are_rejected(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB.replace(
+        'id="refund"', 'id="refund", marks=pytest.mark.probability(margin=0.1)'
+    ))
+    result = pytester.runpytest("--prob-runs=2")
+    result.stdout.fnmatch_lines([
+        "*triage::refund-terse: invalid probability mark: margin applies to the"
+        " whole function: put it on the bench function's mark"
+    ])
+
+
+def test_comparison_json(pytester):
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    _run(pytester, "--prob-runs=10", "--prob-compare=style", "--prob-json=r.json")
+    data = _json(pytester)
+    (cmp,) = data["comparisons"]
+    assert cmp == {
+        "function": "triage",
+        "axis": "style",
+        "baseline": "terse",
+        "arm": "chain_of_thought",
+        "pairs": 1,
+        "unpaired": [],
+        "difference": pytest.approx(0.2),
+        "ci": {"method": "newcombe", "level": 0.95,
+               "low": pytest.approx(-0.11235, abs=1e-5),
+               "high": pytest.approx(0.50984, abs=1e-5)},
+        "p": pytest.approx(0.47368, abs=1e-5),
+        "p_method": "fisher",
+        "exact": True,
+        "p_adjusted": cmp["p"],
+        "adjustment": "none",
+        "family": 1,
+        "exploratory": False,
+        "margin": None,
+        "equivalence": False,
+        "verdict": None,
+        "suppressed": None,
+        "resamples": 5000,
+        "seed": 0,
+        "cost_ratio": pytest.approx(4.0),
+        "inputs": [
+            {"input": "refund", "baseline": {"passes": 8, "total": 10},
+             "arm": {"passes": 10, "total": 10}, "difference": pytest.approx(0.2),
+             "ci": cmp["ci"], "p": cmp["p"], "p_method": "fisher"},
+        ],
+    }
+    # the spec rides in user_properties, but records don't repeat it
+    assert all("compare" not in r for r in data["records"])
+
+
+def test_compare_spec_travels_in_user_properties(pytester):
+    pytester.makeconftest(
+        """
+import json
+
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        for name, value in report.user_properties:
+            if name == "probability" and "compare" in value:
+                json.dumps(value)  # plain data only
+                c = value["compare"]
+                print("CMP", c["axis"], c["baseline"], c["input"], c["arm"], c["arm_index"])
+"""
+    )
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    result = pytester.runpytest("--prob-compare=style", "-s", "--tb=no")
+    result.stdout.fnmatch_lines(["*CMP style terse refund chain_of_thought 1*"])
+
+
+def test_inputs_from_several_axes(pytester):
+    pytester.makepyfile(bench_x="""
+import pytest
+
+@pytest.mark.probability(compare="prompt")
+@pytest.mark.parametrize("model", ["m1", "m2"])
+@pytest.mark.parametrize("prompt", ["v1", "v2"])
+@pytest.mark.parametrize("text", ["a", "b"])
+def bench_x(text, prompt, model):
+    assert True
+""")
+    _run(pytester, "--prob-json=r.json")
+    (cmp,) = _json(pytester)["comparisons"]
+    assert [i["input"] for i in cmp["inputs"]] == ["a-m1", "a-m2", "b-m1", "b-m2"]
+    assert cmp["difference"] == 0.0 and cmp["p"] == 1.0
+
+
+def test_uncompared_suite_unchanged_by_compare_options(pytester):
+    pytester.makepyfile(bench_cls=BENCH_COUNTS, bench_flaky=BENCH_FLAKY)
+    base = _run(pytester, "--prob-runs=10", "-p", "no:cacheprovider")
+    with_opts = _run(
+        pytester, "--prob-runs=10", "-p", "no:cacheprovider",
+        "--prob-compare=style", "--prob-adjust=holm",
+    )
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert base.ret == with_opts.ret == pytest.ExitCode.TESTS_FAILED
+    assert "comparisons" not in base.stdout.str()
+    assert "--prob-explain" not in with_opts.stdout.str()
+
+
+def test_regular_suite_unchanged_by_compare_options(pytester):
+    pytester.makepyfile(test_plain=TEST_PLAIN)
+    base = _run(pytester, "-p", "no:cacheprovider")
+    with_opts = _run(pytester, "-p", "no:cacheprovider", "--prob-compare=x", "--prob-adjust=bh")
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert with_opts.ret == pytest.ExitCode.OK
+
+
+def test_xdist_comparison_parity(pytester):
+    pytest.importorskip("xdist")
+    pytester.makepyfile(
+        bench_pair=_paired_bench('compare="arm", margin=0.05', ("alpha", "beta", "gamma")),
+    )
+    args = ("--prob-adjust=holm", "--prob-explain")
+    serial = _run(pytester, *args, "--prob-json=serial.json")
+    # results arrive in a different order across the two workers
+    dist = _run(pytester, *args, "--prob-json=dist.json", "-n", "2")
+    assert _comparison_block(serial) == _comparison_block(dist)
+    assert len(_comparison_block(serial)) == 4
+    assert serial.ret == dist.ret == pytest.ExitCode.TESTS_FAILED  # gamma UNDECIDED
+    s = _json(pytester, "serial.json")["comparisons"]
+    assert s == _json(pytester, "dist.json")["comparisons"]

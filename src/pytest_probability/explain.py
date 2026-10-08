@@ -42,11 +42,24 @@ module only when it needs it, so the dependency runs one way.
 """
 from __future__ import annotations
 
+import math
 import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterable
 
-from .plugin import FAIL, PASS, UNDECIDED, _change, _pct, _pct1, _pct_bar
+from .plugin import (
+    FAIL,
+    PASS,
+    UNDECIDED,
+    _change,
+    _p,
+    _pct,
+    _pct1,
+    _pct_bar,
+    _pp,
+    _pp_decimals,
+    _ratio,
+)
 
 #: The last line of the normal summary when something deserves a
 #: closer look and ``--prob-explain`` is off.
@@ -494,6 +507,256 @@ def _narrower(change: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Comparisons
+# ---------------------------------------------------------------------------
+
+
+def chance(p: float) -> str:
+    """A p-value as a frequency: ``about 5 times in 10``, ``about 4 times
+    in 1,000``; ``less than 1 time in 1,000`` where the table prints
+    ``p<0.001``."""
+    if p >= 0.945:  # prints as 0.95 or more
+        return "nearly every time"
+    if p < 0.001:
+        return "less than 1 time in 1,000"
+    for scale in (10, 100, 1_000):
+        times = math.floor(p * scale + 0.5)
+        if times >= 1:
+            word = "time" if times == 1 else "times"
+            return f"about {times} {word} in {scale:,}"
+    return "about 1 time in 1,000"
+
+
+def p_is(p: float) -> str:
+    # "p = 0.47", "p < 0.001": the table's rounding, in a sentence.
+    text = _p(p)
+    return f"p < {text[1:]}" if text.startswith("<") else f"p = {text}"
+
+
+def points(d: float, decimals: int) -> str:
+    # "+20 points", "−11 points": the table's rounding, spelled out.
+    return f"{_pp(d, decimals)} points"
+
+
+_ADJUST_NAMES = {
+    "holm": "Holm",
+    "bonferroni": "Bonferroni",
+    "bh": "Benjamini-Hochberg",
+}
+
+
+def _direction(cmp: Any) -> str:
+    """What the range says about which arm is better."""
+    low, high = cmp.ci
+    if low > 0:
+        return f"so {cmp.arm} probably does better than {cmp.baseline}."
+    if high < 0:
+        return f"so {cmp.arm} probably does worse than {cmp.baseline}."
+    return (
+        "so the data can't tell yet which arm is better: the range includes"
+        " no difference at all."
+    )
+
+
+def _p_paragraph(cmp: Any) -> str:
+    p = cmp.shown_p
+    if cmp.adjustment != "none" and cmp.family > 1:
+        name = _ADJUST_NAMES[cmp.adjustment]
+        text = (
+            f"{p_is(p)}, adjusted for the {cmp.family} comparisons in this"
+            f" session ({name}; {p_is(cmp.p)} before adjusting): if there were no"
+            f" real difference, a gap this big would turn up by chance"
+            f" {chance(p)}, even allowing for making {cmp.family} comparisons."
+        )
+    else:
+        text = (
+            f"{p_is(p)}: if there were no real difference, a gap this big would"
+            f" turn up by chance {chance(p)}."
+        )
+    if cmp.exploratory:
+        text += (
+            f" This session makes {cmp.family} comparisons and their p-values"
+            " are not adjusted for that, so read them as exploratory: with"
+            " many comparisons, some small p-values turn up by chance"
+            " (--prob-adjust=holm adjusts them)."
+        )
+    return text
+
+
+def _margin_paragraph(cmp: Any, undecided_fails: bool) -> str:
+    spec, verdict = cmp.spec, cmp.verdict
+    number = f"{spec.margin * 100:g}"
+    size = f"{number} points"
+    if spec.equivalence:
+        body = (
+            f"Your margin is ±{size}: the arms count as equivalent when the"
+            f" whole range sits between −{number} and +{size}."
+        )
+        if verdict == PASS:
+            body += " It does, so they are equivalent within the margin."
+        elif verdict == FAIL:
+            body += (
+                " The whole range is outside it, so the arms differ by more"
+                " than the margin."
+            )
+    else:
+        body = (
+            f"Your margin is {size}: {cmp.arm} passes if it is at most {size}"
+            f" worse than {cmp.baseline}, which needs the whole range above"
+            f" −{size}."
+        )
+        if verdict == PASS:
+            body += f" It is, so {cmp.arm} is no worse than the margin allows."
+        elif verdict == FAIL:
+            body += (
+                f" The whole range is below it, so {cmp.arm} is worse than the"
+                " margin allows."
+            )
+    if verdict == UNDECIDED:
+        if cmp.ci is None:
+            body += " There is no range yet, so the verdict is UNDECIDED."
+        else:
+            body += (
+                " The range has values on both sides of that, so there isn't"
+                " enough data yet to tell: the verdict is UNDECIDED."
+            )
+        body += " " + (
+            "Until that's settled, the comparison fails the test session"
+            " (--prob-undecided=pass would let it through)."
+            if undecided_fails
+            else "This session lets undecided verdicts through"
+            " (--prob-undecided=pass), so it doesn't fail the test session."
+        )
+    return body
+
+
+def comparison_reading(
+    cmp: Any, *, undecided_fails: bool = True, min_inputs: int = 10
+) -> Reading:
+    """A comparison explained: the difference, its range, the p-value
+    and any margin verdict.
+
+    ``cmp`` is a ``Comparison``; ``undecided_fails`` the session's
+    UNDECIDED policy and ``min_inputs`` its ``prob_min_inputs``.
+    """
+    from .plugin import _comparison_lines
+
+    heading = _comparison_lines([cmp])[0][0].strip()
+    dec = _pp_decimals(cmp)
+    arm, base = cmp.arm, cmp.baseline
+    terms: list[tuple[str, Hashable]] = []
+    paras: list[str] = []
+    unpaired = ""
+    if cmp.unpaired:
+        n = len(cmp.unpaired)
+        unpaired = (
+            f" {n} {'input' if n == 1 else 'inputs'} ran in only one of the two"
+            " arms (for example after -k or -m) and"
+            f" {'was' if n == 1 else 'were'} left out."
+        )
+
+    if cmp.pairs == 0:
+        paras.append(
+            f"No input ran in both {arm} and {base}, so there is nothing to"
+            f" compare.{unpaired}"
+        )
+        if cmp.verdict is not None:
+            paras.append(_margin_paragraph(cmp, undecided_fails))
+            terms.append(("margin", None))
+        paras.append(
+            "Next: run both arms on the same inputs (check what -k or -m"
+            " selected)."
+        )
+        return Reading(heading, tuple(paras), cmp.verdict, tuple(terms))
+
+    if cmp.pairs == 1:
+        only = cmp.inputs[0]
+        (xa, na), (xb, nb) = only.arm, only.baseline
+        where = f" ({only.input})" if only.input else ""
+        body = (
+            f"On the one input both arms ran{where}, {arm} passed {xa} of"
+            f" {na} runs and {base} {xb} of {nb}: a difference of"
+            f" {points(cmp.estimate, dec)}."
+        )
+    else:
+        body = (
+            f"Over the {cmp.pairs} inputs both arms ran, {arm} passed"
+            f" {_pp(abs(cmp.estimate), dec).lstrip('+')} points"
+            f" {'fewer' if cmp.estimate < 0 else 'more'} of its runs than {base}"
+            " on average, each input counting equally."
+        )
+    body += unpaired
+    setup = (cmp.level, cmp.resamples, cmp.seed, min_inputs)
+    if cmp.ci is not None:
+        terms.append(("difference", (cmp.ci_method, *setup)))
+        low, high = (_pp(v, dec) for v in cmp.ci)
+        body += (
+            f" The true difference is probably between {low} and {high} points"
+            f" ({_pct_bar(cmp.level)} confidence), {_direction(cmp)}"
+        )
+    else:
+        terms.append(("difference", ("suppressed", *setup)))
+        body += (
+            f" No range is shown: with fewer than {min_inputs} paired inputs"
+            " (prob_min_inputs), a range worked out from the inputs alone"
+            " comes out too narrow. Each input's own difference and range are"
+            " listed with it instead."
+        )
+    paras.append(body)
+    if cmp.pairs == 1:
+        paras.append(
+            "With a single input, this compares the arms on that input only:"
+            " it says nothing about how they would do on other inputs."
+        )
+    elif cmp.ci is not None:
+        paras.append(
+            f"That range treats these {cmp.pairs} inputs as a random sample of"
+            f" the inputs {cmp.function} will meet, keeping each input's runs"
+            " of both arms together, so it allows for other inputs doing"
+            " better or worse, not only for runs varying."
+        )
+    if cmp.p is not None:
+        terms.append(("p", (cmp.p_method, cmp.exact, cmp.resamples, cmp.seed)))
+        if cmp.adjustment != "none" or cmp.exploratory:
+            terms.append(("adjust", cmp.adjustment))
+        paras.append(_p_paragraph(cmp))
+    if cmp.cost_ratio is not None:
+        times = _ratio(cmp.cost_ratio).lstrip("×")
+        paras.append(
+            f"Per run, {arm} cost about the same as {base}."
+            if times == "1.0"
+            else f"Per run, {arm} cost {times} times as much as {base}."
+        )
+    if cmp.verdict is not None:
+        terms.append(("margin", None))
+        paras.append(_margin_paragraph(cmp, undecided_fails))
+
+    if cmp.ci is None:
+        paras.append(
+            f"Next: add inputs (more parametrize cases) to reach {min_inputs}"
+            " paired inputs."
+        )
+    elif cmp.verdict == FAIL:
+        paras.append(
+            f"Next: look at {arm}'s failing runs (-rx lists them), or keep"
+            f" {base}."
+        )
+    elif cmp.ci[0] <= 0 <= cmp.ci[1] or cmp.verdict == UNDECIDED:
+        if cmp.pairs == 1:
+            paras.append(
+                "Next: to tell the arms apart, add inputs (more parametrize"
+                " cases); more runs of this one narrow its range too."
+            )
+        else:
+            paras.append(
+                "Next: to narrow the range, add inputs (more parametrize"
+                " cases); more runs help less when each input is consistently"
+                " right or wrong."
+            )
+    return Reading(heading, tuple(paras), cmp.verdict, tuple(terms))
+
+
+# ---------------------------------------------------------------------------
 # Glossary ("Methods used")
 # ---------------------------------------------------------------------------
 
@@ -617,6 +880,114 @@ def _icc_entry(_: list) -> str:
         " counts, kept between 0 and 1; the range scales with"
         " √((1+(k−1)ρ)/k) for k runs per input.)"
     )
+
+
+@glossary_entry("difference", "+N pp")
+def _difference_entry(keys: list[tuple]) -> str:
+    notes = []
+    for method, level, resamples, seed, min_inputs in keys:
+        if method == "newcombe":
+            notes.append(
+                f"(One input: Newcombe's hybrid score range, {_pct_bar(level)}"
+                " confidence, built from each arm's Wilson range; the two arms'"
+                " runs are separate samples.)"
+            )
+        elif method == "bootstrap":
+            notes.append(
+                f"(Over inputs: a paired bootstrap, {resamples:,} re-draws of"
+                f" the inputs with both arms' runs kept together, seed {seed},"
+                f" {_pct_bar(level)} confidence.)"
+            )
+        else:
+            notes.append(
+                f"(Over inputs, a range is shown only with {min_inputs} or more"
+                " paired inputs; with fewer, it comes out too narrow, so each"
+                " input gets its own range instead.)"
+            )
+    return " ".join(
+        [
+            "A difference in pass rate, the arm's minus the baseline's, in"
+            " percentage points (pp): +20 pp means the arm passed 20 more runs"
+            " in every 100. Over several inputs it is the average of each"
+            " input's difference, every input counting equally. The range"
+            " after it is where the true difference probably falls; only"
+            " inputs that ran in both arms count.",
+            *notes,
+        ]
+    )
+
+
+@glossary_entry("p", "p")
+def _p_entry(keys: list[tuple]) -> str:
+    notes = []
+    for method, exact, resamples, seed in keys:
+        if method == "fisher":
+            note = "(One input: Fisher's exact test on the two arms' runs.)"
+        elif exact:
+            note = (
+                "(Over inputs: a sign-flip test on the per-input differences,"
+                " exact: it tries every way of swapping the arms within inputs."
+                " With one run per arm it is McNemar's exact test.)"
+            )
+        else:
+            note = (
+                "(Over inputs: a sign-flip test on the per-input differences,"
+                f" from {resamples:,} random ways of swapping the arms within"
+                f" inputs, seed {seed}.)"
+            )
+        if note not in notes:
+            notes.append(note)
+    return " ".join(
+        [
+            "How easily luck alone could explain the gap: if both arms really"
+            " passed equally often, the chance of a gap at least this big"
+            " between them. Small p: luck is an unlikely explanation. Large p:"
+            " the data can't tell the arms apart. It is not the chance that"
+            " the arms are equal, and the verdict, when there is a margin,"
+            " comes from the range, not from p.",
+            *notes,
+        ]
+    )
+
+
+@glossary_entry("margin", "Margin")
+def _margin_entry(_: list) -> str:
+    return (
+        "≥−N pp (margin=, non-inferiority): PASS when the whole range is above"
+        " −N points, so the arm is at most N points worse than the baseline;"
+        " FAIL when the whole range is below it. ±N pp (equivalence=True):"
+        " PASS when the whole range is between −N and +N points; FAIL when it"
+        " is entirely outside them. Otherwise, or with no range yet,"
+        " UNDECIDED."
+    )
+
+
+@glossary_entry("adjust", "adjusted")
+def _adjust_entry(methods: list[str]) -> str:
+    texts = []
+    for method in methods:
+        if method == "none":
+            texts.append(
+                "Exploratory: p-values not adjusted for making several"
+                " comparisons. The more comparisons, the more likely some"
+                " small p turns up by luck alone; --prob-adjust=holm,"
+                " bonferroni or bh adjusts them."
+            )
+        elif method == "bh":
+            texts.append(
+                "Benjamini-Hochberg: p-values raised so that, among the"
+                " comparisons with a small p, only a small share are expected"
+                " to be luck."
+            )
+        else:
+            text = (
+                f"{_ADJUST_NAMES[method]}: p-values raised so that the chance"
+                " of even one comparison's small p being luck stays small."
+            )
+            if method == "holm":
+                text += " Holm is never stricter than Bonferroni."
+            texts.append(text)
+    return " ".join(texts)
 
 
 def glossary(terms: Iterable[tuple[str, Hashable]]) -> list[tuple[str, str]]:

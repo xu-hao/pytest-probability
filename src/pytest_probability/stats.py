@@ -22,6 +22,9 @@ Contents:
   ``fisher_exact`` (p-value).
 - **Resampling** — ``bootstrap`` (seeded) and ``percentile_interval``,
   with ``normal_interval`` on a mean as the cross-check.
+- **Paired differences** — ``sign_flip_test`` (permutation p-value on
+  per-input differences: exact when that is cheap, else seeded Monte
+  Carlo) and ``adjust_pvalues`` (Holm, Bonferroni, Benjamini-Hochberg).
 - **Clustered runs** — ``icc`` (intraclass correlation of per-run
   pass/fail outcomes, by one-way ANOVA), ``width_factor`` and
   ``projected_width`` (how an interval over inputs scales with runs
@@ -43,6 +46,8 @@ from __future__ import annotations
 import math
 import random
 import statistics
+from fractions import Fraction
+from itertools import compress
 from typing import Callable, Sequence, TypeVar
 
 T = TypeVar("T")
@@ -566,6 +571,151 @@ def normal_interval(data: Sequence[float], level: float = 0.95) -> tuple[float, 
     mean = statistics.fmean(data)
     half = z * statistics.stdev(data, mean) / math.sqrt(len(data))
     return mean - half, mean + half
+
+
+# ---------------------------------------------------------------------------
+# Paired differences: permutation test and multiple comparisons
+# ---------------------------------------------------------------------------
+
+# Multiple-comparison adjustments understood by ``adjust_pvalues``.
+ADJUSTMENTS = ("none", "holm", "bonferroni", "bh")
+
+# Differences are matched to fractions with denominators up to this:
+# exact for x1/n1 − x2/n2 with up to 1,000 runs per arm.
+_MAX_DENOMINATOR = 10**6
+
+# The exact sign-flip distribution is built one difference at a time;
+# past this many (sum, count) updates in all, Monte Carlo is cheaper.
+_EXACT_WORK = 1_000_000
+
+# randbytes(m).translate(_LOW_BIT) is m random 0/1 selectors, made in C.
+_LOW_BIT = bytes(i & 1 for i in range(256))
+
+
+def sign_flip_test(
+    differences: Sequence[float],
+    *,
+    resamples: int = 5000,
+    seed: int = 0,
+    max_work: int = _EXACT_WORK,
+) -> tuple[float, bool]:
+    """Two-sided sign-flip permutation p-value for paired differences:
+    ``(p, exact)``.
+
+    ``differences`` holds one value per input — arm minus baseline. If
+    the two arms were interchangeable, each difference would be as
+    likely to come out negated, so the p-value is the share of the 2^N
+    sign patterns whose sum is at least as far from 0 as the observed
+    sum: P(|Σ ±dᵢ| ≥ |Σ dᵢ|). Zero differences cannot change sign and
+    drop out.
+
+    Each difference is first matched to the nearest fraction with
+    denominator at most 10^6 — exact for differences of pass fractions
+    with up to 1,000 runs per arm — and scaled to an integer, so sums
+    compare exactly and tied patterns are never lost to rounding.
+
+    **Exact** (``exact`` is True) when the distribution of the sum can
+    be built in at most ``max_work`` steps — always for a couple of
+    dozen inputs, for a few hundred with 10 runs per arm, and for over
+    a thousand with one. Then the result is a fraction of 2^N, and with
+    one run per arm (differences of −1, 0 or +1) it equals McNemar's
+    exact test. **Otherwise** it is a
+    seeded Monte Carlo estimate from ``resamples`` random sign
+    patterns, (1 + hits)/(1 + resamples), which is never 0. The
+    generator is a private ``random.Random(seed)``.
+    """
+    resamples = _check_int("resamples", resamples)
+    if resamples < 1:
+        raise ValueError(f"resamples must be at least 1, got {resamples}")
+    seed = _check_int("seed", seed)
+    fractions = []
+    for d in differences:
+        d = float(d)
+        if not math.isfinite(d):
+            raise ValueError(f"differences must be finite numbers, got {d}")
+        f = Fraction(d).limit_denominator(_MAX_DENOMINATOR)
+        if f:
+            fractions.append(f)
+    if not fractions:
+        return 1.0, True
+    scale = math.lcm(*(f.denominator for f in fractions))
+    signed = [int(f * scale) for f in fractions]
+    # A common factor only spreads the sums out: divide it away.
+    unit = math.gcd(*signed)
+    values = [abs(v) // unit for v in signed]
+    observed = abs(sum(signed)) // unit
+    # Σ ±vᵢ = 2·(sum of the + ones) − Σ vᵢ, so count subset sums.
+    total = sum(values)
+    m = len(values)
+
+    counts: dict[int, int] | None = {0: 1}
+    work = 0
+    for v in values:
+        nxt: dict[int, int] = {}
+        for s, c in counts.items():
+            nxt[s] = nxt.get(s, 0) + c
+            nxt[s + v] = nxt.get(s + v, 0) + c
+        counts = nxt
+        work += len(counts)
+        if work > max_work:
+            counts = None
+            break
+    if counts is not None:
+        hits = sum(c for s, c in counts.items() if abs(2 * s - total) >= observed)
+        return min(1.0, hits / 2**m), True
+
+    rng = random.Random(seed)
+    hits = 0
+    for _ in range(resamples):
+        plus = sum(compress(values, rng.randbytes(m).translate(_LOW_BIT)))
+        if abs(2 * plus - total) >= observed:
+            hits += 1
+    return (1 + hits) / (1 + resamples), False
+
+
+def adjust_pvalues(pvalues: Sequence[float], method: str = "holm") -> list[float]:
+    """p-values adjusted for making ``len(pvalues)`` comparisons, in the
+    order given.
+
+    ``method`` is one of ``ADJUSTMENTS``:
+
+    - ``"none"`` — unchanged.
+    - ``"bonferroni"`` — each p times the number of comparisons.
+    - ``"holm"`` — Holm's step-down: the i-th smallest times (m − i + 1),
+      made non-decreasing. Controls the chance of any false alarm, like
+      Bonferroni, and is never larger than it.
+    - ``"bh"`` — Benjamini-Hochberg: the i-th smallest times m/i, made
+      non-decreasing from the top. Controls the expected share of false
+      alarms among the comparisons it flags, a weaker promise.
+
+    Every adjusted value is capped at 1. The same values as
+    ``statsmodels.stats.multitest.multipletests`` with ``"holm"``,
+    ``"bonferroni"`` and ``"fdr_bh"``.
+    """
+    if method not in ADJUSTMENTS:
+        raise ValueError(
+            f"method must be one of {', '.join(ADJUSTMENTS)}; got {method!r}"
+        )
+    ps = [_check_unit("p", p) for p in pvalues]
+    m = len(ps)
+    if method == "none" or m == 0:
+        return ps
+    if method == "bonferroni":
+        return [min(1.0, p * m) for p in ps]
+    order = sorted(range(m), key=lambda i: ps[i])
+    out = [0.0] * m
+    if method == "holm":
+        running = 0.0
+        for rank, i in enumerate(order):
+            running = max(running, min(1.0, (m - rank) * ps[i]))
+            out[i] = running
+        return out
+    running = 1.0
+    for rank in range(m - 1, -1, -1):
+        i = order[rank]
+        running = min(running, m / (rank + 1) * ps[i])
+        out[i] = min(1.0, running)
+    return out
 
 
 # ---------------------------------------------------------------------------

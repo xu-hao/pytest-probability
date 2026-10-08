@@ -14,6 +14,7 @@ from pytest_probability import explain
 from pytest_probability.plugin import (
     _SETTLE_CAP,
     UNDECIDED,
+    _pp,
     CaseStats,
     Gate,
     StatsConfig,
@@ -1134,3 +1135,315 @@ def test_aggregate_json_explanations(pytester, columns):
         "Next: add inputs (more parametrize cases) to reach 10."
     )
     assert by_name["Overall"].startswith("All 13 inputs in this session passed")
+
+
+# ---------------------------------------------------------------------------
+# Comparisons (#6)
+# ---------------------------------------------------------------------------
+
+
+def _cmp(pairs, arm="chain_of_thought", base="terse", margin=None,
+         equivalence=False, unpaired=(), cost_ratio=None, adjust=None, **cfg):
+    from pytest_probability.plugin import (
+        CompareSpec,
+        Pair,
+        adjust_comparisons,
+        compare_pairs,
+    )
+
+    spec = CompareSpec(axis="style", baseline=base, margin=margin,
+                       equivalence=equivalence)
+    cmp = compare_pairs(
+        "triage", spec, arm,
+        [Pair(name, b, a) for name, b, a in pairs],
+        StatsConfig(**cfg), unpaired=unpaired, cost_ratio=cost_ratio,
+    )
+    if adjust is not None:
+        method, others = adjust
+        return adjust_comparisons([cmp, *others], method)[0]
+    return cmp
+
+
+README = [("refund", (8, 10), (10, 10))]
+NO_DIFFERENCE_P = (
+    "p = 0.47: if there were no real difference, a gap this big would turn up"
+    " by chance about 5 times in 10."
+)
+# 12 inputs: the arm gains 2 or 3 runs in 10 on most of them.
+MANY = [(f"in{i:02}", (5, 10), (7 + i % 2, 10)) for i in range(11)] + [
+    ("in11", (6, 10), (6, 10))
+]
+
+
+def test_comparison_one_input_template():
+    r = explain.comparison_reading(_cmp(README, cost_ratio=4.0))
+    assert r.heading == (
+        "triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47"
+        "  1 paired  cost ×4.0"
+    )
+    assert r.paragraphs == (
+        "On the one input both arms ran (refund), chain_of_thought passed 10 of"
+        " 10 runs and terse 8 of 10: a difference of +20 points. The true"
+        " difference is probably between −11 and +51 points (95% confidence),"
+        " so the data can't tell yet which arm is better: the range includes no"
+        " difference at all.",
+        "With a single input, this compares the arms on that input only: it"
+        " says nothing about how they would do on other inputs.",
+        NO_DIFFERENCE_P,
+        "Per run, chain_of_thought cost 4.0 times as much as terse.",
+        "Next: to tell the arms apart, add inputs (more parametrize cases); more"
+        " runs of this one narrow its range too.",
+    )
+    assert r.tone is None
+    assert [k for k, _ in r.terms] == ["difference", "p"]
+
+
+def test_comparison_over_inputs_template():
+    cmp = _cmp(MANY, resamples=2000)
+    low, high = cmp.ci
+    assert low > 0
+    r = explain.comparison_reading(cmp)
+    assert r.paragraphs[0] == (
+        "Over the 12 inputs both arms ran, chain_of_thought passed 22.5 points"
+        " more of its runs than terse on average, each input counting equally."
+        f" The true difference is probably between {_pp(low, 1)} and"
+        f" {_pp(high, 1)} points (95% confidence), so chain_of_thought probably"
+        " does better than terse."
+    )
+    assert r.paragraphs[1].startswith(
+        "That range treats these 12 inputs as a random sample of the inputs"
+        " triage will meet, keeping each input's runs of both arms together"
+    )
+    assert r.paragraphs[2] == (
+        "p < 0.001: if there were no real difference, a gap this big would turn"
+        " up by chance less than 1 time in 1,000."
+    )
+    assert len(r.paragraphs) == 3  # a clear difference needs no next step
+
+
+def test_comparison_worse_arm_and_unpaired():
+    flipped = [(name, a, b) for name, b, a in MANY]
+    r = explain.comparison_reading(_cmp(flipped, unpaired=("x", "y")))
+    assert r.paragraphs[0].startswith(
+        "Over the 12 inputs both arms ran, chain_of_thought passed 22.5 points"
+        " fewer of its runs than terse on average, each input counting equally."
+        " 2 inputs ran in only one of the two arms (for example after -k or -m)"
+        " and were left out."
+    )
+    assert r.paragraphs[0].endswith(
+        "so chain_of_thought probably does worse than terse."
+    )
+
+
+def test_comparison_too_few_inputs_template():
+    r = explain.comparison_reading(_cmp(MANY[:3]), min_inputs=10)
+    assert r.paragraphs == (
+        "Over the 3 inputs both arms ran, chain_of_thought passed 2.3 points more"
+        " of its runs than terse on average, each input counting equally. No"
+        " range is shown: with fewer than 10 paired inputs (prob_min_inputs), a"
+        " range worked out from the inputs alone comes out too narrow. Each"
+        " input's own difference and range are listed with it instead."
+        .replace("2.3", "23.3"),
+        "p = 0.25: if there were no real difference, a gap this big would turn"
+        " up by chance about 3 times in 10.",
+        "Next: add inputs (more parametrize cases) to reach 10 paired inputs.",
+    )
+
+
+def test_comparison_no_pairs_template():
+    r = explain.comparison_reading(_cmp([], margin=0.02, unpaired=("refund",)))
+    assert r.heading == (
+        "triage[style]  chain_of_thought − terse  0 paired, 1 unpaired"
+        "  ≥−2 pp  UNDECIDED"
+    )
+    assert r.paragraphs == (
+        "No input ran in both chain_of_thought and terse, so there is nothing to"
+        " compare. 1 input ran in only one of the two arms (for example after -k"
+        " or -m) and was left out.",
+        "Your margin is 2 points: chain_of_thought passes if it is at most 2"
+        " points worse than terse, which needs the whole range above −2 points."
+        " There is no range yet, so the verdict is UNDECIDED. Until that's"
+        " settled, the comparison fails the test session (--prob-undecided=pass"
+        " would let it through).",
+        "Next: run both arms on the same inputs (check what -k or -m selected).",
+    )
+    assert r.tone == "undecided"
+
+
+@pytest.mark.parametrize(
+    "pairs, margin, equivalence, verdict, sentence",
+    [
+        (MANY, 0.05, False, "pass",
+         "It is, so chain_of_thought is no worse than the margin allows."),
+        ([(n, a, b) for n, b, a in MANY], 0.05, False, "fail",
+         "The whole range is below it, so chain_of_thought is worse than the"
+         " margin allows."),
+        ([(f"i{i}", (5, 10), (5, 10)) for i in range(12)], 0.05, True, "pass",
+         "It does, so they are equivalent within the margin."),
+        (MANY, 0.05, True, "fail",
+         "The whole range is outside it, so the arms differ by more than the"
+         " margin."),
+        (README, 0.05, False, "undecided",
+         "The range has values on both sides of that, so there isn't enough"
+         " data yet to tell: the verdict is UNDECIDED. This session lets"
+         " undecided verdicts through (--prob-undecided=pass), so it doesn't"
+         " fail the test session."),
+    ],
+)
+def test_comparison_margin_paragraph(pairs, margin, equivalence, verdict, sentence):
+    cmp = _cmp(pairs, margin=margin, equivalence=equivalence, resamples=1000)
+    assert cmp.verdict == verdict
+    r = explain.comparison_reading(cmp, undecided_fails=False)
+    (para,) = [p for p in r.paragraphs if p.startswith("Your margin")]
+    assert para.endswith(sentence)
+    if equivalence:
+        assert para.startswith(
+            "Your margin is ±5 points: the arms count as equivalent when the"
+            " whole range sits between −5 and +5 points."
+        )
+    assert ("margin", None) in r.terms
+    if verdict == "fail":
+        assert r.paragraphs[-1].startswith("Next: look at chain_of_thought's failing runs")
+
+
+def test_comparison_adjusted_and_exploratory_p():
+    other = _cmp(README, arm="few_shot")
+    adjusted = explain.comparison_reading(_cmp(README, adjust=("holm", [other])))
+    assert adjusted.paragraphs[2] == (
+        "p = 0.95, adjusted for the 2 comparisons in this session (Holm; p ="
+        " 0.47 before adjusting): if there were no real difference, a gap this"
+        " big would turn up by chance nearly every time, even allowing for"
+        " making 2 comparisons."
+    )
+    assert ("adjust", "holm") in adjusted.terms
+    exploratory = explain.comparison_reading(_cmp(README, adjust=("none", [other])))
+    assert exploratory.paragraphs[2] == NO_DIFFERENCE_P + (
+        " This session makes 2 comparisons and their p-values are not adjusted"
+        " for that, so read them as exploratory: with many comparisons, some"
+        " small p-values turn up by chance (--prob-adjust=holm adjusts them)."
+    )
+    assert ("adjust", "none") in exploratory.terms
+    # a single comparison has nothing to adjust for
+    single = explain.comparison_reading(_cmp(README, adjust=("none", [])))
+    assert not any(k == "adjust" for k, _ in single.terms)
+
+
+def test_comparison_same_cost():
+    r = explain.comparison_reading(_cmp(README, cost_ratio=1.02))
+    assert "Per run, chain_of_thought cost about the same as terse." in r.paragraphs
+
+
+@pytest.mark.parametrize(
+    "p, text",
+    [(0.4737, "about 5 times in 10"), (0.004, "about 4 times in 1,000"),
+     (0.12, "about 1 time in 10"), (0.03, "about 3 times in 100"),
+     (0.0004, "less than 1 time in 1,000"), (0.97, "nearly every time"),
+     (1.0, "nearly every time")],
+)
+def test_chance(p, text):
+    assert explain.chance(p) == text
+
+
+def test_comparison_avoids_jargon():
+    readings = [
+        _cmp(README, cost_ratio=4.0),
+        _cmp(MANY, margin=0.02),
+        _cmp(MANY[:3], margin=0.02, equivalence=True),
+        _cmp([], margin=0.02),
+        _cmp(README, adjust=("bh", [_cmp(README, arm="x")])),
+        _cmp(README, adjust=("none", [_cmp(README, arm="x")])),
+    ]
+    text = " ".join(
+        p for c in readings for p in explain.comparison_reading(c).paragraphs
+    )
+    terms = [t for c in readings for t in explain.comparison_reading(c).terms]
+    text += " ".join(body for _, body in explain.glossary(terms))
+    for word in ("null hypothesis", "reject", "significan", "alpha", "statistic"):
+        assert word not in text.lower(), word
+
+
+def test_glossary_comparison_entries():
+    entries = _entries(
+        ("difference", ("newcombe", 0.95, 5000, 0, 10)),
+        ("difference", ("bootstrap", 0.95, 5000, 0, 10)),
+        ("p", ("fisher", True, 5000, 0)),
+        ("p", ("sign-flip", True, 5000, 0)),
+        ("p", ("sign-flip", False, 5000, 3)),
+        ("margin", None),
+        ("adjust", "bh"),
+    )
+    assert list(entries) == ["+N pp", "p", "Margin", "adjusted"]
+    assert "Newcombe's hybrid score range, 95% confidence" in entries["+N pp"]
+    assert "a paired bootstrap, 5,000 re-draws" in entries["+N pp"]
+    assert "Fisher's exact test" in entries["p"]
+    assert "With one run per arm it is McNemar's exact test." in entries["p"]
+    assert "from 5,000 random ways of swapping the arms within inputs, seed 3" in entries["p"]
+    assert entries["p"].startswith(
+        "How easily luck alone could explain the gap: if both arms really passed"
+        " equally often, the chance of a gap at least this big between them."
+    )
+    assert entries["adjusted"].startswith("Benjamini-Hochberg")
+
+
+BENCH_AB = """
+import pytest
+from pytest_probability import record_cost
+
+_calls = {}
+
+@pytest.mark.parametrize("style", ["terse", "chain_of_thought"])
+@pytest.mark.parametrize("text", [
+    pytest.param("my card was charged twice", id="refund"),
+])
+def bench_triage(text, style):
+    _calls[style] = _calls.get(style, 0) + 1
+    record_cost(0.0001 if style == "terse" else 0.0004)
+    assert style != "terse" or _calls[style] not in (3, 7)
+"""
+
+
+def test_comparison_explained_end_to_end(pytester, columns):
+    pytester.makepyfile(bench_ab=BENCH_AB)
+    result = _run(
+        pytester, "--prob-runs=10", "--prob-compare=style", "--prob-explain",
+        "--prob-json=r.json",
+    )
+    section = _section(result)
+    at = section.index(
+        "  triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47"
+        "  1 paired  cost ×4.0"
+    )
+    assert section[at + 1] == (
+        "    On the one input both arms ran (refund), chain_of_thought passed 10 of 10"
+    )
+    assert any(ln.startswith("    p            How easily luck") for ln in section)
+    assert HINT not in result.stdout.lines
+    data = json.loads((pytester.path / "r.json").read_text())
+    (cmp,) = data["comparisons"]
+    assert cmp["explanation"].split("\n")[2] == NO_DIFFERENCE_P
+
+
+def test_hint_when_comparisons_are_shown(pytester, columns):
+    # nothing gated, nothing failing: the comparison alone earns the hint
+    pytester.makepyfile(bench_ab=BENCH_AB.replace("not in (3, 7)", "> 0"))
+    result = _run(pytester, "--prob-runs=4", "--prob-compare=style")
+    assert result.ret == pytest.ExitCode.OK
+    lines = result.stdout.lines
+    at = lines.index(HINT)
+    assert lines[at - 1] == ""
+    assert "= probability: comparisons =" in "\n".join(lines[:at])
+    # and not without the comparison
+    result = _run(pytester, "--prob-runs=4")
+    assert HINT not in result.stdout.lines
+
+
+def test_margin_row_has_no_gate_advice(pytester, columns):
+    pytester.makepyfile(bench_ab=BENCH_AB.replace(
+        '@pytest.mark.parametrize("style"',
+        '@pytest.mark.probability(compare="style", margin=0.1)\n'
+        '@pytest.mark.parametrize("style"',
+    ))
+    result = _run(pytester, "--prob-runs=10", "--prob-explain")
+    text = "\n".join(_section(result))
+    assert "gate it" not in text
+    assert "Your margin is 10 points" in text

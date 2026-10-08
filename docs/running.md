@@ -125,7 +125,8 @@ The plugin was built xdist-aware:
   xdist: the scheduler assigns items to workers as they free up.
 - Gate verdicts are decided on the controller from the aggregated
   counts — each run's record carries its case's gate — so they are the
-  same with and without `-n`.
+  same with and without `-n`. Comparisons likewise: each record
+  carries its case's input and arm, and the controller pairs them.
 - Collection-time warnings, such as the gate feasibility warning, are
   raised by every worker, so they show up once per worker.
 - `setup()`/`teardown()` run once per file *per worker that executes
@@ -184,3 +185,9 @@ take them out of the gate's sample instead. Ungated cases in the same
 session behave exactly as before. See {doc}`reference` for the marker,
 the count rule (`min_passes=`), per-gate `confidence=`/`method=`, and
 the full exit-status table.
+
+A comparison with a margin (`@pytest.mark.probability(compare="style",
+margin=0.02)`) works the same way for a whole function: its failing
+runs are xfailed, and the margin's verdict on each arm decides — see
+Comparisons in {doc}`reference`. Without a margin a comparison only
+reports.
