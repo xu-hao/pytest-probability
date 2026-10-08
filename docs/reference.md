@@ -100,6 +100,25 @@ All options live in the `probability` group of `pytest --help`.
   fish and PowerShell take it as is.
   **Default:** the `prob_metric` ini value, else none.
 
+`--prob-plan`
+: Collect, print a [run budget](#planning) for every selected case and
+  exit without running anything — like `--collect-only`, exit code 0.
+  Respects `-k`/`-m`; ignores `-n`; never writes `--prob-json`.
+
+`--prob-plan-assume=RATE`
+: The true pass rate `--prob-plan` plans for, strictly between 0 and 1.
+  **Default:** `0.97`.
+
+`--prob-plan-flake=RATES`
+: Comma-separated failure rates `--prob-plan` plans to catch, each
+  strictly between 0 and 1; one `catch` column each.
+  **Default:** `0.1,0.01`.
+
+`--prob-plan-report=PATH`
+: A previous `--prob-json` report: `--prob-plan` reads each case's cost
+  per run from it (its row's `cost` over `total`) and adds a projected
+  cost column.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -481,6 +500,74 @@ explains pass^k and pass@k.
 Inspired by pass@k from Chen et al., [Evaluating Large Language Models
 Trained on Code](https://arxiv.org/abs/2107.03374) (2021), and pass^k
 from Yao et al., [τ-bench](https://arxiv.org/abs/2406.12045) (2024).
+
+## Planning
+
+`--prob-plan` answers "how many runs do I need, and what will they
+cost?" before you spend anything. It collects as usual, prints one row
+per selected case and exits 0 without running a single item:
+
+```text
+$ pytest benchmarks/ -o prob_runs=40 --prob-plan --prob-plan-report=last.json
+============================== probability: plan ===============================
+  case               runs  min runs  runs for 80%  chance now  catch 10%  catch 1%     cost
+  classify::refund     40        36           100         30%        99%       33%  $0.0800
+  classify::billing    40        36           100         30%        99%       33%  $0.0800
+  classify::pii        40        36           100         30%        99%       33%  $0.0800
+  smoke                20        19            20         88%        88%       18%  $0.2000
+  ungated              40         —             —           —        99%       33%  $0.0000
+
+  Plan:    5 cases, 180 runs; nothing was run.
+  Cost:    $0.4400 projected from last.json
+
+  runs          Runs planned for the case (--prob-runs, a runs= mark or
+                prob_runs), counting only the runs -k/-m selected.
+  min runs      Fewest runs with which the gate can pass at all, and then only
+                if every one of them passes.
+  runs for 80%  Runs with which the gate passes 80% of the time if the case
+                really passes 97% of its runs (--prob-plan-assume); never, if
+                97% is not above the gate's bar.
+  chance now    The chance the gate passes with the planned runs, if the case
+                really passes 97% of its runs.
+  catch 10%     The chance the planned runs show at least one failure if 10% of
+                runs fail; 29 runs make it 95%.
+  catch 1%      The chance the planned runs show at least one failure if 1% of
+                runs fail; 299 runs make it 95%.
+  cost          Planned runs times the case's cost per run in last.json; blank
+                for a case it doesn't have.
+```
+
+Here `classify` is gated at `min_rate=0.9`, `smoke` at
+`min_passes=19, runs=20`, and `ungated` has no gate.
+
+| Column | How it is computed |
+|---|---|
+| `runs` | The runs that would execute: the case's run count, after `-k`/`-m` selection (selecting `run1` and `run2` plans 2). |
+| `min runs` | `Gate.min_runs()`, as in the [feasibility warning](#feasibility-warning): the fewest runs whose all-pass result is a PASS verdict. |
+| `runs for 80%` | The smallest n whose *power* — the chance of a PASS verdict when each run passes with probability `--prob-plan-assume` — is at least 80%. Computed exactly: the Binomial(n, rate) probability of every pass count the gate's own `verdict()` calls PASS (the passing counts are one tail, so one boundary per n). Power saw-tooths in n, so every n from `min runs` up is tried; the search stops at 10,000 (`>10,000`). `never` when the assumed rate is at or below a rate gate's bar: then more runs make a PASS *less* likely. |
+| `chance now` | That same power at the planned `runs`. |
+| `catch F` | 1 − (1 − F)^runs, the chance the planned runs show at least one failure when a fraction F of runs fail. The note gives the runs that make it `prob_confidence` (95%): ⌈ln 0.05 / ln(1 − F)⌉ — 29 at 10%, 299 at 1%. |
+| `cost` | Only with `--prob-plan-report`: runs × the case's cost per run in that report. Blank for a case the report doesn't have; the footer totals the column and counts those cases. |
+
+- Gate columns use each case's own gate — bar, method, level, prior —
+  so a plan agrees with the verdict a real session would give.
+  A count gate (`min_passes`) passes on the count alone, so its
+  `runs for 80%` is where P(at least `min_passes` passes) reaches 80%.
+- Ungated cases are listed too, with `—` in the gate columns: the
+  flake and cost columns apply to them. A suite with no gate at all
+  shows no gate columns.
+- Rows are green when `chance now` is at least 80%, yellow below, and
+  red when `runs` is under `min runs` (the gate can't pass).
+- `prob_errors` doesn't enter the plan: the assumed rate is the chance
+  a run passes.
+- The 80% target and the 10,000-run cap are fixed. A rate gate barely
+  below the assumed rate takes longest (about 2 s at a bar of 0.96 with
+  the exact method).
+- `-n` is turned off: nothing runs, so no workers are started, and the
+  plan is the same as without it. `--prob-json` is not written, so a
+  plan never overwrites the report it reads.
+- Collection errors stop the plan as they stop a session (exit 2);
+  nothing selected exits 5, like pytest.
 
 ## Python API
 

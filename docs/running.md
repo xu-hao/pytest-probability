@@ -129,6 +129,8 @@ The plugin was built xdist-aware:
   carries its case's input and arm, and the controller pairs them.
 - Collection-time warnings, such as the gate feasibility warning, are
   raised by every worker, so they show up once per worker.
+- `--prob-plan` runs nothing, so it turns `-n` off and plans in one
+  process; its output is the same with and without `-n`.
 - `setup()`/`teardown()` run once per file *per worker that executes
   items from that file* — the same semantics xdist gives module-scoped
   fixtures. Keep them idempotent.
@@ -191,3 +193,32 @@ margin=0.02)`) works the same way for a whole function: its failing
 runs are xfailed, and the margin's verdict on each arm decides — see
 Comparisons in {doc}`reference`. Without a margin a comparison only
 reports.
+
+## Budgeting runs before running them
+
+How many runs does a gate need, and what will they cost? `--prob-plan`
+answers without running anything: it collects, prints one row per
+selected case, and exits 0, like `--collect-only`.
+
+```bash
+pytest benchmarks/ --prob-runs=40 --prob-plan
+pytest benchmarks/ --prob-runs=40 --prob-plan --prob-plan-report=last.json
+pytest benchmarks/ --prob-plan -k classify --prob-plan-assume=0.95
+```
+
+```text
+============================== probability: plan ===============================
+  case               runs  min runs  runs for 80%  chance now  catch 10%  catch 1%
+  classify::refund     40        36           100         30%        99%       33%
+  smoke                20        19            20         88%        88%       18%
+```
+
+For each gated case: the fewest runs with which the gate can pass at
+all (`min runs`), the runs that give it an 80% chance to pass if the
+case really passes 97% of its runs (`--prob-plan-assume`), and that
+chance with the planned runs. For every case: the chance the planned
+runs catch a flake that fails 10% or 1% of runs (`--prob-plan-flake`
+sets the rates; 29 and 299 runs make it 95%). With
+`--prob-plan-report=last.json`, a previous `--prob-json` report, it
+also projects each case's cost. A one-line note under the table
+explains every column; {doc}`reference` has the details.

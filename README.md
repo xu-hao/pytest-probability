@@ -251,6 +251,10 @@ Windows `cmd`).
 | `--prob-compare=AXIS` | CLI | ini or none | compare the values of parametrize argument AXIS, each against the first |
 | `--prob-adjust=M` | CLI | ini or `none` | adjust comparison p-values: `none` (exploratory), `holm`, `bonferroni`, `bh` |
 | `--prob-metric=M` | CLI | ini or none | also report `pass^K` (all K runs of an input pass: reliability) and/or `pass@K` (at least one of K passes: best-of-K); comma-separated, repeatable |
+| `--prob-plan` | CLI | off | print a run budget per case (runs to pass a gate, to catch a flake, projected cost) and exit without running |
+| `--prob-plan-assume=RATE` | CLI | 0.97 | true pass rate `--prob-plan` plans for |
+| `--prob-plan-flake=RATES` | CLI | `0.1,0.01` | failure rates `--prob-plan` plans to catch |
+| `--prob-plan-report=PATH` | CLI | — | previous JSON report to read cost per run from, for `--prob-plan` |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |

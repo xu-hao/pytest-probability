@@ -42,6 +42,11 @@ ProbabilityAggregator          (registered in pytest_configure)
                                lines, metrics block, comparisons block,
                                gates block and (--prob-explain) explain
                                section
+
+--prob-plan                    (instead of running)
+  ├─ pytest_cmdline_main:      turn off xdist's -n
+  └─ pytest_runtestloop:       plan_rows(session.items) → aggregator.plan,
+                               rendered as the probability: plan table
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -460,6 +465,50 @@ The terminal section and the JSON strings are both built on the
 process with every result, from aggregated counts, so they are the
 same under xdist.
 
+## Planning
+
+`--prob-plan` lives in `plugin.py` after the comparisons, with its
+column notes in `explain.py` (`plan_notes()`, `render_notes()`).
+
+- **No run.** A `tryfirst` `pytest_runtestloop` returns `True` before
+  pytest's own loop runs any item — the same short-circuit
+  `--collect-only` uses, so selection (`-k`/`-m`, which deselect in
+  `pytest_collection_modifyitems`) has already happened and
+  `session.items` is exactly what would run. It first raises
+  `Interrupted` on collection errors, as pytest's loop does. The
+  aggregator gets `plan` (the rows) instead of results and its
+  `pytest_terminal_summary` renders only the plan; its `_json_path` is
+  `None` under `--prob-plan`, so no report is written.
+- **No workers.** An xdist controller never collects, so it would have
+  nothing to plan. A `pytest_cmdline_main` hookwrapper sets
+  `config.option.numprocesses = 0` before xdist's own
+  `pytest_cmdline_main` reads it (a wrapper runs before every plain
+  implementation, whatever the plugin order), which makes xdist set
+  `dist = "no"` and start nothing.
+- `plan_rows(items, PlanConfig)` groups the `BenchItem`s by case,
+  counting them (so a selected subset of runs is what's planned) and
+  taking the case's `Gate` from its first item. Gate numbers don't
+  depend on the planned run count, so they are cached per gate with
+  `runs` cleared.
+- `Gate.critical_passes(n)` is the fewest passes of n with a PASS
+  verdict (bisection: verdicts are monotone in the pass count).
+  `Gate.power(n, rate)` is `stats.binom_sf(critical − 1, n, rate)`.
+  `Gate.runs_for_power(rate, target, cap)` returns `None` for a rate
+  gate whose bar is at or above `rate`, or when `power(cap)` falls
+  short, and otherwise scans every n from `min_runs()`: power
+  saw-tooths, so bisecting on n could miss the smallest. The critical
+  count rises by at most one per extra run, so the scan tracks it with
+  about one `verdict()` per n. Everything goes through `verdict()`, so
+  a plan uses the gate's own method, level and prior.
+- `stats.runs_to_see_failure(f, level)` is ⌈ln(1 − level)/ln(1 − f)⌉,
+  nudged by whole runs against `stats.detection_chance` so rounding at
+  a boundary can't make it one off. The plan passes `prob_confidence`
+  as `level` — the session's one level.
+- `PlanConfig` (`plan_config(config)`, resolved and validated in
+  `pytest_configure`; `None` without `--prob-plan`) holds the assumed
+  rate, the flake rates and the cost per run read from
+  `--prob-plan-report` (`rows[].cost / rows[].total`).
+
 ## Invariants worth preserving
 
 If you change the plugin, these are the properties the test suite pins
@@ -512,3 +561,7 @@ down and users rely on:
     and without xdist. Without `--prob-metric`/`prob_metric` the
     terminal output is unchanged and `metrics` is `{}`; metrics never
     change the exit status.
+14. `--prob-plan` runs no item, starts no worker and writes no report;
+    its numbers are exact functions of the collected items, their
+    gates and the plan options. Without `--prob-plan` the plan options
+    change nothing.

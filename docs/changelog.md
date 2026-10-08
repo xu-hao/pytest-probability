@@ -138,6 +138,20 @@
   mean. No user-visible change yet; pytest is still the only runtime
   dependency. The test suite cross-checks it against scipy and
   statsmodels, available as the `test` extra.
+- **Planning:** `--prob-plan` collects, prints a run budget and exits 0
+  without running anything (like `--collect-only`; `-k`/`-m` apply,
+  `-n` is turned off, `--prob-json` isn't written). One row per
+  selected case: planned runs; for gated cases the fewest runs with
+  which the gate can pass, the runs for an 80% chance of passing if the
+  case really passes `--prob-plan-assume` of its runs (default 0.97;
+  exact binomial power through the gate's own verdict, `never` when
+  that rate isn't above the bar) and that chance at the planned runs;
+  the chance the planned runs catch a flake at each
+  `--prob-plan-flake` rate (default `0.1,0.01`; 29 and 299 runs make it
+  95%); and, with `--prob-plan-report=PATH`, a cost projected from a
+  previous JSON report's cost per run. A one-line plain-language note
+  explains each column. New `stats.detection_chance` and
+  `stats.runs_to_see_failure`.
 
 ## 0.2.0 (2026-07-08)
 
