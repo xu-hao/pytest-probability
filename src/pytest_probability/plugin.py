@@ -208,6 +208,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Whether an UNDECIDED gate verdict fails the session"
         " (default: prob_undecided ini or fail)",
     )
+    group.addoption(
+        "--prob-explain",
+        dest="prob_explain",
+        action="store_true",
+        default=None,
+        help="Add a plain-language reading of the results to the summary"
+        " and the JSON report (default: prob_explain ini or off)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -254,6 +262,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "Errored runs in gated cases: count (as non-passes) or exclude",
         default="count",
     )
+    parser.addini(
+        "prob_explain",
+        "Explain the results in plain language (summary and JSON report)",
+        type="bool",
+        default=False,
+    )
 
 
 def _runs(config: pytest.Config, marked: int | None = None) -> int:
@@ -283,6 +297,13 @@ def _transpose(config: pytest.Config) -> bool:
     if transpose is None:
         transpose = bool(config.getini("prob_transpose"))
     return transpose
+
+
+def _explain(config: pytest.Config) -> bool:
+    explain = config.getoption("prob_explain")
+    if explain is None:
+        explain = bool(config.getini("prob_explain"))
+    return explain
 
 
 @dataclass(frozen=True)
@@ -557,6 +578,41 @@ class Gate:
         while high - low > 1:
             mid = (low + high) // 2
             if passable(mid):
+                high = mid
+            else:
+                low = mid
+        return high
+
+    def runs_to_settle(self, passes: int, total: int, cap: int) -> int | None:
+        """About how many runs in all would settle an UNDECIDED rate gate.
+
+        The smallest n ≤ ``cap`` whose verdict on round(p̂·n) of n runs
+        is not UNDECIDED, if the observed pass rate p̂ held — PASS above
+        the bar, FAIL below. Judged with ``verdict()``, so with this
+        gate's own interval. ``None`` for count gates, an empty sample,
+        or when p̂ is too close to the bar to settle within ``cap``.
+
+        Rounding p̂·n makes the verdict flicker for a stretch of n before
+        it settles for good, so bisection lands somewhere in that
+        stretch — between the first n that settles and the first from
+        which every n does. That is fine for an estimate printed to two
+        significant figures.
+        """
+        if self.rule != "rate" or not total:
+            return None
+        rate = passes / total
+
+        def settled(n: int) -> bool:
+            return self.verdict(math.floor(rate * n + 0.5), n) != UNDECIDED
+
+        if settled(total):
+            return total
+        if cap <= total or not settled(cap):
+            return None
+        low, high = total, cap
+        while high - low > 1:
+            mid = (low + high) // 2
+            if settled(mid):
                 high = mid
             else:
                 low = mid
@@ -1217,6 +1273,10 @@ _MARKUP = {
     "error": {"red": True},
 }
 
+# How far runs_to_settle() looks before calling a rate too close to its
+# bar to settle: beyond this, "run more" stops being useful advice.
+_SETTLE_CAP = 10_000
+
 _VERDICT_MARKUP = {
     PASS: {"green": True},
     UNDECIDED: {"yellow": True},
@@ -1257,6 +1317,7 @@ class ProbabilityAggregator:
         self._config = config
         self._stats: OrderedDict[str, CaseStats] = OrderedDict()
         self._json_path = config.getoption("prob_json")
+        self._explain = _explain(config)
         # Raw per-run records, kept only when a JSON report was
         # requested.
         self._records: list[dict[str, Any]] | None = (
@@ -1358,6 +1419,13 @@ class ProbabilityAggregator:
             ],
             "records": self._records or [],
         }
+        if self._explain:
+            for s, row in zip(all_stats, payload["rows"]):
+                row["explanation"] = self._row_reading(s).text()
+                if row["gate"] is not None:
+                    row["gate"]["explanation"] = self._gate_reading(
+                        s, results[s.case]
+                    ).text()
         path = Path(self._json_path)
         if path.parent != Path(""):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1480,6 +1548,60 @@ class ProbabilityAggregator:
                 line += f"  ({r.excluded} errored, excluded)"
             tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
 
+    def _gate_reading(self, s: CaseStats, result: GateResult):
+        from . import explain
+
+        settle = None
+        if result.verdict == UNDECIDED:
+            settle = result.gate.runs_to_settle(
+                result.passes, result.total, _SETTLE_CAP
+            )
+        return explain.gate_reading(
+            result,
+            errors=s.errors,
+            undecided_fails=gate_config(self._config).fails(UNDECIDED),
+            settle=settle,
+            cap=_SETTLE_CAP,
+        )
+
+    def _row_reading(self, s: CaseStats):
+        from . import explain
+
+        cfg = stats_config(self._config)
+        interval = cfg.interval(s.passes, s.total) if s.total else None
+        return explain.row_reading(s, interval, cfg, gated=s.gate is not None)
+
+    def _write_explained(
+        self, tr, all_stats: list[CaseStats], results: dict[str, GateResult]
+    ) -> None:
+        """The ``probability: explained`` section: a plain-language
+        reading of every gated case and every ungated row that did not
+        pass every run, then a glossary of the methods they used.
+
+        The wording lives in ``explain.py``; this only picks the lines
+        and supplies the numbers. Rendered from the aggregated counts,
+        so it is the same under xdist.
+        """
+        from . import explain
+
+        readings = []
+        for s in all_stats:
+            if s.case in results:
+                readings.append(self._gate_reading(s, results[s.case]))
+            elif s.status != "pass":
+                readings.append(self._row_reading(s))
+        # The main table's interval column needs explaining even when no
+        # row is notable.
+        cfg = stats_config(self._config)
+        extra = []
+        if any(c is not None for c in self._ci_cells(cfg, all_stats)):
+            extra.append(("interval", explain.stats_key(cfg)))
+        width = getattr(getattr(tr, "_tw", None), "fullwidth", 80)
+        tr.write_sep("=", "probability: explained")
+        markup = {**_MARKUP, **_VERDICT_MARKUP}
+        for line, tone in explain.render_section(readings, width, extra):
+            tr.write_line(line, **markup.get(tone, {}))
+
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:
         del exitstatus, config
         if not self._stats:
@@ -1537,3 +1659,10 @@ class ProbabilityAggregator:
         if self._json_path:
             tr.write_line(f"  Report:  {self._json_path}")
         self._write_gates(tr, results)
+        if self._explain:
+            self._write_explained(tr, all_stats, results)
+        elif any(r.verdict != PASS for r in results.values()):
+            from .explain import HINT
+
+            tr.write_line("")
+            tr.write_line(f"  {HINT}")

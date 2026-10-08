@@ -179,6 +179,7 @@ they have (`min_rate=0.9` needs at least 36 at 95%).
 | `--prob-no-intervals` | CLI | ini or shown | hide the interval column |
 | `--prob-min-rate=RATE` | CLI | ini or none | gate every case on its pass rate |
 | `--prob-undecided={fail,pass}` | CLI | ini or `fail` | whether an UNDECIDED gate fails the session |
+| `--prob-explain` | CLI | ini or off | add a plain-language reading of the results (terminal and JSON) |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -190,6 +191,7 @@ they have (`min_rate=0.9` needs at least 36 at 95%).
 | `prob_min_rate` | ini | — | default for `--prob-min-rate` |
 | `prob_undecided` | ini | `fail` | default for `--prob-undecided` |
 | `prob_errors` | ini | `count` | errored runs in gated cases: `count` as non-passes, or `exclude` |
+| `prob_explain` | ini | false | default for `--prob-explain` |
 | `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior` |
 
 ## JSON report

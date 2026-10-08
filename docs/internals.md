@@ -36,7 +36,8 @@ ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
   ├─ pytest_sessionfinish:     decide gates → exit status, then write
   │                            the JSON report (controller only)
-  └─ pytest_terminal_summary:  render the fraction table and gates block
+  └─ pytest_terminal_summary:  render the fraction table, gates block
+                               and (--prob-explain) explain section
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -276,6 +277,38 @@ The summary adds a `Gates:` tally to the footer and a `probability:
 gates` section listing every non-PASS result with the gate's own
 fraction, interval and bar. The main table keeps the session's interval
 over every run, so its column means the same thing on every row.
+
+## Explanations
+
+`--prob-explain` keeps its wording out of `plugin.py`: every sentence
+lives in `explain.py`, as templates over numbers the plugin has
+already computed. The plugin picks the lines to explain, supplies the
+numbers, and colors the output; `explain.py` imports from `plugin.py`
+and not the other way round (the plugin imports it lazily, only when
+it needs it).
+
+- A `Reading` is one explained line: `heading` (the line itself),
+  `paragraphs` (the last one usually `Next: …`), a `tone` for coloring
+  and the glossary `terms` it used. There is one function per kind of
+  line — `gate_reading(GateResult, …)` and `row_reading(CaseStats, …)`
+  — and a new kind of output line gets a new function beside them.
+- The glossary is a registry: `@glossary_entry(key, label)` registers
+  `fn(details) -> text`. A reading lists `(key, detail)` pairs, and
+  each entry receives the distinct details — `("interval",
+  stats_key(cfg))` makes the `[low, high]` entry name exactly the
+  methods, levels and priors that appeared. Entries print in
+  registration order, and only when some reading used them.
+- `render_section()` lays it out for the terminal (wrapped with
+  `textwrap` to the terminal writer's width); `Reading.text()` is the
+  unwrapped form in the JSON report.
+- The one estimate it prints, "about N runs would settle it", is math,
+  so it lives on the gate: `Gate.runs_to_settle(passes, total, cap)`
+  bisects for the smallest n whose verdict on round(p̂·n)/n is not
+  UNDECIDED, through `verdict()` — the gate's own interval.
+
+The terminal section and the JSON strings are both built on the
+process with every result, from aggregated counts, so they are the
+same under xdist.
 
 ## Invariants worth preserving
 

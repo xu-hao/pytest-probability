@@ -55,6 +55,12 @@ All options live in the `probability` group of `pytest --help`.
   lists the case in the gates block.
   **Default:** the `prob_undecided` ini value, else `fail`.
 
+`--prob-explain`
+: Add a [plain-language reading](#the-explain-section) of the results
+  after the summary, and an `explanation` string to the JSON report's
+  rows and gates.
+  **Default:** the `prob_explain` ini value, else off.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -103,6 +109,9 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 : How errored runs of a gated case are treated: `count` or `exclude`.
   See [Errors in gated cases](#errors-in-gated-cases). Ini only; use
   `-o prob_errors=exclude` for a one-off.
+
+`prob_explain` *(bool, default `false`)*
+: Default for `--prob-explain`.
 
 Invalid values for the statistical and gate options are reported as
 pytest usage errors before anything runs.
@@ -376,6 +385,61 @@ with the interval and bar each verdict came from:
   the verdict depends on them.
 - PASS cases are only counted, on the `Gates:` line. `(allowed)` marks
   UNDECIDED cases that `--prob-undecided=pass` lets through.
+
+### The explain section
+
+When any gate is FAIL or UNDECIDED, the summary ends with a hint:
+
+```text
+  Run with --prob-explain for a plain-language reading.
+```
+
+With `--prob-explain` (or `prob_explain = true`) a third section
+replaces the hint. It reads every gated case, and every ungated row
+that did not pass all its runs, in plain words: what was measured,
+what the numbers mean, and a next step where there is one. Then a
+short glossary explains each term those lines used, naming the
+interval method and level actually in effect:
+
+```text
+============================ probability: explained ============================
+  classify::close  37/40  [80%, 98%]  ≥90%  UNDECIDED
+    37 of 40 runs passed. The true pass rate is probably between 80% and 98%
+    (95% confidence). Your bar is 90%, and that range has values both above and
+    below it, so there isn't enough data yet to tell whether this case meets the
+    bar. Until that's settled, the case fails the test session
+    (--prob-undecided=pass would let it through).
+    Next: run more. If it keeps passing at today's rate (92.5%), about 570 runs
+    in total would settle it.
+
+  classify::weak  3/40  [2%, 20%]  ≥90%  FAIL
+    3 of 40 runs passed. The true pass rate is probably between 2% and 20% (95%
+    confidence). Your bar is 90%, and that whole range is below it, so this case
+    falls short of the bar.
+    Next: look at the failing runs: -rx lists them with their assert messages,
+    and --xfail-tb shows their tracebacks. If a lower pass rate is acceptable
+    for this case, lower the bar.
+
+  Methods used
+    [low, high]  The range the true pass rate probably falls in, given the runs
+                 so far. More runs make it narrower. (Clopper-Pearson, 95%
+                 confidence: errs on the side of a wider range.)
+    Verdict      PASS: the whole range is above the bar. FAIL: the whole range
+                 is below it. UNDECIDED: the range crosses the bar, so more runs
+                 are needed.
+  Full guide: https://pytest-probability.readthedocs.io/en/latest/reference.html#gates
+```
+
+- Text wraps to the terminal width; headings and the link don't.
+- "About N runs" is the smallest total that would settle the verdict
+  if the observed pass rate held, computed with the gate's own
+  interval and rounded up to two significant figures. When the rate is
+  too close to the bar to settle within 10,000 runs, the reading says
+  so instead.
+- Count gates (`min_passes`) are explained in counts; errored runs
+  left out under `prob_errors = exclude` are called out.
+- Under pytest-xdist the controller writes the section from the
+  aggregated counts, so it reads the same as a serial run.
 
 ### The interval column
 
