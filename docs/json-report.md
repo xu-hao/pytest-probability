@@ -141,6 +141,7 @@ only the controller writes it, with the full result set.
       ]
     }
   ],
+  "baseline": null,
   "records": [
     {
       "case": "triage::refund-terse",
@@ -171,6 +172,7 @@ Top level:
 | `rows` | array | One entry per case, in encounter order |
 | `aggregates` | array | One entry per bench function, by name, then one for Overall (below); empty when nothing ran |
 | `comparisons` | array | One entry per compared arm (below): functions by name, arms in parametrize order; empty when nothing is compared |
+| `baseline` | object \| `null` | This run against `--prob-baseline` (below); `null` without it |
 | `records` | array | One entry per executed run |
 
 `rows[]` — the aggregate view, mirroring the terminal table:
@@ -280,6 +282,67 @@ Inputs are sorted by id and the bootstrap and sign-flip test are
 seeded, so the same results give the same `comparisons`, with or
 without pytest-xdist.
 
+`baseline` — this run set against an earlier report (see Baseline in
+{doc}`reference`); `null` without `--prob-baseline`:
+
+```json
+"baseline": {
+  "path": "main.json",
+  "created": "2026-10-08T19:24:03",
+  "margin": 0.05,
+  "paired": 52,
+  "only_current": ["triage::new_case"],
+  "only_baseline": [],
+  "comparisons": [
+    {
+      "function": "triage",
+      "axis": null,
+      "baseline": "baseline",
+      "arm": "current",
+      "pairs": 12,
+      "unpaired": ["new_case"],
+      "difference": -0.15,
+      "ci": {"method": "bootstrap", "level": 0.95,
+             "low": -0.25, "high": -0.05833333333333333},
+      "p": 0.03125,
+      "p_method": "sign-flip",
+      "exact": true,
+      "p_adjusted": 0.03125,
+      "adjustment": "none",
+      "family": 2,
+      "exploratory": true,
+      "margin": 0.05,
+      "equivalence": false,
+      "verdict": "fail",
+      "suppressed": null,
+      "resamples": 5000,
+      "seed": 0,
+      "cost_ratio": null,
+      "inputs": [
+        {"input": "t00",
+         "baseline": {"passes": 9, "total": 10},
+         "arm": {"passes": 5, "total": 10},
+         "difference": -0.4,
+         "ci": {"method": "newcombe", "level": 0.95,
+                "low": -0.6759121533048664, "high": 0.002356109392247785},
+         "p": 0.1408668730650158,
+         "p_method": "fisher"}
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | `str` | `--prob-baseline` as given |
+| `created` | `str \| null` | The baseline report's own `created`, when it has one |
+| `margin` | `float \| null` | `--prob-margin`; `null`: report only, no verdicts |
+| `paired` | `int` | Cases found in both reports |
+| `only_current` / `only_baseline` | array | Ids of the cases found in only one report, sorted; never paired |
+| `comparisons` | array | One entry per bench function with a paired case, by name, shaped like `comparisons[]` with `axis` `null`, `baseline` `"baseline"` and `arm` `"current"` (the difference is current − baseline); `inputs[].input` and `unpaired` are case ids without the function prefix (`""` for an unparametrized function). `p_adjusted` adjusts over these comparisons only |
+| `explanation` | `str` | Only with `--prob-explain`: the header in plain language; each comparison carries its own `explanation` too |
+
 `records[]` — the raw view, one per (case, run) execution:
 
 | Field | Type | Meaning |
@@ -368,15 +431,46 @@ jq -e '.totals.pass_rate >= 80' report.json > /dev/null \
   || { echo "pass rate below 80%"; exit 1; }
 ```
 
-Compare two reports case-by-case:
+To compare a run with an earlier report, use `--prob-baseline` rather
+than diffing the files: it pairs the cases by id and puts an interval
+on each function's change, so noise isn't mistaken for a regression
+(see Baseline in {doc}`reference`). List what it found:
 
 ```bash
-jq -n --slurpfile a old.json --slurpfile b new.json '
-  [$a[0].rows[] as $r
-   | ($b[0].rows[] | select(.case == $r.case)) as $n
-   | select($n.pass_rate < $r.pass_rate)
-   | {case: $r.case, was: $r.pass_rate, now: $n.pass_rate}]'
+jq '.baseline.comparisons[] | {function, pairs, difference,
+    low: .ci.low, high: .ci.high, verdict}' report.json
+jq '.baseline | {only_current, only_baseline}' report.json
 ```
+
+Gate pull requests on main's report from GitHub Actions: each push to
+main saves its report to the cache, and a pull request restores the
+latest one and runs against it (the run id in the key makes every
+main run save a new entry; `restore-keys` picks the newest):
+
+```yaml
+- uses: actions/cache/restore@v4
+  if: github.event_name == 'pull_request'
+  with:
+    path: main.json
+    key: probability-main-${{ github.run_id }}
+    restore-keys: probability-main-
+- name: Benchmarks
+  run: |
+    if [ -f main.json ]; then
+      baseline="--prob-baseline=main.json --prob-margin=0.05"
+    fi
+    pytest benchmarks/ --prob-runs=10 --prob-json=report.json $baseline
+- if: github.ref == 'refs/heads/main' && always()
+  run: cp report.json main.json
+- uses: actions/cache/save@v4
+  if: github.ref == 'refs/heads/main' && always()
+  with:
+    path: main.json
+    key: probability-main-${{ github.run_id }}
+```
+
+On the first pull request, before main has saved a report, the step
+runs without a baseline.
 
 Archive the report from GitHub Actions:
 

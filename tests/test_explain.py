@@ -1685,3 +1685,243 @@ def test_hint_when_metrics_are_shown(pytester, columns):
     section = _section(_run(pytester, "--prob-runs=2", "--prob-metric=pass^2",
                             "--prob-explain"))
     assert section[0] == "  fine  pass^2  N=1 input  100.0%"
+# Baseline (#8)
+# ---------------------------------------------------------------------------
+
+
+def _bcmp(pairs, margin=None, function="triage", unpaired=(), cost_ratio=None,
+          adjust=None, **cfg):
+    """A baseline comparison: ``pairs`` are (case variant, baseline, now)."""
+    from pytest_probability.plugin import (
+        CompareSpec,
+        Pair,
+        adjust_comparisons,
+        compare_pairs,
+    )
+
+    spec = CompareSpec(axis=None, baseline="baseline", margin=margin)
+    cmp = compare_pairs(
+        function, spec, "current", [Pair(n, b, a) for n, b, a in pairs],
+        StatsConfig(**cfg), unpaired=unpaired, cost_ratio=cost_ratio,
+    )
+    if adjust is not None:
+        method, others = adjust
+        return adjust_comparisons([cmp, *others], method)[0]
+    return cmp
+
+
+def _bread(cmp, **kw):
+    return explain.baseline_reading(cmp, path="main.json", **kw)
+
+
+def _bresult(comparisons=(), only_current=(), only_baseline=(), margin=0.02,
+             created="2026-10-01T12:00:00"):
+    from pytest_probability.plugin import Baseline, BaselineResult
+
+    baseline = Baseline("main.json", created, {}, margin)
+    return BaselineResult(baseline, tuple(comparisons), tuple(only_current),
+                          tuple(only_baseline))
+
+
+def test_baseline_one_case_template():
+    r = _bread(_bcmp([("", (8, 10), (10, 10))], margin=0.1, function="smoke"))
+    assert r.heading == (
+        "smoke  current − baseline  +20 pp [−11, +51]  p=0.47  1 paired"
+        "  ≥−10 pp  UNDECIDED"
+    )
+    assert r.paragraphs == (
+        "smoke, a single case in both reports, passed 10 of 10 runs now and 8"
+        " of 10 in the baseline (main.json): a change of +20 points. The true"
+        " change is probably between −11 and +51 points (95% confidence), so"
+        " the data can't tell yet whether it changed: the range includes no"
+        " change at all.",
+        "With a single case, this compares the two reports on that case only:"
+        " it says nothing about other inputs.",
+        NO_DIFFERENCE_P,
+        "Your margin (--prob-margin) is 10 points: this run passes if it is at"
+        " most 10 points worse than the baseline, which needs the whole range"
+        " above −10 points. The range has values on both sides of that, so"
+        " there isn't enough data yet to tell: the verdict is UNDECIDED. Until"
+        " that's settled, it fails the test session (--prob-undecided=pass"
+        " would let it through).",
+        "Next: to tell the two apart, add inputs (more parametrize cases); more"
+        " runs of this one narrow its range too.",
+    )
+    assert r.tone == UNDECIDED
+    assert [k for k, _ in r.terms] == ["baseline", "difference", "p", "margin"]
+    # a parametrized case is named
+    r = _bread(_bcmp(README))
+    assert r.paragraphs[0].startswith(
+        "triage::refund, the one case of triage in both reports, passed 10 of"
+    )
+
+
+# The baseline passed 7 or 8 runs in 10 on most cases; now 5.
+WORSE = [(f"in{i:02}", (7 + i % 2, 10), (5, 10)) for i in range(11)] + [
+    ("in11", (6, 10), (6, 10))
+]
+
+
+def test_baseline_regression_template():
+    cmp = _bcmp(WORSE, margin=0.02, unpaired=("new",), cost_ratio=1.5)
+    assert cmp.verdict == "fail"
+    low, high = (_pp(v, 1) for v in cmp.ci)
+    r = _bread(cmp)
+    assert r.paragraphs[0] == (
+        "Over the 12 cases of triage in both reports, this run passed 22.5"
+        " points fewer of its runs than the baseline (main.json) on average,"
+        " each case counting equally. 1 case of triage is in only one of the two"
+        " reports and was left out. The true change is probably between"
+        f" {low} and {high} points (95% confidence), so this run probably does"
+        " worse than the baseline."
+    )
+    assert r.paragraphs[1].startswith(
+        "That range treats these 12 cases as a random sample of the inputs"
+        " triage will meet, keeping each case's runs from both reports together"
+    )
+    assert r.paragraphs[3] == "Per run, this run cost 1.5 times as much as the baseline."
+    assert r.paragraphs[4].endswith(
+        "The whole range is below it, so triage dropped by more than the margin"
+        " allows."
+    )
+    assert r.paragraphs[5] == (
+        "Next: look at triage's failing runs (-rx lists them) and at what"
+        " changed since the baseline."
+    )
+    assert r.tone == "fail"
+
+
+def test_baseline_pass_no_margin_and_zero_margin():
+    better = [(n, a, b) for n, b, a in WORSE]
+    r = _bread(_bcmp(better, margin=0.02))
+    assert r.paragraphs[-1] == (
+        "Your margin (--prob-margin) is 2 points: this run passes if it is at"
+        " most 2 points worse than the baseline, which needs the whole range"
+        " above −2 points. It is, so triage has not dropped by more than the"
+        " margin allows."
+    )
+    # a PASS needs no next step, even when the range includes no change
+    same = [(n, b, b) for n, b, _ in WORSE]
+    r = _bread(_bcmp(same, margin=0.02))
+    assert r.tone == "pass" and not r.paragraphs[-1].startswith("Next:")
+    # without a margin: no verdict, no margin paragraph, no next step
+    r = _bread(_bcmp(better))
+    assert r.tone is None and len(r.paragraphs) == 3
+    assert ("margin", None) not in r.terms
+    r = _bread(_bcmp(better, margin=0.0))
+    assert r.heading.endswith(">0 pp  PASS")
+    assert r.paragraphs[-1].startswith(
+        "Your margin (--prob-margin) is 0: this run passes only if it is shown"
+        " to do better than the baseline, which needs the whole range above 0."
+    )
+
+
+def test_baseline_too_few_cases_template():
+    r = _bread(_bcmp(WORSE[:3], margin=0.02), undecided_fails=False)
+    assert r.paragraphs[0].endswith(
+        "No range is shown: with fewer than 10 paired cases (prob_min_inputs),"
+        " a range worked out from the cases alone comes out too narrow. Each"
+        " case's own change and range are listed with it instead."
+    )
+    assert r.paragraphs[-2].endswith(
+        "There is no range yet, so the verdict is UNDECIDED. This session lets"
+        " undecided verdicts through (--prob-undecided=pass), so it doesn't fail"
+        " the test session."
+    )
+    assert r.paragraphs[-1] == (
+        "Next: add inputs (more parametrize cases) to reach 10 paired cases."
+    )
+
+
+def test_baseline_summary_template():
+    cmp = _bcmp(README, margin=0.02)
+    r = explain.baseline_summary_reading(
+        _bresult([cmp], only_current=("triage::new",),
+                 only_baseline=("triage::a", "old"))
+    )
+    assert r.heading == (
+        "against main.json (2026-10-01T12:00:00): 1 case paired, 1 only in this"
+        " run, 2 only in the baseline"
+    )
+    assert r.paragraphs == (
+        "This run is set against an earlier report, main.json, written"
+        " 2026-10-01T12:00:00, case by case: a case found in both is paired with"
+        " itself, and each bench function's pass rate is compared, this run"
+        " minus the baseline.",
+        "1 case ran only in this run (new, or with a changed parametrize id)"
+        " and 2 cases are only in the baseline (removed, renamed, or not"
+        " selected this time with -k or -m): listed below the comparisons and"
+        " left out of them, so they can't fail the gate.",
+        "With --prob-margin=0.02, each function's verdict decides: the failing"
+        " runs of cases found in the baseline are reported as xfailed, and a"
+        " function that FAILs fails the test session.",
+    )
+    assert r.tone is None
+    # no margin: it only reports
+    r = explain.baseline_summary_reading(_bresult([cmp], margin=None, created=None))
+    assert r.paragraphs == (
+        "This run is set against an earlier report, main.json, case by case: a"
+        " case found in both is paired with itself, and each bench function's"
+        " pass rate is compared, this run minus the baseline.",
+        "No --prob-margin is set, so the comparison only reports: it never"
+        " changes the exit status, and failing runs fail the session as usual.",
+    )
+    # nothing paired
+    r = explain.baseline_summary_reading(_bresult(only_current=("x",)))
+    assert r.tone == UNDECIDED
+    assert r.paragraphs[-2:] == (
+        "No case is in both reports, so nothing is compared and the baseline"
+        " can't fail the test session.",
+        "Next: check that the baseline report comes from the same suite; case"
+        " ids look like function::parametrize-id.",
+    )
+
+
+def test_baseline_avoids_jargon():
+    readings = [
+        _bread(_bcmp(README, margin=0.1)),
+        _bread(_bcmp(WORSE, margin=0.02)),
+        _bread(_bcmp(WORSE[:3], margin=0.0)),
+        _bread(_bcmp(WORSE, adjust=("holm", [_bcmp(README)]))),
+        explain.baseline_summary_reading(_bresult(only_current=("x",))),
+    ]
+    text = " ".join(p for r in readings for p in r.paragraphs)
+    terms = [t for r in readings for t in r.terms]
+    text += " ".join(body for _, body in explain.glossary(terms))
+    for word in ("null hypothesis", "reject", "significan", "alpha", "statistic"):
+        assert word not in text.lower(), word
+    assert "current − baseline" in dict(explain.glossary(terms))
+
+
+BENCH_REG = """
+import pytest
+
+@pytest.mark.parametrize("i", range(12))
+def bench_pair(i):
+    assert i > 3
+"""
+
+
+def test_baseline_explained_end_to_end(pytester, columns):
+    pytester.makepyfile(bench_pair=BENCH_REG)
+    rows = [{"case": f"pair::{i}", "passes": 1, "total": 1} for i in range(12)]
+    pytester.path.joinpath("main.json").write_text(json.dumps({"rows": rows}))
+    result = _run(
+        pytester, "--prob-baseline=main.json", "--prob-margin=0.02",
+        "--prob-explain", "--prob-json=r.json",
+    )
+    section = _section(result)
+    at = section.index("  against main.json: 12 cases paired")
+    assert section[at + 1].startswith("    This run is set against an earlier")
+    line = next(ln for ln in section if ln.startswith("  pair  current − baseline"))
+    assert line.endswith("≥−2 pp  FAIL")
+    assert any(ln.startswith("    current − baseline  --prob-baseline") for ln in section)
+    assert HINT not in result.stdout.lines
+    # the failing rows are judged: no "gate it" advice
+    assert "gate it" not in "\n".join(section)
+    data = json.loads((pytester.path / "r.json").read_text())["baseline"]
+    assert data["explanation"].startswith("This run is set against an earlier")
+    assert data["comparisons"][0]["explanation"].startswith(
+        "Over the 12 cases of pair in both reports, this run passed 33.3 points"
+        " fewer"
+    )

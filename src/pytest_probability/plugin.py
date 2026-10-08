@@ -35,6 +35,10 @@ Design notes:
   interval over its cases (``aggregate()``), and so does the session.
 - ``--prob-metric`` adds pass^k and pass@k: unbiased per-case
   estimates, averaged over cases by ``aggregate()`` the same way.
+- ``--prob-baseline`` pairs the cases with an earlier JSON report's by
+  case id and compares each function, current − baseline, through the
+  same ``compare_pairs()`` as an axis comparison; ``--prob-margin``
+  makes that a gate.
 """
 from __future__ import annotations
 
@@ -303,6 +307,23 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         metavar="PATH",
         help="--prob-plan: a previous --prob-json report to read each"
         " case's cost per run from, to project the cost of the plan",
+    )
+    group.addoption(
+        "--prob-baseline",
+        dest="prob_baseline",
+        default=None,
+        metavar="PATH",
+        help="Compare every bench function with a previous --prob-json report,"
+        " pairing cases by id (default: no baseline)",
+    )
+    group.addoption(
+        "--prob-margin",
+        dest="prob_margin",
+        type=float,
+        default=None,
+        metavar="MARGIN",
+        help="With --prob-baseline: fail a function whose pass rate may have"
+        " dropped by more than MARGIN, e.g. 0.02 (default: report only)",
     )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
@@ -581,6 +602,7 @@ def pytest_configure(config: pytest.Config) -> None:
     compare_config(config)
     metrics_config(config)
     plan_config(config)
+    baseline_of(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -1266,7 +1288,10 @@ class CompareSpec:
         if self.margin is None:
             return ""
         size = f"{self.margin * 100:g} pp"
-        return f"±{size}" if self.equivalence else f"≥−{size}"
+        if self.equivalence:
+            return f"±{size}"
+        # A zero margin (only --prob-margin allows one) asks for better.
+        return f"≥−{size}" if self.margin else ">0 pp"
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -1671,10 +1696,14 @@ class BenchItem(pytest.Item):
     @property
     def judged(self) -> bool:
         """Whether a verdict, not each run, decides this case: it is
-        gated, or its function's comparison has a margin."""
-        return self.gate is not None or bool(
-            self.compare and self.compare["margin"] is not None
-        )
+        gated, its function's comparison has a margin, or it is in the
+        baseline report and ``--prob-margin`` is set."""
+        if self.gate is not None:
+            return True
+        if self.compare and self.compare["margin"] is not None:
+            return True
+        baseline = baseline_of(self.config)
+        return baseline is not None and baseline.judges(self.case)
 
     def runtest(self) -> None:
         delay = _delay(self.config)
@@ -1746,7 +1775,8 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
 
     A failing run of a gated case is one sample of its pass rate; the
     gate's verdict, not the run, decides pass or fail. The same holds
-    for every case of a function whose comparison has a margin: the
+    for every case of a function whose comparison has a margin, and for
+    every case in the baseline report under ``--prob-margin``: the
     margin's verdict decides. Reporting it as
     xfailed keeps its traceback on the report (``--xfail-tb`` prints
     it, ``-rx`` lists the run with its assert message as the reason),
@@ -1769,7 +1799,12 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
         # pytest.fail() and other control flow: not a sample.
         return
     if record["outcome"] == "fail":
-        what = "gate" if item.gate is not None else "comparison"
+        if item.gate is not None:
+            what = "gate"
+        elif item.compare and item.compare["margin"] is not None:
+            what = "comparison"
+        else:
+            what = "baseline"
         reason = f"probability {what}: {record['message'] or 'AssertionError'}"
     elif (
         record["outcome"] == "error"
@@ -2614,6 +2649,213 @@ def pytest_runtestloop(session: pytest.Session):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Regression gate against a baseline report
+# ---------------------------------------------------------------------------
+
+# The two "arms" of a baseline comparison, as the line and JSON name them.
+BASELINE_ARM, CURRENT_ARM = "baseline", "current"
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """A previous ``--prob-json`` report (``--prob-baseline``), reduced
+    to what the regression gate needs: each case's counts.
+
+    ``cases`` maps case id to a ``CaseStats`` rebuilt from its row —
+    ``passes`` and ``total`` (all a 0.2.0 report has to offer), plus
+    ``errors`` and ``cost`` when present. ``margin`` is
+    ``--prob-margin`` (``None``: report only, no verdict). Loaded and
+    validated in ``pytest_configure`` on every process: workers need
+    it too, to know which cases a verdict judges.
+    """
+
+    path: str
+    created: str | None
+    cases: dict[str, CaseStats]
+    margin: float | None = None
+
+    @property
+    def spec(self) -> CompareSpec:
+        # No axis: the two arms are the two reports.
+        return CompareSpec(axis=None, baseline=BASELINE_ARM, margin=self.margin)
+
+    def judges(self, case: str) -> bool:
+        """Whether a verdict, not each run, decides ``case``: there is a
+        margin and the case is in the baseline (so it will be paired)."""
+        return self.margin is not None and case in self.cases
+
+
+def _count(row: dict[str, Any], key: str, default: int | None = None) -> int:
+    value = row.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(key)
+    return value
+
+
+def load_baseline(text: str) -> tuple[str | None, dict[str, CaseStats]]:
+    """``(created, cases)`` from a report's JSON text; ``ValueError``
+    (its message says what is wrong) for anything else.
+
+    Only ``rows[]`` with ``case``, ``passes`` and ``total`` are needed,
+    so reports from 0.2.0 on work. Rows with no runs are skipped and
+    rows sharing a case id are pooled.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"not valid JSON ({exc})") from None
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("no rows[]; is it a --prob-json report?")
+    cases: dict[str, CaseStats] = {}
+    for i, row in enumerate(rows):
+        try:
+            if not isinstance(row, dict) or not isinstance(row.get("case"), str):
+                raise ValueError("case")
+            passes, total = _count(row, "passes"), _count(row, "total")
+            errors = _count(row, "errors", 0)
+            if passes + errors > total:
+                raise ValueError("passes")
+            cost = row.get("cost") or 0.0
+            if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+                raise ValueError("cost")
+        except ValueError as exc:
+            raise ValueError(
+                f"rows[{i}] needs a case id and run counts with passes <= total"
+                f" (bad {exc})"
+            ) from None
+        if not total:
+            continue
+        s = cases.setdefault(row["case"], CaseStats(case=row["case"]))
+        s.passes += passes
+        s.errors += errors
+        s.fails += total - passes - errors
+        s.cost += float(cost)
+    created = data.get("created")
+    return (created if isinstance(created, str) else None), cases
+
+
+_BASELINE = pytest.StashKey["Baseline | None"]()
+
+
+def _resolve_baseline(config: pytest.Config) -> Baseline | None:
+    raw = config.getoption("prob_baseline")
+    margin = config.getoption("prob_margin")
+    if raw is None:
+        if margin is not None:
+            raise pytest.UsageError("--prob-margin needs --prob-baseline")
+        return None
+    # Positive test so NaN fails too.
+    if margin is not None and not 0.0 <= margin < 1.0:
+        hint = f" (did you mean {margin / 100:g}?)" if 1.0 <= margin < 100.0 else ""
+        raise pytest.UsageError(
+            f"--prob-margin must be at least 0 and below 1, got {margin:g}{hint}"
+        )
+    try:
+        text = Path(raw).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise pytest.UsageError(f"--prob-baseline: no such file: {raw}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise pytest.UsageError(f"--prob-baseline: cannot read {raw}: {exc}") from None
+    try:
+        created, cases = load_baseline(text)
+    except ValueError as exc:
+        raise pytest.UsageError(f"--prob-baseline: {raw}: {exc}") from None
+    return Baseline(path=raw, created=created, cases=cases, margin=margin)
+
+
+def baseline_of(config: pytest.Config) -> Baseline | None:
+    """The session's ``Baseline`` (``None`` without ``--prob-baseline``),
+    loaded and validated at configure."""
+    if _BASELINE not in config.stash:
+        config.stash[_BASELINE] = _resolve_baseline(config)
+    return config.stash[_BASELINE]
+
+
+@dataclass(frozen=True)
+class BaselineResult:
+    """This run against the baseline: one ``Comparison`` per bench
+    function with at least one case in both reports (by name; arm
+    ``current``, baseline ``baseline``), and the ids of the cases found
+    in only one of them, sorted. Those are listed, never paired, so
+    they can't fail the gate; a function with no paired case has no
+    comparison."""
+
+    baseline: Baseline
+    comparisons: tuple[Comparison, ...]
+    only_current: tuple[str, ...]
+    only_baseline: tuple[str, ...]
+
+    @property
+    def paired(self) -> int:
+        return sum(c.pairs for c in self.comparisons)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "path": self.baseline.path,
+            "created": self.baseline.created,
+            "margin": self.baseline.margin,
+            "paired": self.paired,
+            "only_current": list(self.only_current),
+            "only_baseline": list(self.only_baseline),
+            "comparisons": [c.to_json() for c in self.comparisons],
+        }
+
+
+def _variant(case: str) -> str:
+    # The case id after its function: the input a baseline pair is
+    # keyed by ("" for an unparametrized function).
+    return case.split("::", 1)[1] if "::" in case else ""
+
+
+def compare_with_baseline(
+    cases: Iterable[CaseStats],
+    baseline: Baseline,
+    cfg: StatsConfig,
+    adjust: str = "none",
+) -> BaselineResult:
+    """Pair ``cases`` with the baseline's by case id and compare each
+    bench function, current − baseline, through ``compare_pairs``: the
+    same regimes, interval and margin verdict as a comparison on an
+    axis. Errored runs count as non-passes, as in the row fraction. The
+    comparisons are one family for ``adjust``, apart from the axis
+    comparisons.
+    """
+    current = {s.case: s for s in cases if s.total}
+    functions: dict[str, list[str]] = {}
+    for case in {*current, *baseline.cases}:
+        functions.setdefault(function_of(case), []).append(case)
+    out: list[Comparison] = []
+    for function in sorted(functions):
+        ids = sorted(functions[function])
+        paired = [c for c in ids if c in current and c in baseline.cases]
+        if not paired:
+            continue
+        base = [baseline.cases[c] for c in paired]
+        now = [current[c] for c in paired]
+        out.append(
+            compare_pairs(
+                function,
+                baseline.spec,
+                CURRENT_ARM,
+                [
+                    Pair(_variant(b.case), (b.passes, b.total), (n.passes, n.total))
+                    for b, n in zip(base, now)
+                ],
+                cfg,
+                unpaired=[_variant(c) for c in sorted(set(ids) - set(paired))],
+                cost_ratio=_cost_ratio(base, now),
+            )
+        )
+    return BaselineResult(
+        baseline=baseline,
+        comparisons=tuple(adjust_comparisons(out, adjust)),
+        only_current=tuple(sorted(c for c in current if c not in baseline.cases)),
+        only_baseline=tuple(sorted(c for c in baseline.cases if c not in current)),
+    )
+
+
 _MARKUP = {
     "pass": {"green": True},
     "flaky": {"yellow": True},
@@ -2734,7 +2976,10 @@ def _difference_cell(cmp: Any) -> tuple[str, tuple[str, str] | None]:
     return f"{_pp(cmp.estimate, dec)} pp", bounds
 
 
-def _comparison_lines(comparisons: list[Comparison]) -> list[tuple[str, str | None]]:
+def _comparison_lines(
+    comparisons: list[Comparison],
+    label: Callable[[Comparison], str] | None = None,
+) -> list[tuple[str, str | None]]:
     """The comparisons block: one line per comparison, columns aligned —
     ``triage[style]  chain_of_thought − terse  +20 pp [−11, +51]  p=0.47
     1 paired  cost ×4.0`` — each with its verdict (``None``: no margin).
@@ -2743,9 +2988,12 @@ def _comparison_lines(comparisons: list[Comparison]) -> list[tuple[str, str | No
     ``prob_min_inputs``) is followed by one indented line per input
     with that input's own interval and p. When the session makes more
     than one comparison, a closing line says whether the p-values were
-    adjusted for that.
+    adjusted for that. ``label`` names a comparison's line (default:
+    ``function[axis]``).
     """
-    names = [f"{c.function}[{c.axis}]" for c in comparisons]
+    if label is None:
+        label = lambda c: f"{c.function}[{c.axis}]"  # noqa: E731
+    names = [label(c) for c in comparisons]
     arms = [f"{c.arm} − {c.baseline}" for c in comparisons]
     diffs = [_difference_cell(c) for c in comparisons]
     ps = [_p_cell(c.shown_p) for c in comparisons]
@@ -2897,6 +3145,59 @@ _METRIC_LEGEND = {
 }
 
 
+# How many unmatched case ids a line of the baseline block names.
+_UNMATCHED_SHOWN = 5
+
+
+def _cases(n: int) -> str:
+    return f"{n} case" if n == 1 else f"{n} cases"
+
+
+def _baseline_header(result: BaselineResult) -> str:
+    """``against main.json (2026-10-01T12:00:00): 26 cases paired, 1 only
+    in this run, 2 only in the baseline``."""
+    b = result.baseline
+    when = f" ({b.created})" if b.created else ""
+    parts = [f"{_cases(result.paired)} paired"]
+    if result.only_current:
+        parts.append(f"{len(result.only_current)} only in this run")
+    if result.only_baseline:
+        parts.append(f"{len(result.only_baseline)} only in the baseline")
+    return f"against {b.path}{when}: {', '.join(parts)}"
+
+
+def _case_list(ids: tuple[str, ...]) -> str:
+    shown = ", ".join(ids[:_UNMATCHED_SHOWN])
+    more = len(ids) - _UNMATCHED_SHOWN
+    return f"{shown} and {more} more" if more > 0 else shown
+
+
+def _baseline_lines(result: BaselineResult) -> list[tuple[str, str | None]]:
+    """The baseline block: a header naming the report and the pairing,
+    one comparison line per function (``classify  current − baseline
+    −1.2 pp [−4.0, +1.5]  p=0.41  40 paired  ≥−2 pp  PASS``), then the
+    cases found in only one report (the first few ids of each). The
+    header is UNDECIDED-colored when no case paired at all."""
+    lines: list[tuple[str, str | None]] = [
+        (f"  {_baseline_header(result)}", None if result.paired else UNDECIDED)
+    ]
+    lines.extend(
+        _comparison_lines(list(result.comparisons), label=lambda c: c.function)
+    )
+    unmatched = [
+        ("only in this run:", result.only_current),
+        ("only in the baseline:", result.only_baseline),
+    ]
+    unmatched = [(name, ids) for name, ids in unmatched if ids]
+    if unmatched:
+        lines.append(("", None))
+        width = max(len(name) for name, _ in unmatched)
+        lines.extend(
+            (f"  {name:<{width}} {_case_list(ids)}", None) for name, ids in unmatched
+        )
+    return lines
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -2931,6 +3232,8 @@ class ProbabilityAggregator:
         self._aggregates: list[Aggregate] | None = None
         # comparisons(), likewise.
         self._comparisons: list[Comparison] | None = None
+        # baseline_result(), likewise; stays None without --prob-baseline.
+        self._baseline_result: BaselineResult | None = None
 
     def pytest_runtest_logreport(self, report) -> None:
         if getattr(report, "when", None) != "call":
@@ -3011,6 +3314,26 @@ class ProbabilityAggregator:
             )
         return self._comparisons
 
+    def baseline_result(self) -> BaselineResult | None:
+        """This run against ``--prob-baseline`` (``None`` without it),
+        computed once after every result is in; like ``comparisons()``,
+        independent of the order results arrived in."""
+        baseline = baseline_of(self._config)
+        if baseline is None:
+            return None
+        if self._baseline_result is None:
+            self._baseline_result = compare_with_baseline(
+                self._stats.values(),
+                baseline,
+                stats_config(self._config),
+                compare_config(self._config).adjust,
+            )
+        return self._baseline_result
+
+    def _baseline_comparisons(self) -> tuple[Comparison, ...]:
+        result = self.baseline_result()
+        return result.comparisons if result is not None else ()
+
     def _shown_aggregates(self) -> list[Aggregate]:
         """The aggregates the summary prints: those with an interval,
         unless intervals are hidden. Overall is left out when it would
@@ -3052,7 +3375,9 @@ class ProbabilityAggregator:
         results = self.gate_results()
         gcfg = gate_config(session.config)
         verdicts = [r.verdict for r in results.values()] + [
-            c.verdict for c in self.comparisons() if c.verdict is not None
+            c.verdict
+            for c in (*self.comparisons(), *self._baseline_comparisons())
+            if c.verdict is not None
         ]
         if exitstatus == pytest.ExitCode.OK and any(map(gcfg.fails, verdicts)):
             # Every run passed or was xfailed, but a gate or a margin did
@@ -3105,6 +3430,11 @@ class ProbabilityAggregator:
             ],
             "aggregates": [a.to_json() for a in self.aggregates()],
             "comparisons": [c.to_json() for c in self.comparisons()],
+            "baseline": (
+                self.baseline_result().to_json()
+                if self.baseline_result() is not None
+                else None
+            ),
             "records": self._records or [],
         }
         if self._explain:
@@ -3122,6 +3452,13 @@ class ProbabilityAggregator:
                     )
             for cmp, entry in zip(self.comparisons(), payload["comparisons"]):
                 entry["explanation"] = self._comparison_reading(cmp).text()
+            if payload["baseline"] is not None:
+                block = payload["baseline"]
+                block["explanation"] = self._baseline_summary_reading().text()
+                for cmp, entry in zip(
+                    self._baseline_comparisons(), block["comparisons"]
+                ):
+                    entry["explanation"] = self._baseline_reading(cmp).text()
         path = Path(self._json_path)
         if path.parent != Path(""):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3259,6 +3596,16 @@ class ProbabilityAggregator:
             if kind in kinds:
                 tr.write_line(f"  {legend}")
 
+    def _write_baseline(self, tr) -> None:
+        """The ``probability: baseline`` block (nothing without
+        ``--prob-baseline``)."""
+        result = self.baseline_result()
+        if result is None:
+            return
+        tr.write_sep("=", "probability: baseline")
+        for line, verdict in _baseline_lines(result):
+            tr.write_line(line, **_VERDICT_MARKUP.get(verdict, {}))
+
     def _write_comparisons(self, tr) -> None:
         """The ``probability: comparisons`` block (nothing when no
         function is compared)."""
@@ -3325,6 +3672,22 @@ class ProbabilityAggregator:
             min_inputs=stats_config(self._config).min_inputs,
         )
 
+    def _baseline_reading(self, cmp: Comparison):
+        from . import explain
+
+        result = self.baseline_result()
+        return explain.baseline_reading(
+            cmp,
+            path=result.baseline.path,
+            undecided_fails=gate_config(self._config).fails(UNDECIDED),
+            min_inputs=stats_config(self._config).min_inputs,
+        )
+
+    def _baseline_summary_reading(self):
+        from . import explain
+
+        return explain.baseline_summary_reading(self.baseline_result())
+
     def _gate_reading(self, s: CaseStats, result: GateResult):
         from . import explain
 
@@ -3347,8 +3710,11 @@ class ProbabilityAggregator:
         cfg = stats_config(self._config)
         interval = cfg.interval(s.passes, s.total) if s.total else None
         # A margin, like a gate, judges the case: its reading has the step.
-        judged = s.gate is not None or bool(
-            s.compare and s.compare["margin"] is not None
+        baseline = baseline_of(self._config)
+        judged = (
+            s.gate is not None
+            or bool(s.compare and s.compare["margin"] is not None)
+            or (baseline is not None and baseline.judges(s.case))
         )
         return explain.row_reading(s, interval, cfg, gated=judged)
 
@@ -3374,6 +3740,11 @@ class ProbabilityAggregator:
         readings.extend(self._aggregate_reading(a) for a in self._shown_aggregates())
         readings.extend(self._metric_reading(a, m) for a, m in self._shown_metrics())
         readings.extend(self._comparison_reading(c) for c in self.comparisons())
+        if self.baseline_result() is not None:
+            readings.append(self._baseline_summary_reading())
+            readings.extend(
+                self._baseline_reading(c) for c in self._baseline_comparisons()
+            )
         # The main table's interval column needs explaining even when no
         # row is notable.
         cfg = stats_config(self._config)
@@ -3537,12 +3908,14 @@ class ProbabilityAggregator:
             tr.write_line(f"  Report:  {self._json_path}")
         self._write_metrics(tr)
         self._write_comparisons(tr)
+        self._write_baseline(tr)
         self._write_gates(tr, results)
         if self._explain:
             self._write_explained(tr, all_stats, results)
         elif (
             self.comparisons()
             or self._shown_metrics()
+            or self._baseline_comparisons()
             or any(r.verdict != PASS for r in results.values())
         ):
             from .explain import HINT

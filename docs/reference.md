@@ -119,6 +119,19 @@ All options live in the `probability` group of `pytest --help`.
   per run from it (its row's `cost` over `total`) and adds a projected
   cost column.
 
+`--prob-baseline=PATH`
+: Compare every bench function with an earlier `--prob-json` report:
+  see [Baseline](#baseline). The file must exist and hold a report's
+  `rows[]` (0.2.0 reports work); otherwise it is a usage error.
+  **Default:** no baseline.
+
+`--prob-margin=MARGIN`
+: With `--prob-baseline`, turn the comparison into a regression gate:
+  a function fails when its pass rate may have dropped by more than
+  MARGIN (`0.02` is 2 points). At least 0 and below 1; a usage error
+  without `--prob-baseline`.
+  **Default:** none — the baseline comparison only reports.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -569,6 +582,86 @@ Here `classify` is gated at `min_rate=0.9`, `smoke` at
 - Collection errors stop the plan as they stop a session (exit 2);
   nothing selected exits 5, like pytest.
 
+## Baseline
+
+`--prob-baseline` sets this run against an earlier `--prob-json`
+report — typically main's, cached in CI — case by case, and
+`--prob-margin` makes that a regression gate:
+
+```bash
+pytest benchmarks/ --prob-runs=10 --prob-json=report.json \
+    --prob-baseline=main.json --prob-margin=0.05
+```
+
+```text
+============================ probability: baseline =============================
+  against main.json (2026-10-08T19:24:03): 52 cases paired, 1 only in this run
+  classify  current − baseline   −0.2 pp [ −3.0, +2.7]  p=1     40 paired              ≥−5 pp  PASS
+  triage    current − baseline  −15.0 pp [−25.0, −5.8]  p=0.03  12 paired, 1 unpaired  ≥−5 pp  FAIL
+
+  p not adjusted for 2 comparisons: exploratory (--prob-adjust=holm adjusts them)
+
+  only in this run: triage::new_case
+```
+
+Here `triage` lost 15 points and fails the gate; `classify` barely
+moved, and its interval, all above −5 points, passes it. With
+`--prob-margin=0.02` it would be UNDECIDED: 40 cases × 10 runs can't
+rule out a 3-point drop. A tight margin needs many inputs.
+
+**Pairing.** A case in both reports is paired with itself by its case
+id (`triage::refund`); each bench function with at least one paired
+case gets one line: the mean, over its paired cases, of this run's pass
+fraction minus the baseline's, with the interval and p-value of a
+[comparison](#comparisons) — the same three regimes by the number of
+pairs (one case: Newcombe and Fisher; 2 to `prob_min_inputs` − 1: the
+average and the sign-flip p, then one line per case; more: a paired
+bootstrap over cases and the sign-flip p), the same `prob_bootstrap`,
+`prob_seed` and one confidence level. Every run counts and errored runs
+count as non-passes in both reports. `cost ×N` compares the recorded
+cost per run when both reports have one.
+
+**Cases in one report only** are never paired: new cases, removed
+ones, renamed ones, and cases deselected this time with `-k`/`-m`. The
+header counts them, the function's line says `N unpaired`, and the
+block lists the first few ids of each kind (the JSON report lists them
+all). A function with no case in both reports gets no line. When no
+case at all is paired, the header is yellow and nothing is judged —
+check that the baseline comes from the same suite.
+
+**The margin** is a non-inferiority bar, read off the printed
+interval as for an axis comparison's `margin=`:
+
+| `--prob-margin` | Shown | PASS | FAIL | UNDECIDED |
+|---|---|---|---|---|
+| `0.02` | `≥−2 pp` | lower bound > −2 pp | upper bound < −2 pp | otherwise, or no interval |
+| `0` | `>0 pp` | lower bound > 0: this run is shown better | upper bound < 0 | otherwise |
+
+- With a margin, the failing runs of **cases found in the baseline**
+  are reported as xfailed (`-rx` lists them as `probability baseline:
+  …`) and the verdicts set the exit status: FAIL fails the session, and
+  UNDECIDED does unless `--prob-undecided=pass`. A new case is not
+  covered by any verdict, so its failing runs fail the session as
+  usual. Errored runs still fail it.
+- With fewer than `prob_min_inputs` paired cases there is no
+  interval, so the verdict is UNDECIDED: add inputs, or allow it with
+  `--prob-undecided=pass`.
+- **Without `--prob-margin`** the block only reports: failing runs
+  fail the session as usual and the exit status is the same as without
+  `--prob-baseline`.
+- `--prob-adjust` adjusts the baseline lines' p-values as one family,
+  apart from the axis comparisons'. Verdicts come from the intervals
+  only.
+- Only `rows[]` with `case`, `passes` and `total` are read (`errors`
+  and `cost` when present), so reports from 0.2.0 on work; the
+  baseline's method, level and gates don't matter. Rows sharing a case
+  id are pooled.
+- A case can be judged by a gate, an axis comparison's margin and the
+  baseline at once: the session fails when any of their verdicts does.
+- `--prob-explain` reads the header and every line in plain words. See
+  {doc}`json-report` for the `baseline` block and a GitHub Actions
+  recipe that caches main's report.
+
 ## Python API
 
 Everything importable lives in the top-level package:
@@ -710,7 +803,9 @@ sample.
 The section renders only when at least one benchmark item ran. With
 `--prob-metric`, a [`probability: metrics`](#metrics) section follows
 it. When a function is [compared](#comparisons), a `probability:
-comparisons` section comes next, before the gates block.
+comparisons` section comes next, then with `--prob-baseline` a
+[`probability: baseline`](#baseline) section, both before the gates
+block.
 
 ### The gates block
 
@@ -736,8 +831,8 @@ with the interval and bar each verdict came from:
 
 ### The explain section
 
-When any gate is FAIL or UNDECIDED, or any comparison or metric is
-shown, the summary ends with a hint:
+When any gate is FAIL or UNDECIDED, or any comparison, metric or
+baseline line is shown, the summary ends with a hint:
 
 ```text
   Run with --prob-explain for a plain-language reading.
@@ -945,6 +1040,7 @@ otherwise have exited 0.
 | UNDECIDED gates only, `--prob-undecided=pass` | 0 |
 | A gate FAIL, or UNDECIDED under the default `fail` | 1 |
 | A comparison's margin FAIL, or UNDECIDED under the default `fail` | 1 |
+| A function's `--prob-margin` FAIL against the baseline, or UNDECIDED under the default `fail` | 1 |
 | An ungated run failed or errored (whatever the gates) | 1 |
 | An errored run in a gated case, `prob_errors = count` | 1 |
 | Interrupted, usage error, no tests… | pytest's own code, unchanged |
@@ -952,5 +1048,6 @@ otherwise have exited 0.
 pytest's last line counts runs, not gates, so a session can end
 `137 passed, 43 xfailed` and still exit 1: the `Gates:` line and the
 gates block (or the verdicts in the comparisons block) say why.
-Comparisons without a margin never change the exit status. The JSON report's `exit_status` is the final code,
+Comparisons without a margin, and a baseline without
+`--prob-margin`, never change the exit status. The JSON report's `exit_status` is the final code,
 gates included.

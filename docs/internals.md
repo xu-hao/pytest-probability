@@ -32,16 +32,18 @@ BenchItem.runtest()            (one (case, run) execution)
   └─ let exceptions propagate
 
 pytest_runtest_makereport      (hookwrapper)
-  └─ gated case, or margin comparison: report a failing run as xfailed
+  └─ gated case, margin comparison, or baseline case under
+     --prob-margin: report a failing run as xfailed
 
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
-  ├─ pytest_sessionfinish:     decide gates and margins → exit status,
-  │                            then write the JSON report (controller only)
+  ├─ pytest_sessionfinish:     decide gates and margins (axis and
+  │                            baseline) → exit status, then write the
+  │                            JSON report (controller only)
   └─ pytest_terminal_summary:  render the fraction table, function-level
                                lines, metrics block, comparisons block,
-                               gates block and (--prob-explain) explain
-                               section
+                               baseline block, gates block and
+                               (--prob-explain) explain section
 
 --prob-plan                    (instead of running)
   ├─ pytest_cmdline_main:      turn off xdist's -n
@@ -429,6 +431,45 @@ Also in `plugin.py`, after the aggregates:
   comparison with a margin; the makereport wrapper xfails failing runs
   of judged items. Errors are only excluded by a case gate.
 
+## Baseline
+
+Also in `plugin.py`, after the comparisons. A regression gate is a
+comparison whose two arms are two reports, so it reuses
+`compare_pairs()` whole:
+
+- `load_baseline(text)` reads a report's `rows[]` — only `case`,
+  `passes` and `total` are required, `errors` and `cost` are used when
+  present, so 0.2.0 reports work — into `CaseStats` per case id
+  (duplicate ids pooled, rows with no runs skipped), raising
+  `ValueError` with what is wrong.
+- `Baseline` is the loaded report plus `--prob-margin`.
+  `baseline_of(config)` loads and validates it once, in
+  `pytest_configure`, on **every** process: a missing or malformed
+  file, a margin outside [0, 1), or a margin without a baseline is a
+  `UsageError` before anything runs. Workers need it because the xfail
+  decision is theirs: `Baseline.judges(case)` — there is a margin and
+  the case is in the baseline — feeds `BenchItem.judged`. Nothing about
+  the baseline travels in `user_properties`; the controller reads the
+  same file.
+- `compare_with_baseline(cases, baseline, cfg, adjust)` groups the
+  union of both reports' case ids by `function_of`, sorted by name,
+  and for each function with a paired case calls `compare_pairs()` with
+  `CompareSpec(axis=None, baseline="baseline", margin=...)`, arm
+  `"current"`, one `Pair` per case id in both (keyed by the id without
+  its function, so `compare_pairs` sorts them), the rest as `unpaired`
+  and `_cost_ratio()` over the paired rows. `adjust_comparisons()` then
+  adjusts these comparisons as their own family. The `BaselineResult`
+  also keeps the sorted ids found only in this run or only in the
+  baseline. A function without a paired case gets no comparison, so a
+  new or removed function never gets a verdict.
+- `ProbabilityAggregator.baseline_result()` caches it for the JSON
+  `baseline` block, the `probability: baseline` block
+  (`_baseline_lines()`, which reuses `_comparison_lines()` with a
+  `label` naming the line after the function) and the readings
+  (`explain.baseline_summary_reading`, `explain.baseline_reading`).
+  `pytest_sessionfinish` adds the baseline verdicts to the ones it
+  passes through `GateConfig.fails()`.
+
 ## Explanations
 
 `--prob-explain` keeps its wording out of `plugin.py`: every sentence
@@ -565,3 +606,12 @@ down and users rely on:
     its numbers are exact functions of the collected items, their
     gates and the plan options. Without `--prob-plan` the plan options
     change nothing.
+15. A baseline comparison is a function of the aggregated counts, the
+    baseline file, the seed and the settings only: functions are sorted
+    by name and cases by id, through the same seeded `compare_pairs()`,
+    so it is the same with and without xdist. Without
+    `--prob-baseline` there is no baseline block, `baseline` is `null`
+    in the JSON report, and nothing else changes; without
+    `--prob-margin` it never changes the exit status or xfails a run.
+    Only cases found in the baseline are judged, and a margin only
+    ever changes the exit status from `OK` to `TESTS_FAILED`.

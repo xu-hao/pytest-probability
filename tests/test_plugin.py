@@ -3171,3 +3171,407 @@ def test_xdist_metric_parity(pytester):
     assert s["aggregates"] == d["aggregates"]
     rows = lambda data: sorted((r["case"], r["metrics"]) for r in data["rows"])  # noqa: E731
     assert rows(s) == rows(d)
+# Regression gate against a baseline report (#8)
+# ---------------------------------------------------------------------------
+
+
+def _bench_b(fail=(), n=12, runs=1, name="pair"):
+    """``n`` cases ``name::0`` … ``name::{n-1}``; the ones in ``fail`` fail
+    every run. Fixed by the case, so results are the same in any process."""
+    return f"""
+import pytest
+
+@pytest.mark.probability(runs={runs})
+@pytest.mark.parametrize("i", range({n}))
+def bench_{name}(i):
+    assert i not in {tuple(fail)!r}
+"""
+
+
+def _baseline_file(pytester, rows, name="main.json", **extra):
+    """A minimal (0.2.0-shaped) report: rows with case, passes and total."""
+    import json
+
+    data = {
+        "rows": [{"case": c, "passes": p, "total": t} for c, p, t in rows],
+        **extra,
+    }
+    pytester.path.joinpath(name).write_text(json.dumps(data))
+
+
+def _all_pass(name="pair", n=12, runs=1):
+    return [(f"{name}::{i}", runs, runs) for i in range(n)]
+
+
+def _baseline_block(result):
+    """The lines of the ``probability: baseline`` block ([] when absent)."""
+    lines = result.stdout.lines
+    try:
+        start = next(
+            i for i, ln in enumerate(lines) if "= probability: baseline =" in ln
+        )
+    except StopIteration:
+        return []
+    out = []
+    for ln in lines[start + 1 :]:
+        if ln.startswith("=") or ln.strip().startswith("Run with --prob-explain"):
+            break
+        out.append(ln)
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+def _expected_baseline(base, now, margin=None, **cfg):
+    """compare_pairs over cases given as ``{case: (passes, total)}``."""
+    from pytest_probability.plugin import CompareSpec, Pair, StatsConfig, compare_pairs
+
+    spec = CompareSpec(axis=None, baseline="baseline", margin=margin)
+    pairs = [Pair(c.split("::")[1], base[c], now[c]) for c in base if c in now]
+    return compare_pairs("pair", spec, "current", pairs, StatsConfig(**cfg))
+
+
+def test_baseline_from_a_current_report_passes(pytester):
+    # the same suite twice: no change, a zero-width interval, PASS
+    pytester.makepyfile(bench_pair=_bench_b(runs=2))
+    first = _run(pytester, "--prob-json=main.json")
+    assert first.ret == pytest.ExitCode.OK and _baseline_block(first) == []
+    created = _json(pytester, "main.json")["created"]
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02")
+    assert _baseline_block(result) == [
+        f"  against main.json ({created}): 12 cases paired",
+        "  pair  current − baseline  0.0 pp [0.0, 0.0]  p=1  12 paired  ≥−2 pp  PASS",
+    ]
+    assert result.ret == pytest.ExitCode.OK
+
+
+def test_baseline_regression_fails_the_session(pytester):
+    # 4 of 12 cases now fail; a 0.2.0-shaped baseline had them all passing
+    pytester.makepyfile(bench_pair=_bench_b(fail=(0, 1, 2, 3)))
+    _baseline_file(pytester, _all_pass())
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02")
+    cmp = _expected_baseline(
+        {c: (p, t) for c, p, t in _all_pass()},
+        {f"pair::{i}": (int(i > 3), 1) for i in range(12)},
+        margin=0.02,
+    )
+    assert cmp.verdict == "fail" and cmp.ci[1] < -0.02
+    low, high = (_pp1(v) for v in cmp.ci)
+    assert _baseline_block(result) == [
+        "  against main.json: 12 cases paired",
+        f"  pair  current − baseline  −33.3 pp [{low}, {high}]  p=0.12  12 paired"
+        "  ≥−2 pp  FAIL",
+    ]
+    # the failing runs of paired cases are samples: xfailed, the verdict fails
+    result.assert_outcomes(passed=8, xfailed=4)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result = pytester.runpytest(
+        "--prob-baseline=main.json", "--prob-margin=0.02", "-rx", "--tb=no"
+    )
+    result.stdout.fnmatch_lines(["XFAIL*pair::0*probability baseline: assert*"])
+
+
+def test_baseline_margin_omitted_reports_only(pytester):
+    pytester.makepyfile(bench_pair=_bench_b(fail=(0, 1, 2, 3)))
+    _baseline_file(pytester, _all_pass())
+    plain = _run(pytester)
+    result = _run(pytester, "--prob-baseline=main.json")
+    (header, line) = _baseline_block(result)
+    assert line.startswith("  pair  current − baseline  −33.3 pp [")
+    assert line.endswith("p=0.12  12 paired")  # no bar, no verdict
+    # failing runs fail as usual; the exit status is the same as without
+    result.assert_outcomes(passed=8, failed=4)
+    assert result.ret == plain.ret == pytest.ExitCode.TESTS_FAILED
+    # and an improvement leaves a passing suite passing
+    pytester.makepyfile(bench_pair=_bench_b())
+    _baseline_file(pytester, [(f"pair::{i}", 0, 1) for i in range(12)])
+    result = _run(pytester, "--prob-baseline=main.json")
+    assert "+100.0 pp" in _baseline_block(result)[1]
+    assert result.ret == pytest.ExitCode.OK
+
+
+def test_baseline_few_pairs_undecided(pytester):
+    # 3 paired cases: the average and p, one line per case, no interval
+    pytester.makepyfile(bench_pair=_bench_b(n=3, runs=2))
+    _baseline_file(pytester, _all_pass(n=3, runs=2))
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.05")
+    assert _baseline_block(result) == [
+        "  against main.json: 3 cases paired",
+        "  pair  current − baseline  0.0 pp  p=1  3 paired  ≥−5 pp  UNDECIDED",
+        "      0  2/2 vs 2/2  0 pp [−66, +66]  p=1",
+        "      1  2/2 vs 2/2  0 pp [−66, +66]  p=1",
+        "      2  2/2 vs 2/2  0 pp [−66, +66]  p=1",
+    ]
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result = _run(
+        pytester, "--prob-baseline=main.json", "--prob-margin=0.05",
+        "--prob-undecided=pass",
+    )
+    assert result.ret == pytest.ExitCode.OK
+
+
+def test_baseline_single_case_function(pytester):
+    # an unparametrized function is one case: Newcombe and Fisher on its runs
+    pytester.makepyfile(bench_smoke="def bench_smoke():\n    assert True\n")
+    _baseline_file(pytester, [("smoke", 8, 10)])
+    result = _run(
+        pytester, "--prob-runs=10", "--prob-baseline=main.json", "--prob-margin=0.1",
+        "--prob-json=r.json",
+    )
+    assert _baseline_block(result)[1] == (
+        "  smoke  current − baseline  +20 pp [−11, +51]  p=0.47  1 paired"
+        "  ≥−10 pp  UNDECIDED"
+    )
+    (cmp,) = _json(pytester)["baseline"]["comparisons"]
+    assert cmp["ci"]["method"] == "newcombe" and cmp["p_method"] == "fisher"
+    assert cmp["inputs"][0]["input"] == ""
+
+
+def test_baseline_unmatched_cases_are_listed_not_paired(pytester):
+    # pair: 0-9 in both, 10-13 new, 20-21 gone; extra: new; old: gone
+    pytester.makepyfile(
+        bench_pair=_bench_b(n=14),
+        bench_extra=_bench_b(n=2, name="extra"),
+    )
+    _baseline_file(
+        pytester,
+        _all_pass(n=10) + [("pair::20", 1, 1), ("pair::21", 1, 1), ("old", 1, 1)],
+    )
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02",
+                  "--prob-json=r.json")
+    block = _baseline_block(result)
+    assert block[0] == (
+        "  against main.json: 10 cases paired, 6 only in this run,"
+        " 3 only in the baseline"
+    )
+    # one comparison: functions without a paired case have none
+    assert block[1].startswith("  pair  current − baseline  0.0 pp")
+    assert block[1].endswith("10 paired, 6 unpaired  ≥−2 pp  PASS")
+    assert block[2:] == [
+        "",
+        "  only in this run:     extra::0, extra::1, pair::10, pair::11, pair::12"
+        " and 1 more",
+        "  only in the baseline: old, pair::20, pair::21",
+    ]
+    assert result.ret == pytest.ExitCode.OK
+    data = _json(pytester)["baseline"]
+    assert data["paired"] == 10
+    assert data["only_current"] == [
+        "extra::0", "extra::1", "pair::10", "pair::11", "pair::12", "pair::13"
+    ]
+    assert data["only_baseline"] == ["old", "pair::20", "pair::21"]
+    assert data["comparisons"][0]["unpaired"] == ["10", "11", "12", "13", "20", "21"]
+
+
+def test_baseline_unmatched_failing_runs_still_fail(pytester):
+    # a new case has no verdict over it: its failing run fails as usual
+    pytester.makepyfile(bench_pair=_bench_b(n=11, fail=(10,)))
+    _baseline_file(pytester, _all_pass(n=10))
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02")
+    result.assert_outcomes(passed=10, failed=1)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+
+def test_baseline_nothing_paired(pytester):
+    pytester.makepyfile(bench_pair=_bench_b(n=2))
+    _baseline_file(pytester, [("other::a", 1, 1)])
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02")
+    assert _baseline_block(result) == [
+        "  against main.json: 0 cases paired, 2 only in this run,"
+        " 1 only in the baseline",
+        "",
+        "  only in this run:     pair::0, pair::1",
+        "  only in the baseline: other::a",
+    ]
+    assert result.ret == pytest.ExitCode.OK
+
+
+def test_baseline_report_formats(pytester):
+    # a report as 0.2.0 wrote it: rows without ci/gate, records, no stats_config
+    import json
+
+    pytester.makepyfile(bench_pair=_bench_b(n=2))
+    rows = [
+        {"case": f"pair::{i}", "passes": 1, "fails": 1, "errors": 0, "total": 2,
+         "pass_rate": 50.0, "status": "flaky", "cost": 0.0, "usage": {}}
+        for i in range(2)
+    ]
+    pytester.path.joinpath("old.json").write_text(json.dumps({
+        "created": "2026-07-01T10:00:00", "runs": 2, "exit_status": 1,
+        "totals": {}, "rows": rows, "records": [],
+    }))
+    result = _run(pytester, "--prob-runs=2", "--prob-baseline=old.json")
+    assert _baseline_block(result)[:2] == [
+        "  against old.json (2026-07-01T10:00:00): 2 cases paired",
+        "  pair  current − baseline  +50.0 pp  p=0.50  2 paired",
+    ]
+
+
+def test_load_baseline_pools_and_skips():
+    import json
+
+    from pytest_probability.plugin import load_baseline
+
+    created, cases = load_baseline(json.dumps({"rows": [
+        {"case": "a::x", "passes": 1, "total": 2},
+        {"case": "a::x", "passes": 2, "total": 2, "errors": 0, "cost": 0.5},
+        {"case": "a::y", "passes": 0, "total": 0},
+        {"case": "a::z", "passes": 1, "total": 3, "errors": 1},
+    ]}))
+    assert created is None
+    assert sorted(cases) == ["a::x", "a::z"]
+    x, z = cases["a::x"], cases["a::z"]
+    assert (x.passes, x.total, x.cost) == (3, 4, 0.5)
+    assert (z.passes, z.fails, z.errors) == (1, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "content, message",
+    [
+        (None, "*--prob-baseline: no such file: main.json"),
+        ("{nope", "*--prob-baseline: main.json: not valid JSON (*"),
+        ('{"totals": {}}', "*main.json: no rows[]; is it a --prob-json report?"),
+        ('[1, 2]', "*main.json: no rows[]; is it a --prob-json report?"),
+        ('{"rows": [{"case": "a", "passes": 3, "total": 2}]}',
+         "*rows?0? needs a case id and run counts with passes <= total (bad passes)"),
+        ('{"rows": [{"case": "a", "passes": 1, "total": 2}, {"passes": 1}]}',
+         "*rows?1? needs a case id * (bad case)"),
+        ('{"rows": [{"case": "a", "passes": true, "total": 2}]}', "*(bad passes)"),
+        ('{"rows": [{"case": "a", "passes": 1, "total": "2"}]}', "*(bad total)"),
+    ],
+)
+def test_bad_baseline_files(pytester, content, message):
+    pytester.makepyfile(bench_pair=_bench_b(n=1))
+    if content is not None:
+        pytester.path.joinpath("main.json").write_text(content)
+    result = pytester.runpytest("--prob-baseline=main.json")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([message])
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--prob-margin=0.02"], "*--prob-margin needs --prob-baseline"),
+        (["--prob-baseline=main.json", "--prob-margin=-0.1"],
+         "*--prob-margin must be at least 0 and below 1, got -0.1"),
+        (["--prob-baseline=main.json", "--prob-margin=2"],
+         "*--prob-margin must be at least 0 and below 1, got 2 (did you mean 0.02?)"),
+        (["--prob-baseline=main.json", "--prob-margin=nan"],
+         "*--prob-margin must be at least 0 and below 1, got nan"),
+    ],
+)
+def test_bad_margins(pytester, args, message):
+    _baseline_file(pytester, _all_pass(n=1))
+    result = pytester.runpytest(*args)
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([message])
+
+
+def test_baseline_zero_margin_asks_for_better(pytester):
+    pytester.makepyfile(bench_pair=_bench_b())
+    _baseline_file(pytester, _all_pass())
+    result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0")
+    # no change can't show "better": the interval touches 0
+    assert _baseline_block(result)[1].endswith(">0 pp  UNDECIDED")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+
+def test_baseline_json(pytester):
+    pytester.makepyfile(bench_pair=_bench_b(fail=(0, 1, 2, 3)))
+    _baseline_file(pytester, _all_pass(), created="2026-10-01T12:00:00")
+    _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02",
+         "--prob-json=r.json")
+    data = _json(pytester)
+    block = data["baseline"]
+    (cmp,) = block.pop("comparisons")
+    assert block == {
+        "path": "main.json",
+        "created": "2026-10-01T12:00:00",
+        "margin": 0.02,
+        "paired": 12,
+        "only_current": [],
+        "only_baseline": [],
+    }
+    expected = _expected_baseline(
+        {c: (p, t) for c, p, t in _all_pass()},
+        {f"pair::{i}": (int(i > 3), 1) for i in range(12)},
+        margin=0.02,
+    )
+    from pytest_probability.plugin import adjust_comparisons
+
+    assert cmp == adjust_comparisons([expected], "none")[0].to_json()
+    assert cmp["axis"] is None and cmp["arm"] == "current"
+    assert cmp["baseline"] == "baseline" and cmp["verdict"] == "fail"
+    assert data["exit_status"] == 1
+    assert data["comparisons"] == []
+    # failing runs stay "fail" in the records
+    assert [r["outcome"] for r in data["records"]].count("fail") == 4
+
+
+def test_no_baseline_block_without_the_option(pytester):
+    pytester.makepyfile(bench_pair=_bench_b(n=2))
+    result = _run(pytester, "--prob-json=r.json")
+    assert _baseline_block(result) == []
+    assert _json(pytester)["baseline"] is None
+
+
+def test_regular_suite_unchanged_by_baseline_options(pytester):
+    pytester.makepyfile(test_plain=TEST_PLAIN)
+    _baseline_file(pytester, _all_pass(n=2))
+    base = _run(pytester, "-p", "no:cacheprovider")
+    with_opts = _run(
+        pytester, "-p", "no:cacheprovider", "--prob-baseline=main.json",
+        "--prob-margin=0.02",
+    )
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert with_opts.ret == pytest.ExitCode.OK
+
+
+def test_baseline_family_is_apart_from_axis_comparisons(pytester):
+    pytester.makepyfile(
+        bench_pair=_paired_bench(arms=("alpha", "beta"), runs=1).replace(
+            "assert PASS[arm](i)", "assert True"
+        )
+    )
+    first = _run(pytester, "--prob-json=main.json", "--prob-adjust=holm")
+    _run(pytester, "--prob-adjust=holm", "--prob-baseline=main.json",
+         "--prob-json=r.json")
+    data = _json(pytester)
+    assert data["comparisons"] == _json(pytester, "main.json")["comparisons"]
+    (cmp,) = data["baseline"]["comparisons"]
+    assert cmp["family"] == 1 and cmp["adjustment"] == "holm"
+    assert cmp["pairs"] == 24
+    assert first.ret == pytest.ExitCode.OK
+
+
+def test_baseline_hint(pytester):
+    pytester.makepyfile(bench_pair=_bench_b(n=2))
+    _baseline_file(pytester, _all_pass(n=2))
+    result = _run(pytester, "--prob-baseline=main.json")
+    assert "  Run with --prob-explain for a plain-language reading." in (
+        result.stdout.lines
+    )
+
+
+def test_xdist_baseline_parity(pytester):
+    pytest.importorskip("xdist")
+    pytester.makepyfile(
+        bench_pair=_bench_b(fail=(0, 1, 2, 3)),
+        bench_extra=_bench_b(n=3, name="extra"),
+    )
+    _baseline_file(pytester, _all_pass() + _all_pass(name="extra", n=2))
+    args = ("--prob-baseline=main.json", "--prob-margin=0.02", "--prob-explain")
+    serial = _run(pytester, *args, "--prob-json=serial.json")
+    # pass or fail is fixed by the case, so any distribution will do; the
+    # results arrive in a different order across the two workers
+    dist = _run(pytester, *args, "--prob-json=dist.json", "-n", "2")
+    assert _baseline_block(serial) == _baseline_block(dist)
+    assert len(_baseline_block(serial)) == 9
+    assert serial.ret == dist.ret == pytest.ExitCode.TESTS_FAILED
+    # the workers xfail the paired failing runs, as in-process
+    serial.assert_outcomes(passed=11, xfailed=4)
+    dist.assert_outcomes(passed=11, xfailed=4)
+    s = _json(pytester, "serial.json")["baseline"]
+    assert s == _json(pytester, "dist.json")["baseline"]
