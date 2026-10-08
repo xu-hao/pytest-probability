@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+- **Internal:** new `pytest_probability.stats` module — the
+  standard-library-only building blocks for the statistical-testing
+  work: exact binomial tails, the regularized incomplete beta function
+  and its inverse, Clopper-Pearson / Wilson / Beta-credible intervals
+  for one proportion, the Newcombe interval and Fisher's exact test for
+  two, and a seeded bootstrap. No user-visible change yet; pytest is
+  still the only runtime dependency. The test suite cross-checks it
+  against scipy and statsmodels, available as the `test` extra.
+
 ## 0.2.0 (2026-07-08)
 
 Bench functions are now **plain test bodies that assert** — the

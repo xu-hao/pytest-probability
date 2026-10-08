@@ -22,6 +22,15 @@ dependencies = [
     "pytest>=7.4",
 ]
 
+[project.optional-dependencies]
+# Test-only: reference implementations the stats module is checked
+# against, and pytest-xdist for exercising -n runs. Never runtime deps.
+test = [
+    "pytest-xdist",
+    "scipy",
+    "statsmodels",
+]
+
 [project.urls]
 Homepage = "https://github.com/xu-hao/pytest-probability"
 Repository = "https://github.com/xu-hao/pytest-probability"
@@ -37,3 +46,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pytest_probability"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: longer-running statistical checks (deselect with -m 'not slow')",
+]
