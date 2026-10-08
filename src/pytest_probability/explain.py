@@ -1793,13 +1793,18 @@ def plan_notes(
     level: float,
     gated: bool,
     report: str | None,
+    latency: bool = False,
+    both: bool = False,
+    mark: str = "*",
 ) -> list[tuple[str, str]]:
     """``(column, note)`` for every column of the ``--prob-plan`` table
     that is shown: what its numbers mean, in one sentence each.
 
     ``flakes`` maps each failure rate to the runs that catch it with
     probability ``level``; ``report`` is the report costs came from
-    (``None``: no cost column).
+    (``None``: no cost column). ``gated``: some case has a pass-rate
+    gate; ``latency``: some case has a latency gate; ``both``: some
+    case has both, so its power cells carry ``mark``.
     """
     sure = _pct_bar(power)
     rate = _pct_bar(assume)
@@ -1810,18 +1815,48 @@ def plan_notes(
             " prob_runs), counting only the runs -k/-m selected.",
         )
     ]
-    if gated:
-        notes += [
+    # Why a latency gate gets no power figure.
+    unplanned = (
+        "A latency gate gets — here: its chance would need a guess at how"
+        " slow the code really is."
+    )
+    if gated and latency:
+        notes.append(
+            (
+                "min runs",
+                "Fewest runs with which the gate can pass at all: for a"
+                " pass-rate gate, only if every one of them passes; for a"
+                " latency gate, however fast they are, since with fewer its"
+                " percentile's interval has no upper end. A case with both"
+                " gates needs the larger.",
+            )
+        )
+    elif gated:
+        notes.append(
             (
                 "min runs",
                 "Fewest runs with which the gate can pass at all, and then"
                 " only if every one of them passes.",
-            ),
+            )
+        )
+    elif latency:
+        notes.append(
+            (
+                "min runs",
+                "Fewest runs with which the latency gate can pass at all,"
+                " however fast they are: with fewer, its percentile's interval"
+                " has no upper end. It depends only on the percentile and the"
+                " confidence level.",
+            )
+        )
+    if gated:
+        notes += [
             (
                 f"runs for {sure}",
                 f"Runs with which the gate passes {sure} of the time if the"
                 f" case really passes {rate} of its runs (--prob-plan-assume);"
-                f" never, if {rate} is not above the gate's bar.",
+                f" never, if {rate} is not above the gate's bar."
+                + (f" {unplanned}" if latency else ""),
             ),
             (
                 "chance now",
@@ -1829,6 +1864,28 @@ def plan_notes(
                 f" case really passes {rate} of its runs.",
             ),
         ]
+    elif latency:
+        notes += [
+            (
+                f"runs for {sure}",
+                f"Runs with which a pass-rate gate passes {sure} of the time."
+                f" {unplanned}",
+            ),
+            (
+                "chance now",
+                "The chance a pass-rate gate passes with the planned runs; —"
+                " for a latency gate, for the same reason.",
+            ),
+        ]
+    if both:
+        notes.append(
+            (
+                mark,
+                "A latency gate also applies: the marked numbers are for the"
+                " pass-rate gate alone, and the latency gate's runs aren't"
+                " planned beyond its min runs.",
+            )
+        )
     for f, n in flakes.items():
         notes.append(
             (

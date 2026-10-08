@@ -451,3 +451,190 @@ def test_output_unchanged_without_plan(pytester, columns):
     assert "probability: plan" not in with_options.stdout.str()
     strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
     assert strip(with_options) == strip(plain)
+
+
+# ---------------------------------------------------------------------------
+# Latency gates
+# ---------------------------------------------------------------------------
+
+BENCH_LATENCY = """
+import pytest
+
+@pytest.mark.probability(max_latency=2.0)
+def bench_latency_only():
+    pass
+
+@pytest.mark.probability(min_rate=0.9, max_latency=2.0)
+def bench_both():
+    pass
+
+@pytest.mark.probability(min_rate=0.9, max_latency=2.0, latency_quantile=0.5, runs=100)
+def bench_both_p50():
+    pass
+
+@pytest.mark.probability(max_latency=1.0, latency_quantile=0.99, runs=400)
+def bench_p99():
+    pass
+
+@pytest.mark.probability(min_rate=0.9)
+def bench_rate_only():
+    pass
+
+def bench_ungated():
+    pass
+"""
+
+EXPECTED_LATENCY_TABLE = [
+    "  case          runs  min runs  runs for 80%  chance now  catch 10%  catch 1%",
+    "  latency_only    40        72             —           —        99%       33%",
+    "  both            40        72          100*        30%*        99%       33%",
+    "  both_p50       100        36          100*        82%*        99%       63%",
+    "  p99            400       368             —           —        99%       98%",
+    "  rate_only       40        36           100         30%        99%       33%",
+    "  ungated         40         —             —           —        99%       33%",
+]
+
+
+@pytest.mark.parametrize("q", [0.5, 0.95, 0.99])
+@pytest.mark.parametrize(
+    "level, where", [(None, None), (0.9, "mark"), (0.99, "mark"), (0.9, "ini")]
+)
+def test_plan_latency_min_runs_match_quantile_min_n(pytester, columns, q, level, where):
+    if level is not None and where == "mark":
+        conf = f", confidence={level}"
+        ini = ""
+    else:
+        conf = ""
+        ini = f"prob_confidence = {level}\n" if level is not None else ""
+    pytester.makeini(f"[pytest]\nprob_runs = 3\n{ini}")
+    pytester.makepyfile(
+        bench_lat=f"""
+import pytest
+
+@pytest.mark.probability(max_latency=1.0, latency_quantile={q}{conf})
+def bench_one():
+    pass
+"""
+    )
+    result = _run(pytester, "--prob-plan")
+    assert result.ret == 0
+    row = _table(result)[1].split()
+    want = stats.quantile_min_n(q, 0.95 if level is None else level)
+    assert row[:5] == ["one", "3", f"{want:,}", "—", "—"]
+
+
+def test_plan_latency_known_minimums():
+    assert stats.quantile_min_n(0.95) == 72
+    assert stats.quantile_min_n(0.5) == 6
+    assert stats.quantile_min_n(0.99) == 368
+
+
+def test_plan_latency_table_snapshot(pytester, columns):
+    pytester.makeini("[pytest]\nprob_runs = 40\n")
+    pytester.makepyfile(bench_lat=BENCH_LATENCY)
+    result = _run(pytester, "--prob-plan")
+    assert result.ret == 0
+    assert _table(result) == EXPECTED_LATENCY_TABLE
+    section = _section(result)
+    notes = section[section.index("", len(EXPECTED_LATENCY_TABLE) + 1) + 1 :]
+    labels = [ln.split("  ")[1] for ln in notes if not ln.startswith("    ")]
+    assert labels == [
+        "runs", "min runs", "runs for 80%", "chance now", "*", "catch 10%",
+        "catch 1%",
+    ]
+
+
+def test_plan_latency_quantile_alone_is_not_a_gate(pytester, columns):
+    # latency_quantile without max_latency only reports; nothing to plan.
+    pytester.makepyfile(
+        bench_lat="""
+import pytest
+
+@pytest.mark.probability(latency_quantile=0.99)
+def bench_one():
+    pass
+"""
+    )
+    result = _run(pytester, "--prob-plan", "--prob-runs=5", "--prob-plan-flake=0.1")
+    assert _table(result) == ["  case  runs  catch 10%", "  one      5        41%"]
+
+
+def _row_colours(result):
+    """Each table row's case name and the colour code it starts with
+    (``None``: plain)."""
+    import re
+
+    lines = result.stdout.lines
+    start = next(i for i, ln in enumerate(lines) if "probability: plan" in ln)
+    out = {}
+    for ln in lines[start + 2 :]:
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", ln)
+        if not plain.strip():
+            break
+        m = re.match(r"\x1b\[(?:[0-9;]*;)?(3[0-9])m", ln)
+        out[plain.split()[0]] = m.group(1) if m else None
+    return out
+
+
+def test_plan_latency_row_colours(pytester, columns):
+    pytester.makeini("[pytest]\nprob_runs = 40\n")
+    pytester.makepyfile(bench_lat=BENCH_LATENCY)
+    result = _run(pytester, "--prob-plan", "--color=yes")
+    red, green, yellow = "31", "32", "33"
+    assert _row_colours(result) == {
+        "latency_only": red,  # 40 < 72
+        "both": red,  # the rate gate's 36 is met, the latency gate's 72 isn't
+        "both_p50": green,  # 100 ≥ 36 and the rate gate's chance is 82%
+        "p99": None,  # above its minimum; its chance isn't planned
+        "rate_only": yellow,
+        "ungated": None,
+    }
+
+
+def test_plan_notes_latency_snapshot():
+    common = dict(
+        assume=0.97, power=0.8, flakes={0.1: 29}, level=0.95, report=None
+    )
+    unplanned = (
+        "A latency gate gets — here: its chance would need a guess at how"
+        " slow the code really is."
+    )
+    notes = dict(explain.plan_notes(gated=True, latency=True, both=True, **common))
+    assert notes["min runs"] == (
+        "Fewest runs with which the gate can pass at all: for a pass-rate"
+        " gate, only if every one of them passes; for a latency gate,"
+        " however fast they are, since with fewer its percentile's interval"
+        " has no upper end. A case with both gates needs the larger."
+    )
+    assert notes["runs for 80%"].endswith("not above the gate's bar. " + unplanned)
+    assert notes["*"] == (
+        "A latency gate also applies: the marked numbers are for the"
+        " pass-rate gate alone, and the latency gate's runs aren't planned"
+        " beyond its min runs."
+    )
+    only = explain.plan_notes(gated=False, latency=True, **common)
+    assert only == [
+        only[0],
+        (
+            "min runs",
+            "Fewest runs with which the latency gate can pass at all, however"
+            " fast they are: with fewer, its percentile's interval has no"
+            " upper end. It depends only on the percentile and the confidence"
+            " level.",
+        ),
+        (
+            "runs for 80%",
+            "Runs with which a pass-rate gate passes 80% of the time. " + unplanned,
+        ),
+        (
+            "chance now",
+            "The chance a pass-rate gate passes with the planned runs; — for a"
+            " latency gate, for the same reason.",
+        ),
+        only[-1],
+    ]
+    # without latency gates the notes are as before
+    assert explain.plan_notes(gated=True, **common) == explain.plan_notes(
+        gated=True, latency=False, both=False, **common
+    )
+    assert "*" not in dict(explain.plan_notes(gated=True, latency=True, **common))
