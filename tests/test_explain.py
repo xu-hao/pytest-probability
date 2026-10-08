@@ -313,12 +313,14 @@ def test_about_rounds_up_to_two_figures(n, text):
     assert explain.about(n) == text
 
 
-def _agg(counts, scope="function", name="classify", **cfg):
-    """An aggregate reading over cases with these (passes, runs)."""
+def _agg(counts, scope="function", name="classify", cost=0.0, **cfg):
+    """An aggregate reading over cases with these (passes, runs), each
+    case with ``cost`` recorded."""
     from pytest_probability.plugin import aggregate
 
     cases = [
-        CaseStats(f"{name}::{i}", p, n - p) for i, (p, n) in enumerate(counts)
+        CaseStats(f"{name}::{i}", p, n - p, cost=cost)
+        for i, (p, n) in enumerate(counts)
     ]
     cfg = StatsConfig(**cfg)
     return explain.aggregate_reading(
@@ -340,20 +342,85 @@ AGG_NEXT = (
 )
 # 12 inputs passing 2, 4, 6, 8, 10, 2, ... of 10 runs.
 AGG_COUNTS = [(i % 5 * 2 + 2, 10) for i in range(12)]
+# The same rates over single runs: ρ can't be measured.
+AGG_SINGLE = [(i % 2, 1) for i in range(12)]
+AGG_RHO = (
+    "ρ = {rho} measures how alike the runs of one input are, from 0 (an"
+    " input's runs differ as much as runs of different inputs) to 1 (every"
+    " run of an input gives the same result). {reading} With twice the runs"
+    " of every input the range would be {runs}; with twice as many inputs"
+    " (and as many runs each), about 29% narrower."
+)
+RHO_HIGH = (
+    "Here it is high enough that each input tends to be consistently right"
+    " or consistently wrong, so more runs of an input mostly repeat what you"
+    " already know about it."
+)
+RHO_LOW = (
+    "Here it is low enough that the outputs vary noticeably from run to run,"
+    " so more runs of an input still tell you more about it."
+)
+NEXT_INPUTS = (
+    "Next: to narrow the range, add inputs. More runs of the same inputs"
+    " would help much less."
+)
+NEXT_EITHER = (
+    "Next: to narrow the range, add runs or inputs: both help here, and"
+    " more runs are often easier, since they need no new inputs."
+)
 
 
 def test_aggregate_function_template():
     r = _agg(AGG_COUNTS)
-    assert r.heading == "classify  N=12 inputs × k=10  55.0%  [40.0%, 71.7%]"
+    assert r.heading == (
+        "classify  N=12 inputs × k=10  55.0%  [40.0%, 71.7%]  ρ=0.27"
+    )
     assert r.paragraphs == (
         "classify's 12 inputs passed 55.0% of their runs on average, each"
         " input counting equally. The true average pass rate is probably"
         " between 40.0% and 71.7% (95% confidence).",
         AGG_CAVEAT.format(who="classify"),
-        AGG_NEXT,
+        AGG_RHO.format(rho="0.27", reading=RHO_HIGH, runs="about 5% narrower"),
+        NEXT_INPUTS,
     )
     assert r.tone is None
+    assert r.terms == (("aggregate", (0.95, 5000, 0, 10)), ("icc", None))
+
+
+def test_aggregate_single_run_template():
+    # k = 1 everywhere: no ρ, and the general advice.
+    r = _agg(AGG_SINGLE)
+    assert r.heading == "classify  N=12 inputs × k=1  50.0%  [25.0%, 75.0%]"
+    assert r.paragraphs[1:] == (AGG_CAVEAT.format(who="classify"), AGG_NEXT)
     assert r.terms == (("aggregate", (0.95, 5000, 0, 10)),)
+
+
+def test_aggregate_low_rho_template():
+    # Every input near 50%: runs vary, inputs barely differ.
+    r = _agg([(5 + i % 3 - 1, 10) for i in range(12)])
+    assert r.heading.endswith("  ρ=0.00")
+    assert r.paragraphs[2:] == (
+        AGG_RHO.format(rho="0.00", reading=RHO_LOW, runs="about 29% narrower"),
+        NEXT_EITHER,
+    )
+
+
+def test_aggregate_no_variation_template():
+    # Every run passed: ρ is undefined, so it isn't shown.
+    r = _agg([(10, 10)] * 12)
+    assert "ρ" not in r.heading and "ρ" not in r.text()
+    assert r.paragraphs[-1] == AGG_NEXT
+
+
+def test_aggregate_cost_template():
+    # 12 inputs × 10 runs at $0.002 per case: doubling either way adds
+    # 120 runs at $0.0002 each.
+    r = _agg(AGG_COUNTS, cost=0.002)
+    assert r.paragraphs[2].endswith(
+        "about 29% narrower. Either way the number of runs doubles, so each"
+        " option would cost about $0.0240 more, assuming new inputs cost as"
+        " much per run as these did."
+    )
 
 
 def test_aggregate_overall_template():
@@ -364,19 +431,26 @@ def test_aggregate_overall_template():
     )
     assert "(90% confidence)" in r.paragraphs[0]
     assert r.paragraphs[1] == AGG_CAVEAT.format(who="your code")
-    assert r.terms == (("aggregate", (0.9, 5000, 3, 10)),)
+    assert r.terms == (("aggregate", (0.9, 5000, 3, 10)), ("icc", None))
 
 
 def test_aggregate_uneven_runs_template():
     r = _agg([(10, 10)] + [(0, 1)] * 9, name="mixed")
-    assert r.heading == "mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]"
+    assert r.heading == (
+        "mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]  ρ=1.00"
+    )
     assert r.paragraphs[0].startswith(
         "mixed's 10 inputs passed 10.0% of their runs on average, each input"
         " counting equally however many runs it had (1 to 10)."
     )
+    # every input always gives the same result: more runs can't help
+    assert r.paragraphs[2] == AGG_RHO.format(
+        rho="1.00", reading=RHO_HIGH, runs="no narrower"
+    )
 
 
 def test_aggregate_too_few_inputs_template():
+    # ρ is defined here (JSON has it), but there is no range to narrow
     r = _agg([(3, 4), (4, 4)], name="small")
     assert r.heading == "small  N=2 inputs × k=4  87.5%"
     assert r.text() == (
@@ -390,9 +464,14 @@ def test_aggregate_too_few_inputs_template():
 
 def test_aggregate_avoids_jargon():
     text = " ".join(
-        _agg(AGG_COUNTS).paragraphs + _agg([(1, 2), (2, 2)]).paragraphs
+        _agg(AGG_COUNTS, cost=0.01).paragraphs
+        + _agg([(1, 2), (2, 2)]).paragraphs
+        + _agg([(5 + i % 3 - 1, 10) for i in range(12)]).paragraphs
     ).lower()
-    for word in ("null hypothesis", "reject", "significant", "alpha", "cluster"):
+    for word in (
+        "null hypothesis", "reject", "significant", "alpha", "cluster",
+        "correlation", "variance", "anova",
+    ):
         assert word not in text
 
 
@@ -505,6 +584,33 @@ def test_glossary_aggregate_entry():
         )
     ]
     assert labels == ["[low, high]", "N inputs × k"]
+
+
+def test_glossary_icc_entry():
+    entries = _entries(("icc", None))
+    assert entries == {
+        "ρ": "How alike the runs of one input are (the intraclass"
+        " correlation), from 0 (an input's runs differ as much as runs of"
+        " different inputs) to 1 (every run of an input gives the same"
+        " result). Low: outputs vary from run to run, so more runs help."
+        " High: each input is consistently right or wrong, so add inputs"
+        ' instead. "runs ×2" and "inputs ×2" are how much the range would'
+        " narrow with twice the runs of every input, or twice as many inputs;"
+        " each doubles the number of runs, and the cost shown assumes new"
+        " inputs cost as much per run as these did. With few inputs ρ is"
+        " itself rough, so read them as a direction, not a promise. (One-way"
+        " analysis of variance on every run's pass or fail, adjusted for"
+        " inputs with different run counts, kept between 0 and 1; the range"
+        " scales with √((1+(k−1)ρ)/k) for k runs per input.)"
+    }
+    # right after the aggregate entry it belongs to
+    labels = [
+        label
+        for label, _ in explain.glossary(
+            [("icc", None), ("aggregate", (0.95, 5000, 0, 10))]
+        )
+    ]
+    assert labels == ["N inputs × k", "ρ"]
 
 
 def test_glossary_registry_is_extensible():
@@ -980,7 +1086,7 @@ def test_aggregate_explained(pytester, columns):
     blocks = _blocks(_section(result))
     # after the row readings, before the glossary
     assert blocks[-2] == (
-        "  classify  N=12 inputs × k=2  50.0%  [29.2%, 75.0%]",
+        "  classify  N=12 inputs × k=2  50.0%  [29.2%, 75.0%]  ρ=0.37",
         "    classify's 12 inputs passed 50.0% of their runs on average, each input",
         "    counting equally. The true average pass rate is probably between 29.2% and",
         "    75.0% (95% confidence).",
@@ -988,11 +1094,19 @@ def test_aggregate_explained(pytester, columns):
         "    will meet, so it allows for other inputs doing better or worse, not only for",
         "    runs varying. If you picked the inputs by hand rather than at random, it",
         "    measures the cases you chose, not inputs in general.",
-        "    Next: to narrow the range, add inputs. More runs of the same inputs narrow",
-        "    it less, often much less, because they can't show how other inputs would do.",
+        "    ρ = 0.37 measures how alike the runs of one input are, from 0 (an input's",
+        "    runs differ as much as runs of different inputs) to 1 (every run of an input",
+        "    gives the same result). Here it is high enough that each input tends to be",
+        "    consistently right or consistently wrong, so more runs of an input mostly",
+        "    repeat what you already know about it. With twice the runs of every input",
+        "    the range would be about 12% narrower; with twice as many inputs (and as",
+        "    many runs each), about 29% narrower.",
+        "    Next: to narrow the range, add inputs. More runs of the same inputs would",
+        "    help much less.",
     )
     glossary = blocks[-1]
     assert any(ln.startswith("    N inputs × k  An average over") for ln in glossary)
+    assert any(ln.startswith("    ρ             How alike the runs") for ln in glossary)
 
 
 def test_aggregate_not_explained_when_hidden(pytester, columns):
@@ -1011,7 +1125,9 @@ def test_aggregate_json_explanations(pytester, columns):
     by_name = {a["name"]: a["explanation"] for a in aggs}
     assert by_name["classify"].startswith("classify's 12 inputs passed 50.0%")
     assert by_name["classify"].endswith(
-        "because they can't show how other inputs would do."
+        "about 29% narrower.\n"
+        "Next: to narrow the range, add inputs. More runs of the same inputs"
+        " would help much less."
     )
     # too few inputs for a range: JSON only, and it says why
     assert by_name["wobbly"].endswith(

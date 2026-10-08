@@ -1380,6 +1380,13 @@ class Aggregate:
     canonical order — sorted by case id — which is the order the
     bootstrap draws from, so the result doesn't depend on the order
     results arrived in (xdist).
+
+    ``icc`` is the intraclass correlation ρ of the runs' pass/fail
+    outcomes (``stats.icc``) and ``width_factor`` the matching
+    ``stats.width_factor`` at the harmonic mean of the run counts; both
+    are ``None`` when ρ is not defined (every case run once, or every
+    run with the same outcome). ``cost`` is the cases' recorded cost,
+    which prices ``projection()``.
     """
 
     scope: str
@@ -1393,10 +1400,38 @@ class Aggregate:
     ci: tuple[float, float] | None = None
     normal_ci: tuple[float, float] | None = None
     suppressed: str | None = None
+    icc: float | None = None
+    width_factor: float | None = None
+    cost: float = 0.0
 
     @property
     def inputs(self) -> int:
         return len(self.cases)
+
+    @property
+    def harmonic_runs(self) -> float:
+        """The harmonic mean of the run counts: the k at which
+        ``width_factor`` describes this equally weighted average
+        exactly (the run count itself when every case has the same)."""
+        return statistics.harmonic_mean([n for _, n in self.counts])
+
+    def projection(self) -> tuple[float, float] | None:
+        """``(runs_x2, inputs_x2)``: the relative change in interval
+        width from doubling every case's runs, and from doubling the
+        number of cases (with runs like today's) — ``-0.29`` is 29%
+        narrower. ``None`` without ρ.
+
+        Both options double the number of runs, so at the cost per run
+        recorded so far each would add ``cost`` again (assuming new
+        inputs cost as much per run as these did).
+        """
+        if self.icc is None:
+            return None
+        k = self.harmonic_runs
+        return (
+            stats.projected_width(k, self.icc, runs=2.0) - 1.0,
+            stats.projected_width(k, self.icc, inputs=2.0) - 1.0,
+        )
 
     @property
     def runs(self) -> tuple[int, float, int]:
@@ -1436,6 +1471,8 @@ class Aggregate:
             "resampling_unit": "input",
             "note": "inputs treated as a sample",
             "suppressed": self.suppressed,
+            "icc": self.icc,
+            "width_factor": self.width_factor,
         }
 
 
@@ -1457,11 +1494,15 @@ def aggregate(
 
     Every value counts as given: under ``prob_errors = exclude`` errored
     runs still count as non-passes here, as they do in the row
-    fraction, because the exclusion is a gate setting.
+    fraction, because the exclusion is a gate setting — in ρ too, which
+    is computed from the same ``(passes, total)`` counts whatever
+    ``value`` is, and whether or not the interval is suppressed (it is
+    data; the summary shows it only beside an interval).
     """
     ordered = sorted(cases, key=lambda s: s.case)
     counts = tuple((s.passes, s.total) for s in ordered)
     values = [value(c, n) for c, n in counts]
+    rho = stats.icc(counts)
     agg = Aggregate(
         scope=scope,
         name=name,
@@ -1471,7 +1512,14 @@ def aggregate(
         level=cfg.level,
         resamples=cfg.resamples,
         seed=cfg.seed,
+        icc=rho,
+        # fsum is exactly rounded: the same total in any arrival order.
+        cost=math.fsum(s.cost for s in ordered),
     )
+    if rho is not None:
+        agg = dataclasses.replace(
+            agg, width_factor=stats.width_factor(agg.harmonic_runs, rho)
+        )
     if len(values) < cfg.min_inputs:
         # Too few inputs: the bootstrap's spread underestimates the
         # real uncertainty, so no interval rather than a misleading one.
@@ -1534,6 +1582,17 @@ def _pct1(p: float) -> str:
     elif tenths <= 0 and p > 0.0:
         tenths = 1
     return f"{tenths / 10:.1f}%"
+
+
+def _change(c: float) -> str:
+    """A relative change in interval width as a whole percent with a
+    real minus sign — ``−22%``. A shrink too small to round to 1% is
+    ``−<1%`` and no change at all is ``±0%``, so ``−0%`` never shows."""
+    pct = math.floor(abs(c) * 100 + 0.5)
+    if abs(c) < 1e-12:
+        return "±0%"
+    sign = "−" if c < 0 else "+"
+    return f"{sign}{pct}%" if pct else f"{sign}<1%"
 
 
 def _row_name(s: CaseStats) -> str:
@@ -1827,8 +1886,11 @@ class ProbabilityAggregator:
 
     @staticmethod
     def _aggregate_lines(shown: list[Aggregate]) -> list[str]:
-        """``classify  N=40 inputs × k=10  81.4%  [75.0%, 87.2%]``, one
-        line per shown aggregate, columns aligned across them."""
+        """``classify  N=40 inputs × k=10  81.4%  [75.0%, 87.2%]  ρ=0.60``,
+        one line per shown aggregate, columns aligned across them. An
+        aggregate with a ρ gets a continuation line under its size —
+        ``runs ×2 → interval −2%  ·  inputs ×2 → −29%`` — priced when
+        cost was recorded."""
         if not shown:
             return []
         name_col = max(len(a.name) for a in shown)
@@ -1839,11 +1901,23 @@ class ProbabilityAggregator:
         bounds = [tuple(_pct1(v) for v in a.ci) for a in shown]
         low_w = max(len(b[0]) for b in bounds)
         high_w = max(len(b[1]) for b in bounds)
-        return [
-            f"  {a.name:<{name_col}}  {size:<{size_col}}  {est:>{est_col}}"
-            f"  [{low:>{low_w}}, {high:>{high_w}}]"
-            for a, size, est, (low, high) in zip(shown, sizes, ests, bounds)
-        ]
+        lines = []
+        for a, size, est, (low, high) in zip(shown, sizes, ests, bounds):
+            line = (
+                f"  {a.name:<{name_col}}  {size:<{size_col}}  {est:>{est_col}}"
+                f"  [{low:>{low_w}}, {high:>{high_w}}]"
+            )
+            projection = a.projection()
+            if projection is None:
+                lines.append(line)
+                continue
+            lines.append(f"{line}  ρ={a.icc:.2f}")
+            runs, inputs = (_change(c) for c in projection)
+            more = f"runs ×2 → interval {runs}  ·  inputs ×2 → {inputs}"
+            if a.cost:
+                more += f"  ·  each +${a.cost:.4f}"
+            lines.append(" " * (name_col + 4) + more)
+        return lines
 
     def _aggregate_reading(self, agg: Aggregate):
         from . import explain

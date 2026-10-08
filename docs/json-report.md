@@ -82,7 +82,9 @@ only the controller writes it, with the full result set.
       "seed": 0,
       "resampling_unit": "input",
       "note": "inputs treated as a sample",
-      "suppressed": null
+      "suppressed": null,
+      "icc": 0.6033,
+      "width_factor": 0.8018541014424008
     }
   ],
   "records": [
@@ -169,6 +171,8 @@ Overall always is, even when the terminal leaves it out:
 | `resampling_unit` | `str` | Always `"input"`: whole cases are resampled, keeping all their runs |
 | `note` | `str` | Always `"inputs treated as a sample"`: the interval allows for a different set of inputs; for a hand-picked suite it measures the cases chosen, not a wider population |
 | `suppressed` | `str \| null` | Why there is no interval, e.g. `"fewer than 10 inputs"`; `null` when there is one |
+| `icc` | `float \| null` | ρ, the intraclass correlation of the runs' pass/fail outcomes (one-way ANOVA, adjusted for unequal run counts, clipped to [0, 1]): 0 when an input's runs vary as much as runs of different inputs, 1 when every run of an input gives the same result. `null` when every case ran once, or every run passed or every run failed. Computed even when `suppressed` |
+| `width_factor` | `float \| null` | √((1 + (k − 1)ρ)/k), with k the harmonic mean of the run counts: how much one input's runs pin down its pass rate compared with a single run (1/√k at ρ = 0, 1 at ρ = 1). The interval's width scales with `width_factor`/√N, so doubling the runs changes it by `width_factor(2k)/width_factor(k)` and doubling the inputs by 1/√2. `null` with `icc` |
 | `explanation` | `str` | Only with `--prob-explain`: the line in plain language, ending with a `Next:` line |
 
 The bootstrap draws from the cases in case-id order with the recorded
@@ -215,6 +219,12 @@ example as a PR comment (needs `--prob-explain`):
 ```bash
 jq -r '.rows[] | select(.gate and .gate.verdict != "pass")
     | "\(.case): \(.gate.verdict | ascii_upcase)\n\(.gate.explanation)\n"' report.json
+```
+
+List each function's ρ — high means add inputs rather than runs:
+
+```bash
+jq '.aggregates[] | select(.icc != null) | {name, icc, width_factor}' report.json
 ```
 
 Print each function's average and interval, with the cross-check:

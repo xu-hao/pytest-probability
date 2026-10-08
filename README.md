@@ -174,10 +174,19 @@ from a seeded bootstrap that re-draws whole cases, since runs of one
 input are correlated — and the session gets an `Overall` line:
 
 ```
-  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]
-  triage    N=15 inputs × k=5–10  71.3%  [61.3%, 80.7%]
-  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]
+  classify  N=40 inputs × k=10    81.0%  [69.5%, 90.8%]  ρ=0.76
+            runs ×2 → interval −1%  ·  inputs ×2 → −29%  ·  each +$0.0400
+  triage    N=15 inputs × k=5–10  59.3%  [47.3%, 70.7%]  ρ=0.09
+            runs ×2 → interval −15%  ·  inputs ×2 → −29%  ·  each +$0.0125
+  Overall   N=55 inputs × k=5–10  75.1%  [66.0%, 83.8%]  ρ=0.56
+            runs ×2 → interval −2%  ·  inputs ×2 → −29%  ·  each +$0.0525
 ```
+
+With more than one run per case, ρ says how alike an input's runs are,
+and the second line how much doubling the runs or the inputs would
+narrow the interval, at the recorded cost. Low ρ (triage): outputs vary
+from run to run, so more runs help. High ρ (classify): each input is
+consistently right or wrong, so add inputs instead.
 
 ## Options
 

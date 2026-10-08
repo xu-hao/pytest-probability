@@ -1867,12 +1867,16 @@ def bench_mixed(i):
 """
     )
     result = _run(pytester, "--prob-json=r.json")
+    # Each input gives the same result every time: ρ = 1, so more runs
+    # of them would not narrow the range at all.
     assert _aggregate_block(result) == [
-        "  mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]"
+        "  mixed  N=10 inputs × k=1–10  10.0%  [0.0%, 30.0%]  ρ=1.00",
+        "         runs ×2 → interval ±0%  ·  inputs ×2 → −29%",
     ]
     agg = _json(pytester)["aggregates"][0]
     assert agg["estimate"] == pytest.approx(0.1)
     assert agg["runs"] == {"min": 1, "mean": 1.9, "max": 10}
+    assert (agg["icc"], agg["width_factor"]) == (1.0, 1.0)
 
 
 def test_aggregate_counts_errors_as_non_passes(pytester):
@@ -1908,7 +1912,13 @@ def test_aggregate_json(pytester):
     assert set(classify) == {
         "scope", "name", "inputs", "runs", "estimate", "ci", "normal_ci",
         "resamples", "seed", "resampling_unit", "note", "suppressed",
+        "icc", "width_factor",
     }
+    # one run per case: no ρ to measure
+    assert all(
+        a["icc"] is None and a["width_factor"] is None
+        for a in data["aggregates"]
+    )
     est, ci, normal = _expected_aggregate(
         [c for c in AGG_COUNTS if c.startswith("classify")]
     )
@@ -2058,3 +2068,198 @@ def test_regular_suite_unchanged_by_aggregate_options(pytester):
     strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
     assert strip(base) == strip(with_opts)
     assert "= probability =" not in with_opts.stdout.str()
+
+
+# ---------------------------------------------------------------------------
+# Intraclass correlation and the runs-vs-inputs projection (#5)
+# ---------------------------------------------------------------------------
+
+# Under --prob-runs=2, classify's input i passes its first i % 3 runs
+# (0/2, 1/2, 2/2, ...), each run costing $0.001; triage's inputs 0 and 1
+# fail both runs and the rest pass. A per-process counter, so xdist
+# runs need --dist loadfile to keep a function's runs on one worker.
+BENCH_ICC = """
+import pytest
+from pytest_probability import record_cost
+
+_calls = {}
+
+@pytest.mark.parametrize("i", range(10))
+def bench_classify(i):
+    _calls[i] = _calls.get(i, 0) + 1
+    record_cost(0.001)
+    assert _calls[i] <= i % 3
+"""
+
+BENCH_ICC_TRIAGE = """
+import pytest
+
+@pytest.mark.parametrize("i", range(10))
+def bench_triage(i):
+    assert i >= 2
+"""
+
+ICC_COUNTS = {
+    "classify": [(i % 3, 2) for i in range(10)],
+    "triage": [(2 * (i >= 2), 2) for i in range(10)],
+}
+
+
+def _expected_icc(counts):
+    """(ρ, width factor, runs ×2 change, inputs ×2 change) straight from
+    the stats module."""
+    from pytest_probability import stats
+
+    k = len(counts) / sum(1 / n for _, n in counts)
+    rho = stats.icc(counts)
+    return (
+        rho,
+        stats.width_factor(k, rho),
+        stats.projected_width(k, rho, runs=2) - 1,
+        stats.projected_width(k, rho, inputs=2) - 1,
+    )
+
+
+def test_icc_line_and_projection(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC)
+    result = _run(pytester, "--prob-runs=2", "--prob-json=r.json")
+    rho, _, runs, inputs = _expected_icc(ICC_COUNTS["classify"])
+    assert (round(rho, 2), round(runs * 100), round(inputs * 100)) == (0.44, -10, -29)
+    # 10 inputs × 2 runs × $0.001: either option adds 20 more runs
+    assert _aggregate_block(result) == [
+        "  classify  N=10 inputs × k=2  45.0%  [20.0%, 70.0%]  ρ=0.44",
+        "            runs ×2 → interval −10%  ·  inputs ×2 → −29%  ·  each +$0.0200",
+    ]
+
+
+def test_icc_line_without_cost(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC.replace("record_cost(0.001)", "pass"))
+    result = _run(pytester, "--prob-runs=2")
+    assert _aggregate_block(result)[1] == (
+        "            runs ×2 → interval −10%  ·  inputs ×2 → −29%"
+    )
+
+
+def test_icc_columns_align_across_functions(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC, bench_triage=BENCH_ICC_TRIAGE)
+    result = _run(pytester, "--prob-runs=2")
+    block = _aggregate_block(result)
+    names = [ln.split()[0] for ln in block if not ln.startswith("     ")]
+    assert names == ["classify", "triage", "Overall"]
+    # every main line has ρ in the same column, every continuation line
+    # starts under the size column
+    mains = [ln for ln in block if not ln.startswith("     ")]
+    assert len({ln.index("ρ=") for ln in mains}) == 1
+    conts = [ln for ln in block if ln.startswith("     ")]
+    assert len(conts) == 3
+    assert {len(ln) - len(ln.lstrip()) for ln in conts} == {
+        mains[0].index("N=")
+    }
+    # triage's inputs always give the same result
+    assert "ρ=1.00" in mains[1] and "runs ×2 → interval ±0%" in conts[1]
+
+
+def test_icc_hidden_with_its_line(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC)
+    # too few inputs for a line: no ρ either, but the JSON has it
+    result = _run(pytester, "--prob-runs=2", "-o", "prob_min_inputs=11",
+                  "--prob-json=r.json")
+    assert _aggregate_block(result) == []
+    assert "ρ" not in result.stdout.str()
+    agg = _json(pytester)["aggregates"][0]
+    assert agg["ci"] is None and agg["icc"] == _expected_icc(ICC_COUNTS["classify"])[0]
+    result = _run(pytester, "--prob-runs=2", "--prob-no-intervals")
+    assert _aggregate_block(result) == []
+    assert "ρ" not in result.stdout.str()
+
+
+def test_icc_omitted_for_single_runs(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC)
+    result = _run(pytester, "--prob-json=r.json")
+    block = _aggregate_block(result)
+    assert len(block) == 1 and "ρ" not in block[0]
+    agg = _json(pytester)["aggregates"][0]
+    assert agg["icc"] is None and agg["width_factor"] is None
+
+
+def test_icc_json(pytester):
+    pytester.makepyfile(bench_icc=BENCH_ICC, bench_triage=BENCH_ICC_TRIAGE)
+    _run(pytester, "--prob-runs=2", "--prob-json=r.json")
+    aggs = {a["name"]: a for a in _json(pytester)["aggregates"]}
+    for name, counts in ICC_COUNTS.items():
+        rho, factor, _, _ = _expected_icc(counts)
+        assert (aggs[name]["icc"], aggs[name]["width_factor"]) == (rho, factor)
+    rho, factor, _, _ = _expected_icc(ICC_COUNTS["classify"] + ICC_COUNTS["triage"])
+    assert aggs["Overall"]["icc"] == pytest.approx(rho)
+    assert aggs["Overall"]["width_factor"] == pytest.approx(factor)
+
+
+def test_icc_counts_errors_as_non_passes():
+    # The same counts as the row: errored runs are non-passes, whatever
+    # a gate does with them.
+    from pytest_probability import stats
+    from pytest_probability.plugin import CaseStats, StatsConfig, aggregate
+
+    cases = [CaseStats(f"f::{i}", passes=i % 3, errors=2 - i % 3) for i in range(10)]
+    agg = aggregate("function", "f", cases, StatsConfig())
+    assert agg.icc == stats.icc([(i % 3, 2) for i in range(10)])
+
+
+def test_icc_uses_harmonic_mean_of_runs():
+    from pytest_probability import stats
+    from pytest_probability.plugin import CaseStats, StatsConfig, aggregate
+
+    runs = [2, 4, 4, 8, 8, 8, 2, 4, 4, 8]
+    cases = [
+        CaseStats(f"f::{i}", passes=n // 2 + (i % 2), fails=n - n // 2 - (i % 2))
+        for i, n in enumerate(runs)
+    ]
+    agg = aggregate("function", "f", cases, StatsConfig(), value=lambda c, n: c == n)
+    k_h = len(runs) / sum(1 / n for n in runs)
+    assert agg.harmonic_runs == pytest.approx(k_h)
+    assert agg.icc == stats.icc(agg.counts)
+    assert agg.width_factor == pytest.approx(stats.width_factor(k_h, agg.icc))
+    runs_x2, inputs_x2 = agg.projection()
+    assert runs_x2 == pytest.approx(stats.projected_width(k_h, agg.icc, runs=2) - 1)
+    assert inputs_x2 == pytest.approx(2 ** -0.5 - 1)
+
+
+def test_projection_cost_is_recorded_cost():
+    from pytest_probability.plugin import CaseStats, StatsConfig, aggregate
+
+    cases = [
+        CaseStats(f"f::{i}", passes=i % 3, fails=2 - i % 3, cost=0.1 * (i + 1))
+        for i in range(10)
+    ]
+    agg = aggregate("function", "f", cases, StatsConfig())
+    # doubling either the runs or the inputs doubles the number of runs:
+    # at today's cost per run, each adds today's total again
+    assert agg.cost == pytest.approx(5.5)
+
+
+@pytest.mark.parametrize(
+    "change, text",
+    [(-0.2241, "−22%"), (-0.0157, "−2%"), (-0.2929, "−29%"), (-0.004, "−<1%"),
+     (0.0, "±0%"), (-1e-15, "±0%"), (0.05, "+5%")],
+)
+def test_change_format(change, text):
+    from pytest_probability.plugin import _change
+
+    assert _change(change) == text
+
+
+def test_xdist_icc_parity(pytester):
+    pytest.importorskip("xdist")
+    pytester.makepyfile(bench_icc=BENCH_ICC, bench_triage=BENCH_ICC_TRIAGE)
+    args = ("--prob-runs=2", "--prob-explain")
+    serial = _run(pytester, *args, "--prob-json=serial.json")
+    # loadfile keeps each function's runs on one worker (the counter is
+    # per process); the two files still interleave their results
+    dist = _run(
+        pytester, *args, "--prob-json=dist.json", "-n", "2", "--dist", "loadfile"
+    )
+    assert _aggregate_block(serial) == _aggregate_block(dist)
+    assert sum("ρ=" in ln for ln in _aggregate_block(serial)) == 3
+    s = _json(pytester, "serial.json")["aggregates"]
+    assert s == _json(pytester, "dist.json")["aggregates"]
+    assert all(a["icc"] is not None and "ρ = " in a["explanation"] for a in s)

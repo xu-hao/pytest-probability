@@ -379,8 +379,10 @@ sample.
   classify::identify_pii   7/10  [35%,  93%]  $0.0020  FLAKY
    \_ function::case-id  \_ fraction  \_ interval  \_ cost  \_ status (omitted when pass)
 
-  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]   # functions with ≥10 cases,
-  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]   # then all of them
+  classify  N=40 inputs × k=10    81.0%  [69.5%, 90.8%]  ρ=0.76   # functions with ≥10 cases,
+            runs ×2 → interval −1%  ·  inputs ×2 → −29%  ·  each +$0.0400   # ρ: only with >1 run
+  Overall   N=55 inputs × k=5–10  75.1%  [66.0%, 83.8%]  ρ=0.56   # then all of them
+            runs ×2 → interval −2%  ·  inputs ×2 → −29%  ·  each +$0.0525   # cost: only when recorded
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Gates:   3 passed, 1 failed, 1 undecided     # only when a case is gated
@@ -468,7 +470,11 @@ interval method and level actually in effect:
   left out under `prob_errors = exclude` are called out.
 - Each [function-level line](#function-level-intervals) gets a reading
   too: the average, its range, the "inputs treated as a sample"
-  caveat, and a next step.
+  caveat, and a next step. When the line shows a
+  [ρ](#runs-or-inputs), the reading says in words what it means for
+  this function, how much doubling the runs or the inputs would narrow
+  the range and what that would cost, and the next step follows from
+  those numbers.
 - Under pytest-xdist the controller writes the section from the
   aggregated counts, so it reads the same as a serial run.
 
@@ -497,10 +503,17 @@ cases (10 by default) gets one line for the function as a whole, and
 an `Overall` line covers every case in the session:
 
 ```text
-  classify  N=40 inputs × k=10    83.0%  [75.5%, 89.8%]
-  triage    N=15 inputs × k=5–10  71.3%  [61.3%, 80.7%]
-  Overall   N=55 inputs × k=5–10  79.8%  [73.6%, 85.6%]
+  classify  N=40 inputs × k=10    81.0%  [69.5%, 90.8%]  ρ=0.76
+            runs ×2 → interval −1%  ·  inputs ×2 → −29%  ·  each +$0.0400
+  triage    N=15 inputs × k=5–10  59.3%  [47.3%, 70.7%]  ρ=0.09
+            runs ×2 → interval −15%  ·  inputs ×2 → −29%  ·  each +$0.0125
+  Overall   N=55 inputs × k=5–10  75.1%  [66.0%, 83.8%]  ρ=0.56
+            runs ×2 → interval −2%  ·  inputs ×2 → −29%  ·  each +$0.0525
 ```
+
+(ρ and the indented line below each are explained in
+[Runs or inputs?](#runs-or-inputs); they appear only when cases have
+more than one run.)
 
 - **N inputs × k:** the number of cases (inputs) and the runs each
   had; a range like `k=5–10` when run counts differ.
@@ -535,6 +548,57 @@ an `Overall` line covers every case in the session:
   `--prob-no-intervals` hides the whole block. The JSON report's
   `aggregates[]` always has every function and Overall, with a
   normal-approximation interval as a cross-check.
+
+### Runs or inputs?
+
+When the cases have more than one run, each function-level line also
+shows **ρ**, and a second line says how much the interval would narrow
+with twice the runs or twice the inputs (the example above):
+
+- **ρ** (the intraclass correlation) says how alike the runs of one
+  input are, from 0 to 1:
+  - **Low ρ** (triage): the outputs vary from run to run, so more runs
+    help — here doubling them narrows the interval about half as much
+    as doubling the inputs.
+  - **High ρ** (classify): each input is consistently right or
+    consistently wrong, so more runs of it mostly repeat what you
+    already know: add inputs instead.
+- **How it is estimated:** a one-way analysis of variance on the
+  pass/fail outcome of every run, with inputs as the groups — ICC(1).
+  Cases with different run counts use the adjusted average group size
+  k₀ = (Σkᵢ − Σkᵢ²/Σkᵢ)/(N − 1). Errored runs count as non-passes, as
+  in the estimate. The estimate can come out below 0 when inputs are
+  more alike than chance allows; it is clipped to [0, 1].
+- **The projection:** an interval over N inputs with k runs each has a
+  width proportional to √((1 + (k − 1)ρ)/k)/√N. Doubling the inputs
+  always narrows it by 1 − 1/√2, about 29%; doubling every case's runs
+  narrows it by that much at ρ = 0 and not at all at ρ = 1. At k = 10
+  going to 20 runs:
+
+  | ρ | runs ×2 | inputs ×2 |
+  |---|---|---|
+  | 0.025 | −22% | −29% |
+  | 0.3 | −5% | −29% |
+  | 0.6 | −2% | −29% |
+
+  With different run counts per case, k is their harmonic mean, which
+  is exact for the equally weighted average. `−<1%` is a change too
+  small to round to 1%; `±0%` is none at all (ρ = 1).
+- **Cost:** both options double the number of runs, so at the function's
+  average cost per run each adds the function's recorded cost again;
+  the line assumes new inputs cost as much per run as the existing
+  ones. The `each +$…` part appears only when cost was recorded.
+- **When it is left out:** when every case ran once (nothing to
+  compare within an input), and when every run passed or every run
+  failed (no variation to split, so ρ is undefined). Like the interval
+  line itself, it needs `prob_min_inputs` cases and is hidden by
+  `--prob-no-intervals`. The `Overall` line gets its own ρ over every
+  case.
+- ρ is an estimate too, and a rough one with few inputs: read the
+  projection as a direction, not a promise.
+- The JSON report's `aggregates[]` carry `icc` and `width_factor`
+  (`null` when ρ is left out), for every function, including those
+  without a terminal line.
 
 ## Exit status
 
