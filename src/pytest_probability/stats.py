@@ -32,6 +32,9 @@ Contents:
 - **Repeated attempts** — ``pass_hat_k`` (pass^k, all k attempts at
   an input pass) and ``pass_at_k`` (pass@k, at least one does): the
   unbiased estimators from c passes in n runs.
+- **Planning** — ``detection_chance`` (the chance n runs show at least
+  one failure) and ``runs_to_see_failure`` (the runs that make that
+  chance reach a level), for ``--prob-plan``.
 
 Conventions:
 
@@ -857,3 +860,43 @@ def pass_at_k(passes: int, runs: int, k: int) -> float:
     c, n, k = _check_attempts(passes, runs, k)
     total = math.comb(n, k)
     return (total - math.comb(n - c, k)) / total
+
+
+# ---------------------------------------------------------------------------
+# Planning: catching a rare failure
+# ---------------------------------------------------------------------------
+
+
+def detection_chance(rate: float, n: int) -> float:
+    """1 − (1 − rate)ⁿ: the chance that n independent runs show at least
+    one failure when each run fails with probability ``rate``."""
+    rate = _check_unit("rate", rate)
+    n = _check_int("n", n)
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+    if rate == 1.0:
+        return 1.0 if n else 0.0
+    return -math.expm1(n * math.log1p(-rate))
+
+
+def runs_to_see_failure(rate: float, level: float = 0.95) -> int:
+    """Fewest runs that show at least one failure with probability
+    ``level`` when each run fails with probability ``rate``:
+    ⌈ln(1 − level)/ln(1 − rate)⌉ — 29 at 10% and 299 at 1% for 95%.
+
+    The closed form is then nudged by whole runs against
+    ``detection_chance`` so floating-point rounding at an exact
+    boundary can't make it one off.
+    """
+    rate = _check_unit("rate", rate)
+    level = _check_level(level)
+    if rate == 0.0:
+        raise ValueError("rate must be positive: a run that never fails is never seen")
+    if rate == 1.0:
+        return 1
+    n = max(1, math.ceil(math.log1p(-level) / math.log1p(-rate)))
+    while n > 1 and detection_chance(rate, n - 1) >= level:
+        n -= 1
+    while detection_chance(rate, n) < level:
+        n += 1
+    return n

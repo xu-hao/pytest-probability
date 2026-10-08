@@ -270,6 +270,40 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         " per function; comma-separated and repeatable, e.g."
         " --prob-metric=pass^3,pass@5 (default: prob_metric ini or none)",
     )
+    group.addoption(
+        "--prob-plan",
+        dest="prob_plan",
+        action="store_true",
+        default=False,
+        help="Collect, print a run budget per case (runs needed to pass a"
+        " gate, to catch a rare failure, projected cost) and exit without"
+        " running anything",
+    )
+    group.addoption(
+        "--prob-plan-assume",
+        dest="prob_plan_assume",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help="--prob-plan: the true pass rate to plan for, strictly between"
+        f" 0 and 1 (default: {_PLAN_ASSUME:g})",
+    )
+    group.addoption(
+        "--prob-plan-flake",
+        dest="prob_plan_flake",
+        default=None,
+        metavar="RATES",
+        help="--prob-plan: comma-separated failure rates to plan to catch"
+        f" (default: {_PLAN_FLAKE})",
+    )
+    group.addoption(
+        "--prob-plan-report",
+        dest="prob_plan_report",
+        default=None,
+        metavar="PATH",
+        help="--prob-plan: a previous --prob-json report to read each"
+        " case's cost per run from, to project the cost of the plan",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -546,6 +580,7 @@ def pytest_configure(config: pytest.Config) -> None:
     gate_config(config)
     compare_config(config)
     metrics_config(config)
+    plan_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -888,6 +923,65 @@ class Gate:
             else:
                 low = mid
         return high
+
+    def critical_passes(self, n: int) -> int | None:
+        """Fewest passes out of n runs that make the verdict PASS, or
+        ``None`` when even n of n doesn't.
+
+        More passes out of the same runs never make a verdict worse, so
+        the passing counts are exactly ``critical_passes(n)`` to n, and
+        bisection over the count finds the boundary.
+        """
+        if self.verdict(n, n) != PASS:
+            return None
+        low, high = -1, n  # verdict(low) is not PASS, verdict(high) is
+        while high - low > 1:
+            mid = (low + high) // 2
+            if self.verdict(mid, n) == PASS:
+                high = mid
+            else:
+                low = mid
+        return high
+
+    def power(self, n: int, rate: float) -> float:
+        """The chance that n runs give a PASS verdict when every run
+        passes with probability ``rate``: the Binomial(n, rate)
+        probability of at least ``critical_passes(n)`` passes."""
+        critical = self.critical_passes(n)
+        if critical is None:
+            return 0.0
+        return stats.binom_sf(critical - 1, n, rate)
+
+    def runs_for_power(
+        self, rate: float, target: float = 0.8, cap: int = 10_000
+    ) -> int | None:
+        """Fewest runs n ≤ ``cap`` with ``power(n, rate) ≥ target``, or
+        ``None`` when no n up to ``cap`` gets there — always the case
+        for a rate gate whose bar is at or above ``rate``.
+
+        Power is not monotone in n: the passing count moves in whole
+        runs, so it saw-tooths on its way up. So after checking that
+        ``cap`` itself is enough, every n from ``min_runs()`` is tried
+        in turn. The passing count rises by at most one per extra run
+        (an extra failure only lowers the interval, an extra pass only
+        raises it), so it is tracked incrementally — about one verdict
+        per n rather than a bisection.
+        """
+        if self.rule == "rate" and rate <= self.min_rate:
+            return None
+        start = self.min_runs()
+        if start > cap or self.power(cap, rate) < target:
+            return None
+        critical = self.critical_passes(start)
+        for n in range(start, cap + 1):
+            if n > start:
+                # Fewer than last time's count still fails (one more
+                # failure can't help), so only ever step up.
+                while self.verdict(critical, n) != PASS:
+                    critical += 1
+            if stats.binom_sf(critical - 1, n, rate) >= target:
+                return n
+        return cap  # pragma: no cover - power(cap) ≥ target was checked
 
     def bar(self) -> str:
         """The bar as the gates block prints it: ``≥90%``, ``≥19 passes``."""
@@ -2354,6 +2448,172 @@ def comparisons_of(
     return adjust_comparisons(out, adjust)
 
 
+# ---------------------------------------------------------------------------
+# Planning (--prob-plan)
+# ---------------------------------------------------------------------------
+
+# The true pass rate a plan assumes, the failure rates it plans to
+# catch, the chance it asks a gate to pass with, and how far it looks.
+_PLAN_ASSUME = 0.97
+_PLAN_FLAKE = "0.1,0.01"
+_PLAN_POWER = 0.8
+_PLAN_CAP = 10_000
+
+
+@dataclass(frozen=True)
+class PlanConfig:
+    """``--prob-plan``'s settings: the assumed true pass rate, the
+    failure rates to catch, and each case's cost per run from a
+    previous report (``costs`` is empty without one)."""
+
+    assume: float = _PLAN_ASSUME
+    flakes: tuple[float, ...] = (0.1, 0.01)
+    report: str | None = None
+    costs: dict[str, float] = field(default_factory=dict, compare=False)
+
+
+_PLAN_CONFIG = pytest.StashKey["PlanConfig | None"]()
+
+
+def _parse_rates(raw: Any, source: str) -> tuple[float, ...]:
+    parts = [p.strip() for p in str(raw).split(",")]
+    if not all(parts):
+        raise pytest.UsageError(
+            f"{source} must be comma-separated rates strictly between 0 and 1"
+            f" (e.g. 0.1,0.01), got {raw!r}"
+        )
+    rates = tuple(_parse_level(p, source) for p in parts)
+    return tuple(dict.fromkeys(rates))
+
+
+def _read_plan_costs(path: str) -> dict[str, float]:
+    """Cost per run of every case in a ``--prob-json`` report: its
+    ``rows[].cost`` over ``rows[].total``."""
+    source = "--prob-plan-report"
+    try:
+        payload = json.loads(Path(path).read_text())
+    except OSError as exc:
+        raise pytest.UsageError(
+            f"{source}: cannot read {path}: {exc.strerror or exc}"
+        ) from None
+    except ValueError as exc:
+        raise pytest.UsageError(f"{source}: {path} is not JSON: {exc}") from None
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise pytest.UsageError(
+            f"{source}: {path} is not a pytest-probability report (no rows)"
+        )
+    costs: dict[str, float] = {}
+    for row in rows:
+        try:
+            case, cost, total = row["case"], float(row["cost"]), int(row["total"])
+        except (KeyError, TypeError, ValueError):
+            raise pytest.UsageError(
+                f"{source}: {path} has a row without case, cost and total"
+            ) from None
+        if total > 0 and math.isfinite(cost):
+            costs[str(case)] = cost / total
+    return costs
+
+
+def _resolve_plan_config(config: pytest.Config) -> PlanConfig | None:
+    assume = config.getoption("prob_plan_assume")
+    assume = (
+        _PLAN_ASSUME if assume is None else _parse_level(assume, "--prob-plan-assume")
+    )
+    flake = config.getoption("prob_plan_flake")
+    flakes = _parse_rates(
+        _PLAN_FLAKE if flake is None else flake, "--prob-plan-flake"
+    )
+    if not config.getoption("prob_plan"):
+        return None
+    report = config.getoption("prob_plan_report")
+    costs = _read_plan_costs(report) if report else {}
+    return PlanConfig(assume=assume, flakes=flakes, report=report, costs=costs)
+
+
+def plan_config(config: pytest.Config) -> PlanConfig | None:
+    """The session's ``PlanConfig``, or ``None`` without ``--prob-plan``
+    (validated at configure)."""
+    if _PLAN_CONFIG not in config.stash:
+        config.stash[_PLAN_CONFIG] = _resolve_plan_config(config)
+    return config.stash[_PLAN_CONFIG]
+
+
+@dataclass(frozen=True)
+class PlanRow:
+    """One case's budget. ``runs`` is what would run (selection
+    applied); the gate columns are ``None`` for an ungated case, and
+    ``power_runs`` also when no run count up to the cap gets there.
+    ``cost_per_run`` is ``None`` when no report priced the case."""
+
+    case: str
+    runs: int
+    gate: Gate | None
+    min_runs: int | None = None
+    power_runs: int | None = None
+    chance: float | None = None
+    cost_per_run: float | None = None
+
+    @property
+    def cost(self) -> float | None:
+        if self.cost_per_run is None:
+            return None
+        return self.cost_per_run * self.runs
+
+
+def plan_rows(items: Iterable[pytest.Item], pcfg: PlanConfig) -> list[PlanRow]:
+    """The plan for the bench items that would run, one row per case
+    in collection order. A gate's numbers don't depend on its planned
+    run count, so they are worked out once per distinct gate."""
+    cases: OrderedDict[str, list[Any]] = OrderedDict()
+    for item in items:
+        if isinstance(item, BenchItem):
+            entry = cases.setdefault(item.case, [0, item.gate])
+            entry[0] += 1
+    per_gate: dict[Gate, tuple[int, int | None]] = {}
+    rows = []
+    for case, (runs, gate) in cases.items():
+        extra: dict[str, Any] = {"cost_per_run": pcfg.costs.get(case)}
+        if gate is not None:
+            key = dataclasses.replace(gate, runs=0)
+            if key not in per_gate:
+                per_gate[key] = (
+                    gate.min_runs(),
+                    gate.runs_for_power(pcfg.assume, _PLAN_POWER, _PLAN_CAP),
+                )
+            extra["min_runs"], extra["power_runs"] = per_gate[key]
+            extra["chance"] = gate.power(runs, pcfg.assume)
+        rows.append(PlanRow(case, runs, gate, **extra))
+    return rows
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config: pytest.Config):
+    # A plan runs nothing, so it needs no workers — and an xdist
+    # controller never collects, so it would have nothing to plan.
+    # Turning -n off before xdist reads it keeps the plan in this
+    # process.
+    if config.getoption("prob_plan") and hasattr(config.option, "numprocesses"):
+        config.option.numprocesses = 0
+    yield
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtestloop(session: pytest.Session):
+    if plan_config(session.config) is None:
+        return None
+    # pytest's own runtestloop stops on collection errors; so does a plan.
+    if session.testsfailed and not session.config.option.continue_on_collection_errors:
+        raise session.Interrupted(
+            f"{session.testsfailed} error{'s' if session.testsfailed != 1 else ''}"
+            " during collection"
+        )
+    aggregator = session.config.pluginmanager.get_plugin("probability-aggregator")
+    aggregator.plan = plan_rows(session.items, plan_config(session.config))
+    return True
+
+
 _MARKUP = {
     "pass": {"green": True},
     "flaky": {"yellow": True},
@@ -2387,6 +2647,13 @@ def _pct(p: float) -> str:
     elif pct <= 0 and p > 0.0:
         pct = 1
     return f"{pct}%"
+
+
+def _chance(p: float) -> str:
+    """A planned chance as a whole percent. Rates strictly between 0
+    and 1 never make one certain, so ``100%`` is never printed even
+    when the float rounds to 1.0; ``0%`` still means impossible."""
+    return _pct(min(p, 0.999))
 
 
 def _pct1(p: float) -> str:
@@ -2646,7 +2913,13 @@ class ProbabilityAggregator:
     def __init__(self, config: pytest.Config) -> None:
         self._config = config
         self._stats: OrderedDict[str, CaseStats] = OrderedDict()
-        self._json_path = config.getoption("prob_json")
+        # --prob-plan runs nothing, so it never writes a report: it
+        # would only overwrite the last real one.
+        self._json_path = (
+            None if config.getoption("prob_plan") else config.getoption("prob_json")
+        )
+        # --prob-plan's rows, set by pytest_runtestloop instead of running.
+        self.plan: list[PlanRow] | None = None
         self._explain = _explain(config)
         # Raw per-run records, kept only when a JSON report was
         # requested.
@@ -3113,8 +3386,95 @@ class ProbabilityAggregator:
         for line, tone in explain.render_section(readings, width, extra):
             tr.write_line(line, **markup.get(tone, {}))
 
+    def _write_plan(self, tr, rows: list[PlanRow]) -> None:
+        from . import explain
+
+        pcfg = plan_config(self._config)
+        level = stats_config(self._config).level
+        gated = any(r.gate is not None for r in rows)
+        priced = any(r.cost is not None for r in rows)
+
+        def runs_cell(r: PlanRow) -> str:
+            if r.gate is None:
+                return "—"
+            if r.power_runs is not None:
+                return f"{r.power_runs:,}"
+            if r.gate.rule == "rate" and pcfg.assume <= r.gate.min_rate:
+                return "never"
+            return f">{_PLAN_CAP:,}"
+
+        header = ["case", "runs"]
+        if gated:
+            header += ["min runs", "runs for 80%", "chance now"]
+        header += [f"catch {_pct_bar(f)}" for f in pcfg.flakes]
+        if priced:
+            header.append("cost")
+        table = []
+        for r in rows:
+            cells = [_row_name(r), f"{r.runs:,}"]
+            if gated:
+                if r.gate is None:
+                    cells += ["—", "—", "—"]
+                else:
+                    cells += [f"{r.min_runs:,}", runs_cell(r), _chance(r.chance)]
+            cells += [_chance(stats.detection_chance(f, r.runs)) for f in pcfg.flakes]
+            if priced:
+                cells.append("" if r.cost is None else f"${r.cost:.4f}")
+            table.append(cells)
+        widths = [max(len(c[i]) for c in [header, *table]) for i in range(len(header))]
+
+        def line(cells: list[str]) -> str:
+            first = f"  {cells[0]:<{widths[0]}}"
+            rest = "".join(f"  {c:>{w}}" for c, w in zip(cells[1:], widths[1:]))
+            return (first + rest).rstrip()
+
+        tr.write_sep("=", "probability: plan")
+        tr.write_line(line(header), bold=True)
+        for r, cells in zip(rows, table):
+            tr.write_line(line(cells), **_MARKUP.get(self._plan_tone(r), {}))
+        tr.write_line("")
+        total = sum(r.runs for r in rows)
+        cases = f"{len(rows)} case{'s' if len(rows) != 1 else ''}"
+        tr.write_line(
+            f"  Plan:    {cases}, {total:,} run{'s' if total != 1 else ''};"
+            " nothing was run.",
+            bold=True,
+        )
+        if pcfg.report is not None:
+            unpriced = sum(r.cost is None for r in rows)
+            cost = f"  Cost:    ${math.fsum(r.cost or 0.0 for r in rows):.4f} projected"
+            cost += f" from {pcfg.report}"
+            if unpriced:
+                cost += f" ({unpriced} case{'s' if unpriced != 1 else ''} not in it)"
+            tr.write_line(cost)
+        tr.write_line("")
+        width = getattr(getattr(tr, "_tw", None), "fullwidth", 80)
+        notes = explain.plan_notes(
+            assume=pcfg.assume,
+            power=_PLAN_POWER,
+            flakes={f: stats.runs_to_see_failure(f, level) for f in pcfg.flakes},
+            level=level,
+            gated=gated,
+            report=pcfg.report if priced else None,
+        )
+        for text in explain.render_notes(notes, width):
+            tr.write_line(text)
+
+    @staticmethod
+    def _plan_tone(r: PlanRow) -> str | None:
+        # Red: the gate can't pass with these runs; yellow: it passes
+        # less than 80% of the time at the assumed rate; green: enough.
+        if r.gate is None:
+            return None
+        if r.runs < r.min_runs:
+            return "fail"
+        return "pass" if r.chance >= _PLAN_POWER else "flaky"
+
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:
         del exitstatus, config
+        if self.plan:
+            self._write_plan(terminalreporter, self.plan)
+            return
         if not self._stats:
             return
         all_stats = list(self._stats.values())

@@ -1204,3 +1204,83 @@ def render_section(
     # Never wrapped: a broken URL can't be clicked.
     lines.append((f"{_HEAD_INDENT}Full guide: {GUIDE_URL}", None))
     return lines
+
+
+# ---------------------------------------------------------------------------
+# --prob-plan: one note per column
+# ---------------------------------------------------------------------------
+
+
+def plan_notes(
+    *,
+    assume: float,
+    power: float,
+    flakes: dict[float, int],
+    level: float,
+    gated: bool,
+    report: str | None,
+) -> list[tuple[str, str]]:
+    """``(column, note)`` for every column of the ``--prob-plan`` table
+    that is shown: what its numbers mean, in one sentence each.
+
+    ``flakes`` maps each failure rate to the runs that catch it with
+    probability ``level``; ``report`` is the report costs came from
+    (``None``: no cost column).
+    """
+    sure = _pct_bar(power)
+    rate = _pct_bar(assume)
+    notes = [
+        (
+            "runs",
+            "Runs planned for the case (--prob-runs, a runs= mark or"
+            " prob_runs), counting only the runs -k/-m selected.",
+        )
+    ]
+    if gated:
+        notes += [
+            (
+                "min runs",
+                "Fewest runs with which the gate can pass at all, and then"
+                " only if every one of them passes.",
+            ),
+            (
+                f"runs for {sure}",
+                f"Runs with which the gate passes {sure} of the time if the"
+                f" case really passes {rate} of its runs (--prob-plan-assume);"
+                f" never, if {rate} is not above the gate's bar.",
+            ),
+            (
+                "chance now",
+                f"The chance the gate passes with the planned runs, if the"
+                f" case really passes {rate} of its runs.",
+            ),
+        ]
+    for f, n in flakes.items():
+        notes.append(
+            (
+                f"catch {_pct_bar(f)}",
+                f"The chance the planned runs show at least one failure if"
+                f" {_pct_bar(f)} of runs fail; {n:,} runs make it"
+                f" {_pct_bar(level)}.",
+            )
+        )
+    if report is not None:
+        notes.append(
+            (
+                "cost",
+                f"Planned runs times the case's cost per run in {report};"
+                " blank for a case it doesn't have.",
+            )
+        )
+    return notes
+
+
+def render_notes(notes: list[tuple[str, str]], width: int) -> list[str]:
+    """Column notes as a hanging list under the table, wrapped to
+    ``width``."""
+    label_w = max(len(label) for label, _ in notes)
+    lines = []
+    for label, text in notes:
+        head = f"{_HEAD_INDENT}{label:<{label_w}}  "
+        lines.extend(_wrap(text, width, head, " " * len(head)))
+    return lines
