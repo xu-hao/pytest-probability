@@ -161,6 +161,10 @@ end: {doc}`bdd`.
   statuses, and raw per-run records to a single file.
 - **One dependency: pytest.**
 
+New to the intervals and verdicts? Start with the
+{doc}`statistics guide <statistics>`, whose first section is written for
+non-statisticians.
+
 ## Documentation
 
 ```{toctree}
@@ -173,6 +177,7 @@ bdd
 cases
 parametrization
 running
+statistics
 cost
 json-report
 ```

@@ -103,6 +103,8 @@ case splits into `-small` / `-large` rows.
   lifecycle hooks, error semantics.
 - {doc}`parametrization` — axes, ids, marks, and selection.
 - {doc}`running` — repeat counts, ordering, throttling, parallelism.
+- {doc}`statistics` — what intervals, gates and p-values mean, what they
+  assume, and how to decide with them.
 - {doc}`cost` — per-model token usage and spend, next to the fractions
   it bought.
 - {doc}`json-report` — machine-readable output for CI and dashboards.

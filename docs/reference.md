@@ -1,5 +1,9 @@
 # Reference
 
+This page lists every option and output. For what the statistics mean,
+what they assume and how to decide with them, see the
+{doc}`statistics guide <statistics>`.
+
 ## Command-line options
 
 All options live in the `probability` group of `pytest --help`.
@@ -1135,7 +1139,7 @@ interval method and level actually in effect:
     Verdict      PASS: the whole range is above the bar. FAIL: the whole range
                  is below it. UNDECIDED: the range crosses the bar, so more runs
                  are needed.
-  Full guide: https://pytest-probability.readthedocs.io/en/latest/reference.html#gates
+  Full guide: https://pytest-probability.readthedocs.io/en/latest/statistics.html
 ```
 
 - Text wraps to the terminal width; headings and the link don't.

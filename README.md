@@ -43,7 +43,8 @@ $ pytest benchmarks/ --prob-runs=10
 Full documentation at
 **[pytest-probability.readthedocs.io](https://pytest-probability.readthedocs.io)** —
 installation, a quickstart, guides for benchmark files, parametrization,
-running, cost accounting and the JSON report, a complete options
+running, a statistics guide (what the intervals, gates and verdicts
+mean and assume), cost accounting and the JSON report, a complete options
 reference, and a developer guide covering the plugin's internals.
 
 To build locally: `pip install -r docs/requirements.txt && sphinx-build -W -b html docs docs/_build/html`.
