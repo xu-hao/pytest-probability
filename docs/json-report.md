@@ -498,7 +498,7 @@ jq '.rows[] | select(.status == "flaky") | {case, pass_rate}' report.json
 ```
 
 To fail CI only below a pass-rate floor, instead of on any flaky run,
-use a gate: `--prob-min-rate=0.8` (or `@pytest.mark.probability(...)`
+use a gate (see {doc}`statistics` for how to read the verdicts): `--prob-min-rate=0.8` (or `@pytest.mark.probability(...)`
 per case) judges each case's interval against the bar and sets the
 exit status itself — see {doc}`running`. A floor on the pooled overall
 rate is still a `jq` one-liner (pair it with `continue-on-error` on an

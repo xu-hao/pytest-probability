@@ -68,7 +68,7 @@ from .plugin import (
 HINT = "Run with --prob-explain for a plain-language reading."
 
 #: Where the glossary sends readers for the full story.
-GUIDE_URL = "https://pytest-probability.readthedocs.io/en/latest/reference.html#gates"
+GUIDE_URL = "https://pytest-probability.readthedocs.io/en/latest/statistics.html"
 
 # Layout: headings sit where table rows do, bodies one step in.
 _HEAD_INDENT = "  "

@@ -230,6 +230,13 @@
   marked `*` because the latency gate's runs aren't planned. A
   latency-only case shows `—` for `runs for 80%` and `chance now`.
   Output is unchanged for suites without latency gates.
+- **Docs:** a new Statistics guide ({doc}`statistics`) opens with a
+  plain-language section that uses the wording of `--prob-explain`, then
+  covers assumptions, reading intervals, gates and verdicts, averages
+  over inputs and ρ, comparisons, margins and multiplicity, the baseline
+  gate, early stopping, latency, planning, reproducibility, a "what to
+  report" checklist and credits. `--prob-explain`'s "Full guide" link
+  now points at it.
 
 ## 0.2.0 (2026-07-08)
 

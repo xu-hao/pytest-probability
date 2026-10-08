@@ -197,7 +197,8 @@ Errored runs still fail the session; set `prob_errors = exclude` to
 take them out of the gate's sample instead. Ungated cases in the same
 session behave exactly as before. See {doc}`reference` for the marker,
 the count rule (`min_passes=`), per-gate `confidence=`/`method=`, and
-the full exit-status table.
+the full exit-status table. {doc}`statistics` explains how to read the
+verdicts and when UNDECIDED is the right answer.
 
 A comparison with a margin (`@pytest.mark.probability(compare="style",
 margin=0.02)`) works the same way for a whole function: its failing
