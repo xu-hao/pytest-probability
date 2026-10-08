@@ -58,7 +58,7 @@ All options live in the `probability` group of `pytest --help`.
 `--prob-explain`
 : Add a [plain-language reading](#the-explain-section) of the results
   after the summary, and an `explanation` string to the JSON report's
-  rows, gates and aggregates.
+  rows, gates, aggregates, metrics and comparisons.
   **Default:** the `prob_explain` ini value, else off.
 
 `--prob-bootstrap=N`
@@ -86,6 +86,19 @@ All options live in the `probability` group of `pytest --help`.
   are: Holm, Bonferroni, or Benjamini-Hochberg. `none` leaves them as
   they are and labels them exploratory when there is more than one.
   **Default:** the `prob_adjust` ini value, else `none`.
+
+`--prob-metric=METRIC`
+: Also report a [metric](#metrics) for each case, each function and
+  the session: `pass^K`, the chance that K runs of an input all pass
+  (reliability), or `pass@K`, the chance that at least one of K does
+  (best-of-K). K is a whole number of at least 1. Comma-separated and
+  repeatable — `--prob-metric=pass^3,pass@5` is `--prob-metric=pass^3
+  --prob-metric=pass@5` — with duplicates dropped; any other spelling
+  is a usage error. Given on the command line, it replaces
+  `prob_metric`. `^` needs quoting in some shells: `'pass^3'` in zsh
+  with `extendedglob`, `"pass^3"` in Windows `cmd`; bash, plain zsh,
+  fish and PowerShell take it as is.
+  **Default:** the `prob_metric` ini value, else none.
 
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
@@ -157,6 +170,11 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 
 `prob_adjust` *(string, default `"none"`)*
 : Default for `--prob-adjust`.
+
+`prob_metric` *(string, default empty)*
+: Default for `--prob-metric`: metric names separated by commas,
+  spaces or new lines (`prob_metric = pass^3, pass@5`). Empty means
+  none.
 
 Invalid values for the statistical, bootstrap and gate options are
 reported as pytest usage errors before anything runs.
@@ -387,6 +405,83 @@ the interval printed beside it, as for [Gates](#gates):
 - Without a margin a comparison only reports: failing runs fail the
   session as usual, and the exit status is the same as without it.
 
+## Metrics
+
+A pass rate says how often one run passes. Two other questions come up
+when the code under test is called more than once:
+
+- **pass^k — reliability:** the chance that k runs of the same input
+  *all* pass. For code that has to work every time it is called. It
+  can only fall as k grows.
+- **pass@k — best-of-k:** the chance that *at least one* of k runs of
+  the same input passes. For when a failed attempt can be retried, or
+  the best of k answers kept (by a checker that recognizes a right
+  one). It can only rise as k grows.
+
+Both are opt-in:
+
+```bash
+pytest benchmarks/ --prob-runs=10 --prob-metric='pass^3,pass@5'
+```
+
+```text
+============================= probability: metrics =============================
+  classify  pass^3  N=12 inputs  34.3%  [17.2%,  53.8%]
+            pass@5  N=12 inputs  99.4%  [98.8%, 100.0%]
+  triage    pass^3  N=3 inputs   69.4%
+            pass@5  N=2 inputs   99.8%                   1 left out (fewer than 5 runs)
+  Overall   pass^3  N=15 inputs  41.3%  [22.9%,  61.2%]
+            pass@5  N=14 inputs  99.5%  [98.9%,  99.9%]  1 left out (fewer than 5 runs)
+
+  pass^k: the chance that k runs of an input all pass (reliability)
+  pass@k: the chance that at least one of k runs of an input passes (best-of-k)
+```
+
+Here classify passes 66.7% of its runs on average, but three runs in a
+row of the same input all pass only about a third of the time, while
+one of five runs passes almost always.
+
+- **Per case:** from c passes in n runs, pass^k is C(c, k)/C(n, k) — of
+  all the ways to pick k of the n runs, the share in which all k passed
+  — and pass@k is 1 − C(n − c, k)/C(n, k), the share with at least one
+  pass. Both are unbiased: averaged over what the runs could have been,
+  they give exactly p^k and 1 − (1 − p)^k for a pass probability p.
+  Raising the observed rate to the power k instead would overstate
+  pass^k on average.
+  Computed in exact integer arithmetic, then rounded once. `pass^1`
+  and `pass@1` are the pass rate. Per-case values are in the JSON
+  report's `rows[].metrics`, not the terminal.
+- **k is the number of runs drawn,** not the number each case had; k
+  must not exceed it. **A case with fewer than k runs is left out** of
+  that metric (`null` in its row) and counted on the line: `1 left out
+  (fewer than 5 runs)`. A line with no case long enough shows `N=0
+  inputs` and no value.
+- **Per function and Overall:** the mean of the per-case values over
+  the cases with enough runs, each case counting equally, with the
+  same percentile interval from a cluster bootstrap over cases as a
+  [function-level line](#function-level-intervals) — the same
+  `prob_confidence`, `--prob-bootstrap`, `--prob-seed` and case-id
+  order, and no interval with fewer than `prob_min_inputs` cases.
+  Each metric is one more bootstrap per line.
+- **Which lines:** every bench function, by name, and `Overall` (left
+  out when there is a single function), whatever its number of
+  inputs: unlike the function-level block, this block is the only place
+  the terminal shows the metrics. `--prob-no-intervals` hides the
+  intervals but keeps the values.
+- **Errored runs** count as non-passes (c is the passes, n every run),
+  as in the row fraction, even under `prob_errors = exclude`.
+- Metrics only report: they never change verdicts or the exit status.
+  Without `--prob-metric` the output is exactly as before.
+
+`--prob-explain` reads every line of the block in plain words — what
+the metric means, its average beside the plain pass rate of the same
+inputs, its range, how many inputs were too short — and the glossary
+explains pass^k and pass@k.
+
+Inspired by pass@k from Chen et al., [Evaluating Large Language Models
+Trained on Code](https://arxiv.org/abs/2107.03374) (2021), and pass^k
+from Yao et al., [τ-bench](https://arxiv.org/abs/2406.12045) (2024).
+
 ## Python API
 
 Everything importable lives in the top-level package:
@@ -525,9 +620,10 @@ sample.
   Report:  report.json                             # only with --prob-json
 ```
 
-The section renders only when at least one benchmark item ran. When a
-function is [compared](#comparisons), a `probability: comparisons`
-section follows it, before the gates block.
+The section renders only when at least one benchmark item ran. With
+`--prob-metric`, a [`probability: metrics`](#metrics) section follows
+it. When a function is [compared](#comparisons), a `probability:
+comparisons` section comes next, before the gates block.
 
 ### The gates block
 
@@ -553,8 +649,8 @@ with the interval and bar each verdict came from:
 
 ### The explain section
 
-When any gate is FAIL or UNDECIDED, or any comparison is shown, the
-summary ends with a hint:
+When any gate is FAIL or UNDECIDED, or any comparison or metric is
+shown, the summary ends with a hint:
 
 ```text
   Run with --prob-explain for a plain-language reading.
@@ -611,6 +707,10 @@ interval method and level actually in effect:
   this function, how much doubling the runs or the inputs would narrow
   the range and what that would cost, and the next step follows from
   those numbers.
+- Each line of the [metrics block](#metrics) gets a reading: what
+  pass^k or pass@k means, its average next to the plain pass rate of
+  the same inputs, its range or why there is none, the inputs left out
+  for having fewer than k runs, and a next step when one helps.
 - Each [comparison](#comparisons) gets a reading: the difference and
   what its range says about which arm is better, what "one input" or
   "a sample of inputs" means for it, p as how often a gap this big

@@ -33,6 +33,8 @@ Design notes:
 - A function with enough cases also gets a function-level line: the
   mean of its per-case fractions, with a seeded cluster-bootstrap
   interval over its cases (``aggregate()``), and so does the session.
+- ``--prob-metric`` adds pass^k and pass@k: unbiased per-case
+  estimates, averaged over cases by ``aggregate()`` the same way.
 """
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ import importlib.util
 import inspect
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -256,6 +259,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         " none (exploratory), holm, bonferroni or bh"
         " (default: prob_adjust ini or none)",
     )
+    group.addoption(
+        "--prob-metric",
+        dest="prob_metric",
+        action="append",
+        default=None,
+        metavar="METRIC",
+        help="Also report pass^K (all K runs of an input pass: reliability)"
+        " and/or pass@K (at least one of K passes: best-of-K) per case and"
+        " per function; comma-separated and repeatable, e.g."
+        " --prob-metric=pass^3,pass@5 (default: prob_metric ini or none)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -328,6 +342,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "prob_adjust",
         "Multiple-comparison adjustment: none, holm, bonferroni or bh",
         default="none",
+    )
+    parser.addini(
+        "prob_metric",
+        "Metrics to report, comma-separated: pass^K and/or pass@K",
+        default="",
     )
 
 
@@ -526,6 +545,7 @@ def pytest_configure(config: pytest.Config) -> None:
     stats_config(config)
     gate_config(config)
     compare_config(config)
+    metrics_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -683,6 +703,78 @@ def compare_config(config: pytest.Config) -> CompareConfig:
     if cfg is None:
         cfg = config.stash[_COMPARE_CONFIG] = _resolve_compare_config(config)
     return cfg
+
+
+@dataclass(frozen=True)
+class Metric:
+    """A per-case metric over k attempts at an input (``--prob-metric``).
+
+    ``kind`` is ``"^"`` for pass^k, the chance that k attempts all pass
+    (reliability), or ``"@"`` for pass@k, the chance that at least one
+    of k does (best-of-k). A case needs at least ``k`` runs for it.
+    """
+
+    kind: str
+    k: int
+
+    @property
+    def name(self) -> str:
+        """``pass^3``, ``pass@5``: the spelling of the option and of the
+        JSON keys."""
+        return f"pass{self.kind}{self.k}"
+
+    def value(self, passes: int, total: int) -> float:
+        """The unbiased estimate from ``passes`` in ``total`` ≥ k runs."""
+        if self.kind == "^":
+            return stats.pass_hat_k(passes, total, self.k)
+        return stats.pass_at_k(passes, total, self.k)
+
+    def of(self, s: CaseStats) -> float | None:
+        """The metric for one row; ``None`` when it has fewer than k runs."""
+        if s.total < self.k:
+            return None
+        return self.value(s.passes, s.total)
+
+
+# pass^K or pass@K, K a run count (leading zeros allowed: pass^03 is pass^3).
+_METRIC_RE = re.compile(r"pass([\^@])([0-9]+)")
+
+_METRICS = pytest.StashKey[tuple]()
+
+
+def parse_metrics(raw: Iterable[str], source: str) -> tuple[Metric, ...]:
+    """The metrics named in ``raw`` — strings each holding one or more
+    names separated by commas or whitespace — in first-seen order,
+    duplicates dropped. A bad name is a usage error naming ``source``."""
+    out: list[Metric] = []
+    for chunk in raw:
+        for item in re.split(r"[,\s]+", str(chunk).strip()):
+            if not item:
+                continue
+            match = _METRIC_RE.fullmatch(item)
+            if match is None or int(match[2]) < 1:
+                raise pytest.UsageError(
+                    f"{source} takes pass^K or pass@K with K a whole number"
+                    f" of at least 1 (e.g. pass^3,pass@5), got {item!r}"
+                )
+            metric = Metric(match[1], int(match[2]))
+            if metric not in out:
+                out.append(metric)
+    return tuple(out)
+
+
+def metrics_config(config: pytest.Config) -> tuple[Metric, ...]:
+    """The session's ``--prob-metric``/``prob_metric`` metrics (validated
+    at configure); the command line replaces the ini value."""
+    metrics = config.stash.get(_METRICS, None)
+    if metrics is None:
+        raw = config.getoption("prob_metric")
+        if raw is None:
+            metrics = parse_metrics([config.getini("prob_metric")], "prob_metric")
+        else:
+            metrics = parse_metrics(raw, "--prob-metric")
+        config.stash[_METRICS] = metrics
+    return metrics
 
 
 def _pct_bar(rate: float) -> str:
@@ -1721,6 +1813,8 @@ class Aggregate:
     icc: float | None = None
     width_factor: float | None = None
     cost: float = 0.0
+    # One per --prob-metric, in option order.
+    metrics: tuple[MetricAggregate, ...] = ()
 
     @property
     def inputs(self) -> int:
@@ -1765,25 +1859,14 @@ class Aggregate:
 
     def to_json(self) -> dict[str, Any]:
         low, mean, high = self.runs
-
-        def interval(method: str, bounds: tuple[float, float] | None):
-            if bounds is None:
-                return None
-            return {
-                "method": method,
-                "level": self.level,
-                "low": bounds[0],
-                "high": bounds[1],
-            }
-
         return {
             "scope": self.scope,
             "name": self.name,
             "inputs": self.inputs,
             "runs": {"min": low, "mean": mean, "max": high},
             "estimate": self.estimate,
-            "ci": interval("bootstrap", self.ci),
-            "normal_ci": interval("normal", self.normal_ci),
+            "ci": _interval_json("bootstrap", self.level, self.ci),
+            "normal_ci": _interval_json("normal", self.level, self.normal_ci),
             "resamples": self.resamples,
             "seed": self.seed,
             "resampling_unit": "input",
@@ -1791,6 +1874,63 @@ class Aggregate:
             "suppressed": self.suppressed,
             "icc": self.icc,
             "width_factor": self.width_factor,
+            "metrics": {m.metric.name: m.to_json() for m in self.metrics},
+        }
+
+
+def _interval_json(
+    method: str, level: float, bounds: tuple[float, float] | None
+) -> dict[str, Any] | None:
+    if bounds is None:
+        return None
+    return {"method": method, "level": level, "low": bounds[0], "high": bounds[1]}
+
+
+@dataclass(frozen=True)
+class MetricAggregate:
+    """One ``Metric`` over a function's (or the session's) cases.
+
+    ``aggregate`` is the ``Aggregate`` of the metric's per-case values
+    over the cases with at least k runs — the same mean, cluster
+    bootstrap and ``min_inputs`` rule as the pass rate's — and ``None``
+    when no case has k runs. ``left_out`` counts the cases with fewer.
+    """
+
+    metric: Metric
+    aggregate: Aggregate | None
+    left_out: int = 0
+
+    @property
+    def inputs(self) -> int:
+        return self.aggregate.inputs if self.aggregate is not None else 0
+
+    @property
+    def estimate(self) -> float | None:
+        return self.aggregate.estimate if self.aggregate is not None else None
+
+    @property
+    def ci(self) -> tuple[float, float] | None:
+        return self.aggregate.ci if self.aggregate is not None else None
+
+    @property
+    def suppressed(self) -> str | None:
+        if self.aggregate is None:
+            return f"no input with at least {self.metric.k} runs"
+        return self.aggregate.suppressed
+
+    def to_json(self) -> dict[str, Any]:
+        agg = self.aggregate
+        level = agg.level if agg is not None else None
+        return {
+            "k": self.metric.k,
+            "inputs": self.inputs,
+            "left_out": self.left_out,
+            "estimate": self.estimate,
+            "ci": _interval_json("bootstrap", level, self.ci),
+            "normal_ci": _interval_json(
+                "normal", level, agg.normal_ci if agg is not None else None
+            ),
+            "suppressed": self.suppressed,
         }
 
 
@@ -1800,13 +1940,16 @@ def aggregate(
     cases: Iterable[CaseStats],
     cfg: StatsConfig,
     value: Callable[[int, int], float] = pass_fraction,
+    metrics: Iterable[Metric] = (),
 ) -> Aggregate:
     """The ``Aggregate`` of ``cases`` (each with at least one run).
 
-    ``value(passes, total)`` is the per-case quantity averaged; later
-    metrics (pass^k) can pass their own. Since the statistic is a mean
-    of per-case values, resampling whole cases is resampling their
-    values: each value carries all its case's runs. The bootstrap uses
+    ``value(passes, total)`` is the per-case quantity averaged. Each of
+    ``metrics`` gets a ``MetricAggregate``: this same procedure with the
+    metric as ``value``, over the cases with at least k runs (the others
+    are left out and counted). Since the statistic is a mean of
+    per-case values, resampling whole cases is resampling their values:
+    each value carries all its case's runs. The bootstrap uses
     ``cfg``'s resamples, seed and level, through ``stats.bootstrap``'s
     private generator — the global ``random`` state is never touched.
 
@@ -1833,6 +1976,9 @@ def aggregate(
         icc=rho,
         # fsum is exactly rounded: the same total in any arrival order.
         cost=math.fsum(s.cost for s in ordered),
+        metrics=tuple(
+            _metric_aggregate(scope, name, ordered, cfg, m) for m in metrics
+        ),
     )
     if rho is not None:
         agg = dataclasses.replace(
@@ -1851,6 +1997,21 @@ def aggregate(
         agg,
         ci=stats.percentile_interval(samples, cfg.level),
         normal_ci=stats.normal_interval(values, cfg.level),
+    )
+
+
+def _metric_aggregate(
+    scope: str, name: str, cases: list[CaseStats], cfg: StatsConfig, metric: Metric
+) -> MetricAggregate:
+    eligible = [s for s in cases if s.total >= metric.k]
+    return MetricAggregate(
+        metric=metric,
+        aggregate=(
+            aggregate(scope, name, eligible, cfg, value=metric.value)
+            if eligible
+            else None
+        ),
+        left_out=len(cases) - len(eligible),
     )
 
 
@@ -2412,6 +2573,63 @@ def _input_lines(cmp: Comparison) -> list[str]:
     ]
 
 
+def _metric_lines(
+    entries: list[tuple[Aggregate, MetricAggregate]], intervals: bool = True
+) -> list[str]:
+    """The metrics block: one line per (aggregate, metric), columns
+    aligned — ``classify  pass^3  N=12 inputs  41.2%  [30.1%, 52.0%]`` —
+    the aggregate's name only on its first line. The interval is left
+    out when there is none (fewer than ``prob_min_inputs`` inputs with k
+    runs) or ``intervals`` is off; ``2 left out (fewer than 5 runs)``
+    counts the cases too short for the metric."""
+    names, prev = [], None
+    for agg, _ in entries:
+        names.append(agg.name if agg is not prev else "")
+        prev = agg
+    metrics = [m.metric.name for _, m in entries]
+    sizes = [f"N={m.inputs} input{'' if m.inputs == 1 else 's'}" for _, m in entries]
+    ests = [_pct1(m.estimate) if m.estimate is not None else "" for _, m in entries]
+    bounds = [
+        (_pct1(m.ci[0]), _pct1(m.ci[1])) if intervals and m.ci is not None else None
+        for _, m in entries
+    ]
+    notes = [
+        f"{m.left_out} left out (fewer than {m.metric.k} runs)" if m.left_out else ""
+        for _, m in entries
+    ]
+
+    def width(cells: list[str]) -> int:
+        return max((len(x) for x in cells), default=0)
+
+    shown = [b for b in bounds if b is not None]
+    low_w = max((len(b[0]) for b in shown), default=0)
+    high_w = max((len(b[1]) for b in shown), default=0)
+    interval_w = low_w + high_w + 4 if shown else 0
+    name_w, metric_w, size_w, est_w = map(width, (names, metrics, sizes, ests))
+    lines = []
+    for name, metric, size, est, b, note in zip(
+        names, metrics, sizes, ests, bounds, notes
+    ):
+        parts = [f"{name:<{name_w}}", f"{metric:<{metric_w}}", f"{size:<{size_w}}"]
+        # Columns no line uses are left out altogether.
+        if est_w:
+            parts.append(f"{est:>{est_w}}")
+        if interval_w:
+            cell = f"[{b[0]:>{low_w}}, {b[1]:>{high_w}}]" if b is not None else ""
+            parts.append(f"{cell:<{interval_w}}")
+        parts.append(note)
+        lines.append(("  " + "  ".join(parts)).rstrip())
+    return lines
+
+
+# The metrics block's closing legend, one line per kind used.
+_METRIC_LEGEND = {
+    "^": "pass^k: the chance that k runs of an input all pass (reliability)",
+    "@": "pass@k: the chance that at least one of k runs of an input passes"
+    " (best-of-k)",
+}
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -2494,12 +2712,17 @@ class ProbabilityAggregator:
             by_function: dict[str, list[CaseStats]] = {}
             for s in self._stats.values():
                 by_function.setdefault(function_of(s.case), []).append(s)
+            metrics = metrics_config(self._config)
             out = [
-                aggregate(FUNCTION, name, by_function[name], cfg)
+                aggregate(FUNCTION, name, by_function[name], cfg, metrics=metrics)
                 for name in sorted(by_function)
             ]
             if self._stats:
-                out.append(aggregate(OVERALL, "Overall", self._stats.values(), cfg))
+                out.append(
+                    aggregate(
+                        OVERALL, "Overall", self._stats.values(), cfg, metrics=metrics
+                    )
+                )
             self._aggregates = out
         return self._aggregates
 
@@ -2529,6 +2752,24 @@ class ProbabilityAggregator:
             if a.ci is not None and not (a.scope == OVERALL and functions == 1)
         ]
 
+    def _shown_metrics(self) -> list[tuple[Aggregate, MetricAggregate]]:
+        """The metrics block's lines: every function's metrics, by
+        function name, then Overall's — left out, as in the aggregate
+        block, when there is a single function. Unlike that block,
+        functions with too few inputs for an interval are listed (with
+        the estimate alone): the block is the terminal's only view of
+        the metrics."""
+        if not metrics_config(self._config):
+            return []
+        aggs = self.aggregates()
+        functions = sum(a.scope == FUNCTION for a in aggs)
+        return [
+            (a, m)
+            for a in aggs
+            if not (a.scope == OVERALL and functions == 1)
+            for m in a.metrics
+        ]
+
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         # Under pytest-xdist this hook also fires on workers, which only
         # hold a shard of the results — the controller decides gates and
@@ -2549,6 +2790,7 @@ class ProbabilityAggregator:
             return
         all_stats = list(self._stats.values())
         cfg = stats_config(session.config)
+        metrics = metrics_config(session.config)
         payload = {
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "runs": _runs(session.config),
@@ -2584,6 +2826,7 @@ class ProbabilityAggregator:
                     ),
                     "cost": s.cost,
                     "usage": s.usage,
+                    "metrics": {m.name: m.of(s) for m in metrics},
                 }
                 for s in all_stats
             ],
@@ -2600,6 +2843,10 @@ class ProbabilityAggregator:
                     ).text()
             for agg, entry in zip(self.aggregates(), payload["aggregates"]):
                 entry["explanation"] = self._aggregate_reading(agg).text()
+                for m in agg.metrics:
+                    entry["metrics"][m.metric.name]["explanation"] = (
+                        self._metric_reading(agg, m).text()
+                    )
             for cmp, entry in zip(self.comparisons(), payload["comparisons"]):
                 entry["explanation"] = self._comparison_reading(cmp).text()
         path = Path(self._json_path)
@@ -2724,6 +2971,21 @@ class ProbabilityAggregator:
                 line += f"  ({r.excluded} errored, excluded)"
             tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
 
+    def _write_metrics(self, tr) -> None:
+        """The ``probability: metrics`` block (nothing without
+        ``--prob-metric``)."""
+        entries = self._shown_metrics()
+        if not entries:
+            return
+        tr.write_sep("=", "probability: metrics")
+        for line in _metric_lines(entries, stats_config(self._config).intervals):
+            tr.write_line(line)
+        tr.write_line("")
+        kinds = {m.metric.kind for _, m in entries}
+        for kind, legend in _METRIC_LEGEND.items():
+            if kind in kinds:
+                tr.write_line(f"  {legend}")
+
     def _write_comparisons(self, tr) -> None:
         """The ``probability: comparisons`` block (nothing when no
         function is compared)."""
@@ -2774,6 +3036,12 @@ class ProbabilityAggregator:
 
         cfg = stats_config(self._config)
         return explain.aggregate_reading(agg, cfg.min_inputs)
+
+    def _metric_reading(self, agg: Aggregate, m: MetricAggregate):
+        from . import explain
+
+        cfg = stats_config(self._config)
+        return explain.metric_reading(agg, m, cfg.min_inputs, intervals=cfg.intervals)
 
     def _comparison_reading(self, cmp: Comparison):
         from . import explain
@@ -2831,6 +3099,7 @@ class ProbabilityAggregator:
             elif s.status != "pass":
                 readings.append(self._row_reading(s))
         readings.extend(self._aggregate_reading(a) for a in self._shown_aggregates())
+        readings.extend(self._metric_reading(a, m) for a, m in self._shown_metrics())
         readings.extend(self._comparison_reading(c) for c in self.comparisons())
         # The main table's interval column needs explaining even when no
         # row is notable.
@@ -2906,11 +3175,16 @@ class ProbabilityAggregator:
                 tr.write_line(line.rstrip())
         if self._json_path:
             tr.write_line(f"  Report:  {self._json_path}")
+        self._write_metrics(tr)
         self._write_comparisons(tr)
         self._write_gates(tr, results)
         if self._explain:
             self._write_explained(tr, all_stats, results)
-        elif self.comparisons() or any(r.verdict != PASS for r in results.values()):
+        elif (
+            self.comparisons()
+            or self._shown_metrics()
+            or any(r.verdict != PASS for r in results.values())
+        ):
             from .explain import HINT
 
             tr.write_line("")

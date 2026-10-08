@@ -1912,8 +1912,11 @@ def test_aggregate_json(pytester):
     assert set(classify) == {
         "scope", "name", "inputs", "runs", "estimate", "ci", "normal_ci",
         "resamples", "seed", "resampling_unit", "note", "suppressed",
-        "icc", "width_factor",
+        "icc", "width_factor", "metrics",
     }
+    # no --prob-metric: empty, in rows too
+    assert all(a["metrics"] == {} for a in data["aggregates"])
+    assert all(r["metrics"] == {} for r in data["rows"])
     # one run per case: no ρ to measure
     assert all(
         a["icc"] is None and a["width_factor"] is None
@@ -2833,3 +2836,338 @@ def test_xdist_comparison_parity(pytester):
     assert serial.ret == dist.ret == pytest.ExitCode.TESTS_FAILED  # gamma UNDECIDED
     s = _json(pytester, "serial.json")["comparisons"]
     assert s == _json(pytester, "dist.json")["comparisons"]
+
+
+# ---------------------------------------------------------------------------
+# pass^k and pass@k metrics (#7)
+# ---------------------------------------------------------------------------
+
+# Under prob_runs = 3, m's inputs pass every run except 2 (2/3), 5 (1/3)
+# and 8 (0/3); m::short has runs=2 and passes 1 of them. ok, in its own
+# file, always passes. A per-process counter, so xdist runs need --dist
+# loadfile.
+BENCH_METRIC = """
+import pytest
+
+_calls = {}
+PASSES = {2: 2, 5: 1, 8: 0}
+
+@pytest.mark.parametrize("i", [
+    *range(10), pytest.param("short", marks=pytest.mark.probability(runs=2)),
+])
+def bench_m(i):
+    _calls[i] = _calls.get(i, 0) + 1
+    assert _calls[i] <= PASSES.get(i, 3 if i != "short" else 1)
+"""
+
+BENCH_METRIC_OK = """
+def bench_ok():
+    assert True
+"""
+
+METRIC_COUNTS = {
+    **{f"m::{i}": ({2: 2, 5: 1, 8: 0}.get(i, 3), 3) for i in range(10)},
+    "m::short": (1, 2),
+    "ok": (3, 3),
+}
+
+METRIC_BLOCK = [
+    "  m        pass^2  N=11 inputs   66.7%  [39.4%,  90.9%]",
+    "           pass@3  N=10 inputs   90.0%  [70.0%, 100.0%]"
+    "  1 left out (fewer than 3 runs)",
+    "  ok       pass^2  N=1 input    100.0%",
+    "           pass@3  N=1 input    100.0%",
+    "  Overall  pass^2  N=12 inputs   69.4%  [41.7%,  91.7%]",
+    "           pass@3  N=11 inputs   90.9%  [72.7%, 100.0%]"
+    "  1 left out (fewer than 3 runs)",
+    "",
+    "  pass^k: the chance that k runs of an input all pass (reliability)",
+    "  pass@k: the chance that at least one of k runs of an input passes"
+    " (best-of-k)",
+]
+
+
+def _metric_files(pytester):
+    pytester.makepyfile(bench_metric=BENCH_METRIC, bench_ok=BENCH_METRIC_OK)
+
+
+def _run_metric(pytester, *args):
+    return _run(pytester, "-p", "no:cacheprovider", "-o", "prob_runs=3", *args)
+
+
+def _section_lines(result, title):
+    """The lines of a ``probability: ...`` section, up to the next one or
+    the short summary."""
+    lines = result.stdout.lines
+    start = next(i for i, ln in enumerate(lines) if f"= {title} =" in ln)
+    out = []
+    for ln in lines[start + 1 :]:
+        if ln.startswith("="):
+            break
+        out.append(ln)
+    return out
+
+
+def _expected_metric(kind, k, cases, level=0.95, resamples=5000, seed=0):
+    """(estimate, ci, normal_ci) of a metric straight from the stats
+    module: per-case values in case-id order, short cases left out."""
+    import statistics
+
+    from pytest_probability import stats
+
+    fn = stats.pass_hat_k if kind == "^" else stats.pass_at_k
+    values = [
+        fn(*METRIC_COUNTS[c], k) for c in sorted(cases) if METRIC_COUNTS[c][1] >= k
+    ]
+    samples = stats.bootstrap(values, resamples=resamples, seed=seed)
+    return (
+        statistics.fmean(values),
+        stats.percentile_interval(samples, level),
+        stats.normal_interval(values, level),
+    )
+
+
+def test_metric_block(pytester):
+    _metric_files(pytester)
+    result = _run_metric(pytester, "--prob-metric=pass^2,pass@3")
+    block = _section_lines(result, "probability: metrics")
+    assert block[: block.index("")] == METRIC_BLOCK[:6]
+    assert block[block.index("") : block.index("") + 4] == METRIC_BLOCK[6:] + [""]
+    # the numbers are the direct computation's, rounded
+    m = [c for c in METRIC_COUNTS if c.startswith("m::")]
+    squeeze = lambda line: " ".join(line.split())  # noqa: E731
+    est, (lo, hi), _ = _expected_metric("@", 3, m)
+    assert f"{_p1(est)} [{_p1(lo)}, {_p1(hi)}]" in squeeze(block[1])
+    est, (lo, hi), _ = _expected_metric("^", 2, METRIC_COUNTS)
+    assert f"{_p1(est)} [{_p1(lo)}, {_p1(hi)}]" in squeeze(block[4])
+    # the block earns the explain hint
+    assert "  Run with --prob-explain for a plain-language reading." in block
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+
+
+def test_metric_option_spellings(pytester):
+    _metric_files(pytester)
+    want = _section_lines(
+        _run_metric(pytester, "--prob-metric=pass^2,pass@3"), "probability: metrics"
+    )
+    # repeatable, duplicates dropped, first-seen order
+    for args in (
+        ["--prob-metric=pass^2", "--prob-metric=pass@3,pass^2"],
+        ["--prob-metric", "pass^02 , pass@3"],
+        ["-o", "prob_metric=pass^2, pass@3"],
+    ):
+        got = _section_lines(_run_metric(pytester, *args), "probability: metrics")
+        assert got == want, args
+    pytester.makeini("[pytest]\nprob_metric = pass^2\n    pass@3\n")
+    assert _section_lines(_run_metric(pytester), "probability: metrics") == want
+    # the command line replaces the ini value
+    result = _run_metric(pytester, "--prob-metric=pass@3", "--prob-json=r.json")
+    assert list(_json(pytester)["rows"][0]["metrics"]) == ["pass@3"]
+    assert "pass^2" not in "\n".join(_section_lines(result, "probability: metrics"))
+
+
+@pytest.mark.parametrize(
+    "args, source, bad",
+    [
+        (["--prob-metric=pass^0"], "--prob-metric", "'pass^0'"),
+        (["--prob-metric=pass3"], "--prob-metric", "'pass3'"),
+        (["--prob-metric=pass^k"], "--prob-metric", "'pass^k'"),
+        (["--prob-metric=pass@1.5"], "--prob-metric", "'pass@1.5'"),
+        (["--prob-metric=pass^3;pass@5"], "--prob-metric", "'pass^3;pass@5'"),
+        (["-o", "prob_metric=pass@-1"], "prob_metric", "'pass@-1'"),
+        (["-o", "prob_metric=Pass^3"], "prob_metric", "'Pass^3'"),
+    ],
+)
+def test_invalid_metrics_are_usage_errors(pytester, args, source, bad):
+    pytester.makepyfile(bench_ok=BENCH_METRIC_OK)
+    result = _run(pytester, *args)
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(
+        [f"*{source} takes pass^K or pass@K with K a whole number of at least 1"
+         f" (e.g. pass^3,pass@5), got {bad}*"]
+    )
+
+
+def test_parse_metrics():
+    from pytest_probability.plugin import Metric, parse_metrics
+
+    assert parse_metrics([""], "x") == ()
+    assert parse_metrics(["pass^3,pass@5", "pass^3", "pass@05\npass^1"], "x") == (
+        Metric("^", 3), Metric("@", 5), Metric("^", 1),
+    )
+    assert [m.name for m in parse_metrics(["pass^03"], "x")] == ["pass^3"]
+
+
+def test_metric_values():
+    from pytest_probability.plugin import CaseStats, Metric
+
+    s = CaseStats("c", passes=7, fails=2, errors=1)
+    # errored runs count as non-passes: c = 7, n = 10
+    assert Metric("^", 3).of(s) == 35 / 120
+    assert Metric("@", 3).of(s) == 1 - 1 / 120
+    assert Metric("^", 1).of(s) == Metric("@", 1).of(s) == 0.7
+    assert Metric("^", 11).of(s) is None
+    assert Metric("@", 10).of(s) == 1.0
+
+
+def test_metric_json(pytester):
+    from pytest_probability import stats
+
+    _metric_files(pytester)
+    _run_metric(pytester, "--prob-metric=pass^2,pass@3", "--prob-json=r.json")
+    data = _json(pytester)
+    rows = {r["case"]: r["metrics"] for r in data["rows"]}
+    for case, (c, n) in METRIC_COUNTS.items():
+        assert rows[case] == {
+            "pass^2": stats.pass_hat_k(c, n, 2),
+            "pass@3": stats.pass_at_k(c, n, 3) if n >= 3 else None,
+        }, case
+    aggs = {a["name"]: a["metrics"] for a in data["aggregates"]}
+    assert list(aggs) == ["m", "ok", "Overall"]
+    m = [c for c in METRIC_COUNTS if c.startswith("m::")]
+    est, ci, normal = _expected_metric("@", 3, m)
+    assert aggs["m"]["pass@3"] == {
+        "k": 3,
+        "inputs": 10,
+        "left_out": 1,
+        "estimate": est,
+        "ci": {"method": "bootstrap", "level": 0.95, "low": ci[0], "high": ci[1]},
+        "normal_ci": {
+            "method": "normal", "level": 0.95, "low": normal[0], "high": normal[1],
+        },
+        "suppressed": None,
+    }
+    assert aggs["Overall"]["pass^2"]["estimate"] == _expected_metric(
+        "^", 2, METRIC_COUNTS
+    )[0]
+    assert aggs["ok"]["pass^2"] == {
+        "k": 2, "inputs": 1, "left_out": 0, "estimate": 1.0, "ci": None,
+        "normal_ci": None, "suppressed": "fewer than 10 inputs",
+    }
+
+
+def test_metric_settings_drive_its_interval(pytester):
+    _metric_files(pytester)
+    args = ("--prob-metric=pass^2", "--prob-json=r.json", "--prob-bootstrap=300")
+    _run_metric(pytester, *args, "--prob-seed=4", "--prob-confidence=0.8")
+    ci = _json(pytester)["aggregates"][-1]["metrics"]["pass^2"]["ci"]
+    want = _expected_metric("^", 2, METRIC_COUNTS, level=0.8, resamples=300, seed=4)
+    assert (ci["level"], ci["low"], ci["high"]) == (0.8, *want[1])
+
+
+def test_metric_k1_is_the_pass_rate():
+    import dataclasses
+
+    from pytest_probability.plugin import CaseStats, Metric, StatsConfig, aggregate
+
+    cases = [
+        CaseStats(c, passes=p, fails=n - p) for c, (p, n) in METRIC_COUNTS.items()
+    ]
+    agg = aggregate(
+        "overall", "Overall", cases, StatsConfig(),
+        metrics=[Metric("^", 1), Metric("@", 1)],
+    )
+    for m in agg.metrics:
+        assert m.left_out == 0
+        # the same estimate, interval and ρ as the pass rate's
+        assert m.aggregate == dataclasses.replace(agg, metrics=())
+
+
+def test_metric_short_cases_are_left_out():
+    from pytest_probability.plugin import CaseStats, Metric, StatsConfig, aggregate
+
+    # runs 1..12, every run passing but the first of each case
+    cases = [CaseStats(f"f::{n:02}", passes=n - 1, fails=1) for n in range(1, 13)]
+    agg = aggregate(
+        "function", "f", cases, StatsConfig(),
+        metrics=[Metric("^", 3), Metric("@", 12), Metric("^", 13)],
+    )
+    three, twelve, none = agg.metrics
+    assert (three.inputs, three.left_out) == (10, 2)
+    assert three.aggregate.cases == tuple(f"f::{n:02}" for n in range(3, 13))
+    assert three.estimate == pytest.approx(
+        sum((n - 3) / n for n in range(3, 13)) / 10
+    )
+    assert three.ci is not None and three.suppressed is None
+    assert (twelve.inputs, twelve.left_out, twelve.estimate) == (1, 11, 1.0)
+    assert twelve.suppressed == "fewer than 10 inputs" and twelve.ci is None
+    assert (none.inputs, none.left_out, none.aggregate) == (0, 12, None)
+    assert none.to_json() == {
+        "k": 13, "inputs": 0, "left_out": 12, "estimate": None, "ci": None,
+        "normal_ci": None, "suppressed": "no input with at least 13 runs",
+    }
+
+
+def test_metric_with_no_eligible_input_in_the_block(pytester):
+    _metric_files(pytester)
+    result = _run_metric(pytester, "--prob-metric=pass@4")
+    assert _section_lines(result, "probability: metrics")[:3] == [
+        "  m        pass@4  N=0 inputs  11 left out (fewer than 4 runs)",
+        "  ok       pass@4  N=0 inputs  1 left out (fewer than 4 runs)",
+        "  Overall  pass@4  N=0 inputs  12 left out (fewer than 4 runs)",
+    ]
+
+
+def test_metric_no_intervals_keeps_the_estimates(pytester):
+    _metric_files(pytester)
+    result = _run_metric(
+        pytester, "--prob-metric=pass^2,pass@3", "--prob-no-intervals"
+    )
+    block = _section_lines(result, "probability: metrics")
+    assert block[:2] == [
+        "  m        pass^2  N=11 inputs   66.7%",
+        "           pass@3  N=10 inputs   90.0%  1 left out (fewer than 3 runs)",
+    ]
+
+
+def test_metric_single_function_has_no_overall_line(pytester):
+    pytester.makepyfile(bench_metric=BENCH_METRIC)
+    result = _run_metric(pytester, "--prob-metric=pass^2")
+    block = _section_lines(result, "probability: metrics")
+    assert [ln.split()[0] for ln in block[: block.index("")]] == ["m"]
+
+
+def test_output_unchanged_without_metrics(pytester):
+    _metric_files(pytester)
+    base = _run_metric(pytester)
+    assert "probability: metrics" not in base.stdout.str()
+    assert "--prob-explain" not in base.stdout.str()
+    with_metrics = _run_metric(pytester, "--prob-metric=pass^2")
+    # everything before the metrics block is the same: the main table,
+    # the aggregate block and the footer
+    lines = with_metrics.stdout.lines
+    at = next(i for i, ln in enumerate(lines) if "= probability: metrics =" in ln)
+    assert lines[:at] == base.stdout.lines[:at]
+    assert "short test summary info" in base.stdout.lines[at]
+    # JSON: empty metrics, rows and aggregates alike
+    _run_metric(pytester, "--prob-json=r.json")
+    data = _json(pytester)
+    assert all(r["metrics"] == {} for r in data["rows"] + data["aggregates"])
+
+
+def test_regular_suite_unchanged_by_metric_options(pytester):
+    pytester.makepyfile(test_plain=TEST_PLAIN)
+    base = _run(pytester, "-p", "no:cacheprovider")
+    with_opts = _run(
+        pytester, "-p", "no:cacheprovider", "--prob-metric=pass^3,pass@5"
+    )
+    strip = lambda r: [ln for ln in r.stdout.lines if " in " not in ln]  # noqa: E731
+    assert strip(base) == strip(with_opts)
+    assert "= probability" not in with_opts.stdout.str()
+
+
+def test_xdist_metric_parity(pytester):
+    pytest.importorskip("xdist")
+    _metric_files(pytester)
+    args = ("--prob-metric=pass^2,pass@3", "--prob-explain")
+    serial = _run_metric(pytester, *args, "--prob-json=serial.json")
+    dist = _run_metric(
+        pytester, *args, "--prob-json=dist.json", "-n", "2", "--dist", "loadfile"
+    )
+    for title in ("probability: metrics", "probability: explained"):
+        assert _section_lines(serial, title) == _section_lines(dist, title)
+    assert _section_lines(serial, "probability: metrics")[:6] == METRIC_BLOCK[:6]
+    s, d = _json(pytester, "serial.json"), _json(pytester, "dist.json")
+    assert s["aggregates"] == d["aggregates"]
+    rows = lambda data: sorted((r["case"], r["metrics"]) for r in data["rows"])  # noqa: E731
+    assert rows(s) == rows(d)

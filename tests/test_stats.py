@@ -405,6 +405,12 @@ def test_normal_interval_is_unclipped():
         lambda: stats.sign_flip_test([math.nan]),
         lambda: stats.adjust_pvalues([0.1], "fdr"),
         lambda: stats.adjust_pvalues([1.5], "holm"),
+        lambda: stats.pass_hat_k(1, 3, 0),
+        lambda: stats.pass_hat_k(1, 3, 4),
+        lambda: stats.pass_hat_k(4, 3, 1),
+        lambda: stats.pass_at_k(1, 3, 1.5),
+        lambda: stats.pass_at_k(1, 3, True),
+        lambda: stats.pass_at_k(0, 0, 1),
     ],
 )
 def test_invalid_input_raises_value_error(call):
@@ -868,3 +874,74 @@ def test_stats_imports_only_the_standard_library():
     }
     assert "pytest" not in imported
     assert imported <= set(sys.stdlib_module_names) | {"__future__"}, imported
+
+
+# ---------------------------------------------------------------------------
+# pass^k and pass@k
+# ---------------------------------------------------------------------------
+
+
+def _subsets(passes, runs, k):
+    """(all pass, at least one passes, subsets) over every k of the runs."""
+    from itertools import combinations
+
+    outcomes = [True] * passes + [False] * (runs - passes)
+    picks = list(combinations(outcomes, k))
+    return sum(map(all, picks)), sum(map(any, picks)), len(picks)
+
+
+def test_pass_k_match_subset_enumeration():
+    # Exactly: the estimators are the share of k-subsets of the runs in
+    # which all (pass^k) or any (pass@k) passed, correctly rounded.
+    from fractions import Fraction
+
+    for n in range(1, 11):
+        for c in range(n + 1):
+            for k in range(1, n + 1):
+                every, some, total = _subsets(c, n, k)
+                assert stats.pass_hat_k(c, n, k) == float(Fraction(every, total))
+                assert stats.pass_at_k(c, n, k) == float(Fraction(some, total))
+
+
+@pytest.mark.parametrize("p", [0.1, 1 / 3, 0.5, 0.9])
+def test_pass_k_are_unbiased(p):
+    # Averaged over the binomial distribution of c, they give p^k and
+    # 1 − (1 − p)^k exactly (to rounding), unlike the plug-in (c/n)^k.
+    for n in range(1, 9):
+        pmf = [math.comb(n, c) * p**c * (1 - p) ** (n - c) for c in range(n + 1)]
+        for k in range(1, n + 1):
+            hat = math.fsum(w * stats.pass_hat_k(c, n, k) for c, w in enumerate(pmf))
+            at = math.fsum(w * stats.pass_at_k(c, n, k) for c, w in enumerate(pmf))
+            assert close(hat, p**k, rel=1e-12)
+            assert close(at, 1 - (1 - p) ** k, rel=1e-12)
+            plug_in = math.fsum(w * (c / n) ** k for c, w in enumerate(pmf))
+            if 1 < k and 1 < n:
+                assert plug_in > hat
+
+
+def test_pass_k_with_one_attempt_is_the_pass_rate():
+    for n in range(1, 30):
+        for c in range(n + 1):
+            assert stats.pass_hat_k(c, n, 1) == stats.pass_at_k(c, n, 1) == c / n
+
+
+def test_pass_k_monotone_in_k():
+    for n in range(1, 15):
+        for c in range(n + 1):
+            hats = [stats.pass_hat_k(c, n, k) for k in range(1, n + 1)]
+            ats = [stats.pass_at_k(c, n, k) for k in range(1, n + 1)]
+            assert hats == sorted(hats, reverse=True)
+            assert ats == sorted(ats)
+
+
+def test_pass_k_edges_and_large_n():
+    assert stats.pass_hat_k(5, 5, 5) == stats.pass_at_k(1, 5, 5) == 1.0
+    assert stats.pass_hat_k(4, 5, 5) == stats.pass_at_k(0, 5, 5) == 0.0
+    # 1 failure in n runs: k runs avoid it with chance (n − k)/n
+    n = 100_000
+    assert stats.pass_hat_k(n - 1, n, 30_000) == 0.7
+    # 1 pass in n runs: tiny values keep full precision
+    assert stats.pass_at_k(1, n, 1) == 1 / n
+    assert stats.pass_at_k(1, 10**6, 3) == 3e-6
+    # fewer failures than k: some attempt always passes
+    assert stats.pass_at_k(n - 4, n, 5) == 1.0
