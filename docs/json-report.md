@@ -54,6 +54,11 @@ only the controller writes it, with the full result set.
       "status": "flaky",
       "ci": {"method": "exact", "level": 0.95,
              "low": 0.4439045376923587, "high": 0.9747892736731666},
+      "gate": {"rule": "rate", "min_rate": 0.9, "confidence": 0.95,
+               "method": "exact", "prior": [1.0, 1.0], "errors": "count",
+               "runs": 10, "passes": 8, "total": 10, "excluded": 0,
+               "low": 0.4439045376923587, "high": 0.9747892736731666,
+               "verdict": "undecided"},
       "cost": 0.001,
       "usage": {
         "m-small": {"input_tokens": 1200, "output_tokens": 80,
@@ -84,9 +89,9 @@ Top level:
 | Field | Type | Meaning |
 |---|---|---|
 | `created` | `str` | Local timestamp, `YYYY-MM-DDTHH:MM:SS` |
-| `runs` | `int` | The configured `--prob-runs` value |
+| `runs` | `int` | The configured `--prob-runs` value (a `probability(runs=...)` mark can change it for one function or case; see `rows[].total` and `rows[].gate.runs`) |
 | `stats_config` | object | The session's statistical settings: `method` (`"exact"`, `"wilson"` or `"bayes"`), `level` (two-sided, e.g. `0.95`), `prior` (`[a, b]`, the configured `prob_prior`; used only by `bayes`) |
-| `exit_status` | `int` | pytest's exit code for the session |
+| `exit_status` | `int` | The session's exit code, including a failure from a gate |
 | `totals` | object | Aggregates over every row: `passes`, `fails`, `errors`, `count`, `pass_rate`, `cost`, `usage` |
 | `rows` | array | One entry per case, in encounter order |
 | `records` | array | One entry per executed run |
@@ -100,9 +105,29 @@ Top level:
 | `total` | `int` | All three counts summed |
 | `pass_rate` | `float` | `passes / total * 100` |
 | `status` | `str` | `"pass"`, `"flaky"`, `"errored"`, `"fail"`, or `"error"` — see the status table in {doc}`reference` |
-| `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal |
+| `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal. Always the session's method and level over every run, even for a gated row |
+| `gate` | object \| `null` | The case's gate and its verdict (below); `null` for an ungated case |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
+
+`rows[].gate` — present when the case is gated (see Gates in
+{doc}`reference`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `rule` | `str` | `"rate"` (judge the interval against `min_rate`) or `"count"` (passes ≥ `min_passes`) |
+| `min_rate` / `min_passes` | `float` / `int` | The bar; only the one for `rule` is present |
+| `confidence` / `method` / `prior` | | The settings of the gate's interval: the session's, or the marker's overrides |
+| `errors` | `str` | `prob_errors`: `"count"` or `"exclude"` |
+| `runs` | `int` | The case's planned run count |
+| `passes` / `total` | `int` | The gate's sample: errored runs are left out of `total` under `exclude` |
+| `excluded` | `int` | Errored runs left out (0 under `count`) |
+| `low` / `high` | `float \| null` | The gate's interval, unrounded; `null` when `total` is 0 |
+| `verdict` | `str` | `"pass"`, `"fail"` or `"undecided"` |
+
+The gate's interval equals `ci` when the gate uses the session's
+method and level and errors count; otherwise it is the one its verdict
+was read from.
 
 `records[]` — the raw view, one per (case, run) execution:
 
@@ -110,7 +135,7 @@ Top level:
 |---|---|---|
 | `case` | `str` | Case id (matches `rows[].case`) |
 | `run` | `int` | 1-based run number |
-| `outcome` | `str` | `"pass"`, `"fail"`, or `"error"` — the run's class |
+| `outcome` | `str` | `"pass"`, `"fail"`, or `"error"` — the run's class (a gated case's failing runs are xfailed in pytest's output, but stay `"fail"` here) |
 | `message` | `str \| null` | First line of the assert's message on failure |
 | `error` | `str \| null` | `"ExceptionType: text"` on error |
 | `elapsed` | `float` | Wall-clock seconds, measured by the plugin |
@@ -123,7 +148,16 @@ actually ran.
 
 ## Recipes
 
-Flag cases whose interval cannot rule out a pass rate below 80%:
+List the gates that did not pass, with the interval behind each
+verdict:
+
+```bash
+jq '.rows[] | select(.gate and .gate.verdict != "pass")
+    | {case, verdict: .gate.verdict, low: .gate.low, high: .gate.high}' report.json
+```
+
+Flag cases whose interval cannot rule out a pass rate below 80% (for a
+CI gate on this, use `--prob-min-rate=0.8` instead):
 
 ```bash
 jq '.rows[] | select(.ci.low < 0.8) | {case, low: .ci.low, high: .ci.high}' report.json
@@ -135,9 +169,12 @@ Pull the flaky rows with `jq`:
 jq '.rows[] | select(.status == "flaky") | {case, pass_rate}' report.json
 ```
 
-Fail CI only below a pass-rate floor, instead of on any flaky run
-(pair this with `continue-on-error` on the pytest step, since a flaky
-run still exits nonzero):
+To fail CI only below a pass-rate floor, instead of on any flaky run,
+use a gate: `--prob-min-rate=0.8` (or `@pytest.mark.probability(...)`
+per case) judges each case's interval against the bar and sets the
+exit status itself — see {doc}`running`. A floor on the pooled overall
+rate is still a `jq` one-liner (pair it with `continue-on-error` on an
+ungated pytest step, since a flaky run exits nonzero there):
 
 ```bash
 jq -e '.totals.pass_rate >= 80' report.json > /dev/null \

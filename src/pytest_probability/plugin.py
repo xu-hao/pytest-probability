@@ -26,11 +26,16 @@ Design notes:
   aggregate survives pytest-xdist's worker-to-controller serialization.
 - A pass fraction only exists across items, so it cannot be attached to
   any single test outcome; it is rendered in ``pytest_terminal_summary``.
+- A gate (``@pytest.mark.probability(min_rate=...)``) judges a case on
+  its interval instead. Its failing runs are reported as xfailed, the
+  aggregator decides the verdict from the counts, and
+  ``pytest_sessionfinish`` turns a failed gate into a failed session.
 """
 from __future__ import annotations
 
 import ast
 import contextvars
+import dataclasses
 import fnmatch
 import hashlib
 import importlib.util
@@ -39,10 +44,11 @@ import json
 import math
 import sys
 import time
-from collections import OrderedDict
+import warnings
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 import pytest
 
@@ -185,6 +191,23 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Hide the interval column in the summary"
         " (default: prob_intervals ini or shown)",
     )
+    group.addoption(
+        "--prob-min-rate",
+        dest="prob_min_rate",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help="Gate every case on its pass rate: PASS when the whole interval"
+        " lies above RATE (default: prob_min_rate ini or no gate)",
+    )
+    group.addoption(
+        "--prob-undecided",
+        dest="prob_undecided",
+        default=None,
+        choices=UNDECIDED_POLICIES,
+        help="Whether an UNDECIDED gate verdict fails the session"
+        " (default: prob_undecided ini or fail)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -216,12 +239,29 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type="bool",
         default=True,
     )
+    parser.addini(
+        "prob_min_rate",
+        "Gate every case on its pass rate (empty: no global gate)",
+        default="",
+    )
+    parser.addini(
+        "prob_undecided",
+        "Whether an UNDECIDED gate verdict fails the session: fail or pass",
+        default="fail",
+    )
+    parser.addini(
+        "prob_errors",
+        "Errored runs in gated cases: count (as non-passes) or exclude",
+        default="count",
+    )
 
 
-def _runs(config: pytest.Config) -> int:
+def _runs(config: pytest.Config, marked: int | None = None) -> int:
+    """Runs per case: ``--prob-runs``, else a ``probability(runs=...)``
+    mark's value, else the ``prob_runs`` ini setting."""
     runs = config.getoption("prob_runs")
     if runs is None:
-        runs = int(config.getini("prob_runs"))
+        runs = marked if marked is not None else int(config.getini("prob_runs"))
     return max(1, runs)
 
 
@@ -292,17 +332,21 @@ def _parse_level(raw: Any, source: str) -> float:
     return level
 
 
-def _parse_prior(raw: str) -> tuple[float, float]:
-    parts = [p.strip() for p in str(raw).split(",")]
+def _parse_prior(raw: Any, source: str = "prob_prior") -> tuple[float, float]:
+    # An "a,b" string (ini) or an (a, b) pair (a mark's prior=).
+    if isinstance(raw, (tuple, list)):
+        parts = list(raw)
+    else:
+        parts = [p.strip() for p in str(raw).split(",")]
     try:
         if len(parts) != 2:
             raise ValueError
         a, b = float(parts[0]), float(parts[1])
         if not all(v > 0.0 and math.isfinite(v) for v in (a, b)):
             raise ValueError
-    except ValueError:
+    except (TypeError, ValueError):
         raise pytest.UsageError(
-            f"prob_prior must be two positive numbers 'a,b' (e.g. 1,1 or"
+            f"{source} must be two positive numbers 'a,b' (e.g. 1,1 or"
             f" 0.5,0.5), got {raw!r}"
         ) from None
     return a, b
@@ -339,13 +383,340 @@ def stats_config(config: pytest.Config) -> StatsConfig:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # Registered so --strict-markers accepts it.
+    config.addinivalue_line(
+        "markers",
+        "probability(min_rate=None, min_passes=None, runs=None,"
+        " confidence=None, method=None, prior=None): gate a benchmark case on"
+        " its pass rate (min_rate) or pass count (min_passes), and/or set its"
+        " run count. See https://pytest-probability.readthedocs.io/en/latest/"
+        "reference.html",
+    )
     # Resolve (and validate) up front so a bad value is a usage error
     # before anything runs — on the xdist controller, which renders,
     # as much as anywhere.
     stats_config(config)
+    gate_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gates
+# ---------------------------------------------------------------------------
+
+# Gate verdicts as the JSON report spells them; the terminal upper-cases.
+PASS, FAIL, UNDECIDED = "pass", "fail", "undecided"
+
+UNDECIDED_POLICIES = ("fail", "pass")
+ERROR_MODES = ("count", "exclude")
+
+
+class InfeasibleGateWarning(pytest.PytestWarning):
+    """A gate that cannot pass even if every run passes: too few runs."""
+
+
+def interval_verdict(low: float, high: float, bar: float) -> str:
+    """The verdict rule shared by every interval-based gate.
+
+    PASS when the whole interval lies above ``bar``, FAIL when it lies
+    entirely below, UNDECIDED when it straddles it — the data cannot
+    tell yet. Callers pass the unrounded bounds of the interval they
+    print, so a printed interval and its verdict never disagree.
+    """
+    if low > bar:
+        return PASS
+    if high < bar:
+        return FAIL
+    return UNDECIDED
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    """Session-wide gate settings: the global bar and the two policies.
+
+    ``min_rate`` is ``--prob-min-rate``/``prob_min_rate`` (``None``: no
+    global gate). ``undecided`` says whether an UNDECIDED verdict fails
+    the session. ``errors`` says whether errored runs of a gated case
+    count as non-passes (``count``) or leave its sample (``exclude``).
+    """
+
+    min_rate: float | None = None
+    undecided: str = "fail"
+    errors: str = "count"
+
+    def fails(self, verdict: str) -> bool:
+        """Whether a verdict fails the session."""
+        return verdict == FAIL or (verdict == UNDECIDED and self.undecided == "fail")
+
+
+_GATE_CONFIG = pytest.StashKey[GateConfig]()
+
+
+def _resolve_gate_config(config: pytest.Config) -> GateConfig:
+    min_rate = config.getoption("prob_min_rate")
+    if min_rate is not None:
+        min_rate = _parse_level(min_rate, "--prob-min-rate")
+    else:
+        raw = str(config.getini("prob_min_rate")).strip()
+        min_rate = _parse_level(raw, "prob_min_rate") if raw else None
+    undecided = config.getoption("prob_undecided")
+    if undecided is None:
+        undecided = str(config.getini("prob_undecided")).strip()
+        if undecided not in UNDECIDED_POLICIES:
+            raise pytest.UsageError(
+                f"prob_undecided must be one of {', '.join(UNDECIDED_POLICIES)},"
+                f" got {undecided!r}"
+            )
+    errors = str(config.getini("prob_errors")).strip()
+    if errors not in ERROR_MODES:
+        raise pytest.UsageError(
+            f"prob_errors must be one of {', '.join(ERROR_MODES)}, got {errors!r}"
+        )
+    return GateConfig(min_rate=min_rate, undecided=undecided, errors=errors)
+
+
+def gate_config(config: pytest.Config) -> GateConfig:
+    """The session's resolved ``GateConfig`` (validated at configure)."""
+    cfg = config.stash.get(_GATE_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_GATE_CONFIG] = _resolve_gate_config(config)
+    return cfg
+
+
+def _pct_bar(rate: float) -> str:
+    # A bar as the author wrote it: 0.9 -> "90%", 0.975 -> "97.5%".
+    return f"{rate * 100:g}%"
+
+
+@dataclass(frozen=True)
+class Gate:
+    """One case's resolved gate.
+
+    ``rule`` is ``"rate"`` (judge the interval against ``min_rate``) or
+    ``"count"`` (pass when passes ≥ ``min_passes``). ``stats`` holds the
+    method, level and prior the gate's interval uses — the session's,
+    with any per-gate overrides. ``runs`` is the case's planned run
+    count, ``errors`` the session's error mode.
+
+    Built at collection, then shipped as ``to_record()`` — a plain
+    dict — inside every run record: under xdist the controller decides
+    verdicts, and it never collects.
+    """
+
+    rule: str
+    stats: StatsConfig
+    min_rate: float | None = None
+    min_passes: int | None = None
+    errors: str = "count"
+    runs: int = 1
+
+    def judge(
+        self, passes: int, total: int
+    ) -> tuple[tuple[float, float] | None, str]:
+        """``(interval, verdict)`` for ``passes`` out of ``total`` judged
+        runs. The interval is ``None`` when there are no runs."""
+        interval = self.stats.interval(passes, total) if total else None
+        if self.rule == "count":
+            return interval, PASS if passes >= self.min_passes else FAIL
+        if interval is None:
+            return None, UNDECIDED
+        return interval, interval_verdict(*interval, self.min_rate)
+
+    def verdict(self, passes: int, total: int) -> str:
+        return self.judge(passes, total)[1]
+
+    def evaluate(self, s: CaseStats) -> GateResult:
+        """The verdict on a case's aggregated runs."""
+        if self.errors == "exclude":
+            # Errors are not evidence about the code: out of the sample.
+            total, excluded = s.passes + s.fails, s.errors
+        else:
+            total, excluded = s.total, 0
+        interval, verdict = self.judge(s.passes, total)
+        return GateResult(s.case, self, s.passes, total, excluded, interval, verdict)
+
+    def min_runs(self) -> int:
+        """Fewest runs with which the gate can PASS — all of them passing.
+
+        n/n only gets more convincing as n grows, for every method, so
+        a doubling search and then bisection find it in O(log n)
+        interval evaluations.
+        """
+        if self.rule == "count":
+            return self.min_passes
+
+        def passable(n: int) -> bool:
+            return self.verdict(n, n) == PASS
+
+        high = 1
+        while not passable(high):
+            high *= 2
+        low = high // 2
+        while high - low > 1:
+            mid = (low + high) // 2
+            if passable(mid):
+                high = mid
+            else:
+                low = mid
+        return high
+
+    def bar(self) -> str:
+        """The bar as the gates block prints it: ``≥90%``, ``≥19 passes``."""
+        if self.rule == "count":
+            return f"≥{self.min_passes} passes"
+        return f"≥{_pct_bar(self.min_rate)}"
+
+    def describe(self) -> str:
+        """The gate as written: ``min_rate=0.9 at 95%``, ``min_passes=19``."""
+        if self.rule == "count":
+            return f"min_passes={self.min_passes}"
+        text = f"min_rate={self.min_rate:g} at {_pct_bar(self.stats.level)}"
+        if self.stats.method != "exact":
+            text += f" ({self.stats.method})"
+        return text
+
+    def to_record(self) -> dict[str, Any]:
+        rec: dict[str, Any] = {"rule": self.rule}
+        if self.rule == "count":
+            rec["min_passes"] = self.min_passes
+        else:
+            rec["min_rate"] = self.min_rate
+        rec.update(
+            confidence=self.stats.level,
+            method=self.stats.method,
+            prior=list(self.stats.prior),
+            errors=self.errors,
+            runs=self.runs,
+        )
+        return rec
+
+    @classmethod
+    def from_record(cls, rec: dict[str, Any]) -> Gate:
+        return cls(
+            rule=rec["rule"],
+            stats=StatsConfig(
+                method=rec["method"],
+                level=rec["confidence"],
+                prior=tuple(rec["prior"]),
+            ),
+            min_rate=rec.get("min_rate"),
+            min_passes=rec.get("min_passes"),
+            errors=rec["errors"],
+            runs=rec["runs"],
+        )
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """A gate's verdict on one case, with the sample and interval behind
+    it: ``passes`` of ``total`` judged runs, ``excluded`` errored runs
+    left out (``prob_errors = exclude``)."""
+
+    case: str
+    gate: Gate
+    passes: int
+    total: int
+    excluded: int
+    interval: tuple[float, float] | None
+    verdict: str
+
+    def to_json(self) -> dict[str, Any]:
+        low, high = self.interval if self.interval is not None else (None, None)
+        return {
+            **self.gate.to_record(),
+            "passes": self.passes,
+            "total": self.total,
+            "excluded": self.excluded,
+            "low": low,
+            "high": high,
+            "verdict": self.verdict,
+        }
+
+
+_MARK_ARGS = ("min_rate", "min_passes", "runs", "confidence", "method", "prior")
+
+
+def _merge_probability_marks(marks: list) -> dict[str, Any]:
+    """Merge ``probability`` marks into one dict, closest mark first.
+
+    A ``pytest.param`` mark comes before the function's, and a
+    function's decorators run bottom-up (the one nearest the ``def``
+    first, as ``get_closest_marker`` sees them). The closest mark wins
+    key by key — except that ``min_rate`` and ``min_passes`` are one
+    setting, so a closer mark naming either replaces both. ``None``
+    values count as unset.
+    """
+    merged: dict[str, Any] = {}
+    for mark in marks:
+        if mark.args:
+            raise ValueError("takes keyword arguments only")
+        unknown = sorted(set(mark.kwargs) - set(_MARK_ARGS))
+        if unknown:
+            raise ValueError(
+                f"unexpected argument {', '.join(unknown)};"
+                f" expected one of {', '.join(_MARK_ARGS)}"
+            )
+        kwargs = {k: v for k, v in mark.kwargs.items() if v is not None}
+        if "min_rate" in kwargs and "min_passes" in kwargs:
+            raise ValueError("min_rate and min_passes can't be used together")
+        rule_set = "min_rate" in merged or "min_passes" in merged
+        for key, value in kwargs.items():
+            if key in ("min_rate", "min_passes") and rule_set:
+                continue
+            merged.setdefault(key, value)
+    return merged
+
+
+def _positive_int(raw: Any, name: str) -> int:
+    # bool is an int subclass; True as a count is a bug at the call site.
+    if isinstance(raw, bool) or not hasattr(raw, "__index__") or raw.__index__() < 1:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return raw.__index__()
+
+
+def _case_plan(config: pytest.Config, marks: list) -> tuple[int, Gate | None]:
+    """A case's run count and gate, from its ``probability`` marks
+    (closest first) and the session settings.
+
+    Every value given is validated, gate or no gate; bad ones raise
+    ``ValueError``/``pytest.UsageError``. The case is gated when a mark
+    sets ``min_rate`` or ``min_passes``, or a global min rate is set.
+    """
+    settings = _merge_probability_marks(marks)
+    runs_mark = settings.get("runs")
+    if runs_mark is not None:
+        runs_mark = _positive_int(runs_mark, "runs")
+    runs = _runs(config, runs_mark)
+    session = stats_config(config)
+    overrides: dict[str, Any] = {}
+    if "confidence" in settings:
+        overrides["level"] = _parse_level(settings["confidence"], "confidence")
+    if "method" in settings:
+        if settings["method"] not in stats.METHODS:
+            raise ValueError(
+                f"method must be one of {', '.join(stats.METHODS)},"
+                f" got {settings['method']!r}"
+            )
+        overrides["method"] = settings["method"]
+    if "prior" in settings:
+        overrides["prior"] = _parse_prior(settings["prior"], "prior")
+    gcfg = gate_config(config)
+    common = dict(
+        stats=dataclasses.replace(session, **overrides),
+        errors=gcfg.errors,
+        runs=runs,
+    )
+    if "min_passes" in settings:
+        min_passes = _positive_int(settings["min_passes"], "min_passes")
+        return runs, Gate(rule="count", min_passes=min_passes, **common)
+    if "min_rate" in settings:
+        min_rate = _parse_level(settings["min_rate"], "min_rate")
+        return runs, Gate(rule="rate", min_rate=min_rate, **common)
+    if gcfg.min_rate is not None:
+        return runs, Gate(rule="rate", min_rate=gcfg.min_rate, **common)
+    return runs, None
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +882,17 @@ class BenchFile(pytest.File):
             self._teardown_fn()
 
 
+class _CasePlan(NamedTuple):
+    """One case of a bench function, resolved at collection."""
+
+    variant_id: str
+    params: dict[str, Any]
+    marks: tuple
+    case: str
+    runs: int
+    gate: Gate | None
+
+
 class BenchFunction(pytest.Collector):
     """One ``bench_*`` function: an ordinary parametrized generator.
 
@@ -529,46 +911,94 @@ class BenchFunction(pytest.Collector):
         all_marks = list(getattr(self.bench_fn, "pytestmark", []))
         param_marks = [m for m in all_marks if m.name == "parametrize"]
         other_marks = [m for m in all_marks if m.name != "parametrize"]
-        variants = _parametrize_variants(param_marks)
-        runs = _runs(self.config)
+        fn_prob = [m for m in other_marks if m.name == "probability"]
         short = self.name.removeprefix("bench_") or self.name
+
+        plans: list[_CasePlan] = []
+        for variant_id, params, vmarks in _parametrize_variants(param_marks):
+            # Unparametrized: one case, named after the function.
+            case = f"{short}::{variant_id}" if variant_id else short
+            case_prob = [m for m in vmarks if m.name == "probability"]
+            try:
+                runs, gate = _case_plan(self.config, [*case_prob, *fn_prob])
+            except (ValueError, pytest.UsageError) as exc:
+                raise self.CollectError(
+                    f"{case}: invalid probability mark: {exc}"
+                ) from None
+            plans.append(_CasePlan(variant_id, params, vmarks, case, runs, gate))
+        self._warn_infeasible(short, plans)
 
         if _transpose(self.config):
             # Run-major: run 1 of every case, then run 2, ...
+            most = max((p.runs for p in plans), default=0)
             pairs = [
-                (variant, run_id)
-                for run_id in range(1, runs + 1)
-                for variant in variants
+                (plan, run_id)
+                for run_id in range(1, most + 1)
+                for plan in plans
+                if run_id <= plan.runs
             ]
         else:
             pairs = [
-                (variant, run_id)
-                for variant in variants
-                for run_id in range(1, runs + 1)
+                (plan, run_id) for plan in plans for run_id in range(1, plan.runs + 1)
             ]
-        for (variant_id, params, vmarks), run_id in pairs:
-            if variant_id:
-                name = variant_id if runs == 1 else f"{variant_id}[run{run_id}]"
-                case = f"{short}::{variant_id}"
+        for plan, run_id in pairs:
+            if plan.variant_id:
+                name = (
+                    plan.variant_id
+                    if plan.runs == 1
+                    else f"{plan.variant_id}[run{run_id}]"
+                )
             else:
-                # Unparametrized: one case, named after the function.
                 name = f"run{run_id}"
-                case = short
             item = BenchItem.from_parent(
                 self,
                 name=name,
                 run_id=run_id,
                 bench_fn=self.bench_fn,
-                params=params,
-                case=case,
+                params=plan.params,
+                case=plan.case,
+                gate=plan.gate,
             )
-            for mark in (*other_marks, *vmarks):
+            for mark in (*other_marks, *plan.marks):
                 # add_marker() only accepts MarkDecorator; these are raw
                 # Mark objects, so attach the way it does internally
                 # (skip/xfail/-m all read these).
                 item.own_markers.append(mark)
                 item.keywords[mark.name] = mark
             yield item
+
+    def _warn_infeasible(self, short: str, plans: list[_CasePlan]) -> None:
+        """Warn about gates that cannot pass even if every run passes.
+
+        One warning per distinct gate, naming the case — or, when
+        several cases share it (a global gate), how many.
+        """
+        infeasible: dict[Gate, list[str]] = {}
+        passable: dict[Gate, bool] = {}
+        for plan in plans:
+            gate = plan.gate
+            if gate is None:
+                continue
+            if gate not in passable:
+                passable[gate] = gate.verdict(gate.runs, gate.runs) == PASS
+            if not passable[gate]:
+                infeasible.setdefault(gate, []).append(plan.case)
+        code = getattr(self.bench_fn, "__code__", None)
+        for gate, cases in infeasible.items():
+            if len(cases) == 1:
+                who, has = cases[0], "this case has"
+            else:
+                who, has = f"{short} ({len(cases)} cases)", "each has"
+            # warn_explicit, like Node.warn, but pointing at the function.
+            warnings.warn_explicit(
+                InfeasibleGateWarning(
+                    f"{who}: {gate.describe()} needs ≥{gate.min_runs()} runs;"
+                    f" {has} {gate.runs}"
+                ),
+                category=None,
+                filename=str(self.path),
+                lineno=code.co_firstlineno if code is not None else 1,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +1030,9 @@ class BenchItem(pytest.Item):
     wrong), any other exception is an error (your harness broke).
     ``pytest.skip``/``xfail`` raise outcomes that bypass recording
     entirely, exactly like pytest.
+
+    In a gated case a failing run is a sample, not a verdict, so
+    ``pytest_runtest_makereport`` reports it as xfailed.
     """
 
     def __init__(
@@ -609,6 +1042,7 @@ class BenchItem(pytest.Item):
         bench_fn: Callable,
         params: dict[str, Any],
         case: str,
+        gate: Gate | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -617,6 +1051,7 @@ class BenchItem(pytest.Item):
         self.params = params
         # Function-qualified case id: the aggregation row.
         self.case = case
+        self.gate = gate
 
     def runtest(self) -> None:
         delay = _delay(self.config)
@@ -655,26 +1090,63 @@ class BenchItem(pytest.Item):
             # control-flow BaseExceptions: those runs are not samples.
             if outcome is not None:
                 cost = recorder.cost + sum(u["cost"] for u in recorder.usage)
-                self.user_properties.append(
-                    (
-                        # Plain dicts only: user_properties must survive
-                        # xdist's worker-to-controller serialization.
-                        "probability",
-                        {
-                            "case": self.case,
-                            "run": self.run_id,
-                            "outcome": outcome,
-                            "message": message,
-                            "error": error,
-                            "elapsed": time.perf_counter() - start,
-                            "cost": cost or None,
-                            "usage": recorder.usage,
-                        },
-                    )
-                )
+                record = {
+                    "case": self.case,
+                    "run": self.run_id,
+                    "outcome": outcome,
+                    "message": message,
+                    "error": error,
+                    "elapsed": time.perf_counter() - start,
+                    "cost": cost or None,
+                    "usage": recorder.usage,
+                }
+                if self.gate is not None:
+                    # The controller decides verdicts without collecting,
+                    # so the gate rides along with every run.
+                    record["gate"] = self.gate.to_record()
+                # Plain dicts only: user_properties must survive xdist's
+                # worker-to-controller serialization.
+                self.user_properties.append(("probability", record))
 
     def reportinfo(self):
         return self.path, 0, f"case: {self.case}"
+
+
+# Old-style wrapper (not wrapper=True) so pytest 7.4 with older pluggy
+# keeps working.
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
+    """Report a gated case's failing runs as xfailed.
+
+    A failing run of a gated case is one sample of its pass rate; the
+    gate's verdict, not the run, decides pass or fail. Reporting it as
+    xfailed keeps its traceback on the report (``--xfail-tb`` prints
+    it, ``-rx`` lists the run with its assert message as the reason),
+    keeps ``-x``/``--maxfail`` from stopping on it, and keeps it from
+    failing the session. Errors do fail the session, unless
+    ``prob_errors = exclude`` takes them out of the gate's sample.
+    ``--runxfail`` turns all of this off, as it does for xfail marks.
+    """
+    outcome = yield
+    if call.when != "call" or not isinstance(item, BenchItem) or item.gate is None:
+        return
+    report = outcome.get_result()
+    if not report.failed or getattr(item.config.option, "runxfail", False):
+        return
+    record = next(
+        (v for k, v in report.user_properties if k == "probability"), None
+    )
+    if record is None:
+        # pytest.fail() and other control flow: not a sample.
+        return
+    if record["outcome"] == "fail":
+        reason = f"probability gate: {record['message'] or 'AssertionError'}"
+    elif record["outcome"] == "error" and item.gate.errors == "exclude":
+        reason = f"probability gate, error excluded: {record['error']}"
+    else:
+        return
+    report.outcome = "skipped"
+    report.wasxfail = reason
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +1183,8 @@ class CaseStats:
     cost: float = 0.0
     # per-model token aggregates: model -> {input_tokens, output_tokens, ...}
     usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # The case's gate, rebuilt from its first run record; None: ungated.
+    gate: Gate | None = None
 
     @property
     def total(self) -> int:
@@ -741,6 +1215,12 @@ _MARKUP = {
     "errored": {"yellow": True},
     "fail": {"red": True},
     "error": {"red": True},
+}
+
+_VERDICT_MARKUP = {
+    PASS: {"green": True},
+    UNDECIDED: {"yellow": True},
+    FAIL: {"red": True},
 }
 
 
@@ -789,9 +1269,17 @@ class ProbabilityAggregator:
         for name, value in report.user_properties:
             if name != "probability":
                 continue
+            gate = value.get("gate")
             if self._records is not None:
-                self._records.append(value)
+                # The gate spec is per case: rows[].gate reports it once.
+                self._records.append(
+                    {k: v for k, v in value.items() if k != "gate"}
+                    if gate is not None
+                    else value
+                )
             st = self._stats.setdefault(value["case"], CaseStats(case=value["case"]))
+            if gate is not None and st.gate is None:
+                st.gate = Gate.from_record(gate)
             outcome = value["outcome"]
             if outcome == "pass":
                 st.passes += 1
@@ -804,12 +1292,29 @@ class ProbabilityAggregator:
             for usage in value.get("usage", ()):
                 _merge_usage(st.usage, usage)
 
+    def gate_results(self) -> dict[str, GateResult]:
+        """The verdict for every gated row, from the aggregated counts."""
+        return {
+            s.case: s.gate.evaluate(s)
+            for s in self._stats.values()
+            if s.gate is not None
+        }
+
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        if not self._json_path:
-            return
         # Under pytest-xdist this hook also fires on workers, which only
-        # hold a shard of the results — the controller writes the file.
+        # hold a shard of the results — the controller decides gates and
+        # writes the file.
         if hasattr(session.config, "workerinput"):
+            return
+        results = self.gate_results()
+        gcfg = gate_config(session.config)
+        if exitstatus == pytest.ExitCode.OK and any(
+            gcfg.fails(r.verdict) for r in results.values()
+        ):
+            # Every run passed or was xfailed, but a gate did not hold.
+            # Any other status (failures, interrupts) already says more.
+            exitstatus = session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        if not self._json_path:
             return
         all_stats = list(self._stats.values())
         cfg = stats_config(session.config)
@@ -843,6 +1348,9 @@ class ProbabilityAggregator:
                     "pass_rate": s.passes / s.total * 100 if s.total else 0.0,
                     "status": s.status,
                     "ci": self._ci_json(cfg, s),
+                    "gate": (
+                        results[s.case].to_json() if s.case in results else None
+                    ),
                     "cost": s.cost,
                     "usage": s.usage,
                 }
@@ -873,30 +1381,104 @@ class ProbabilityAggregator:
         return totals
 
     @staticmethod
-    def _ci_cells(cfg: StatsConfig, all_stats: list[CaseStats]) -> list[str | None]:
+    def _interval_cells(bounds: list[tuple[float, float] | None]) -> list[str]:
+        """Padded ``[low, high]`` cells, one per entry; blank for ``None``,
+        and all empty strings when every entry is ``None``.
+
+        Low and high are right-aligned separately so the brackets and
+        comma line up when widths vary.
+        """
+        texts = [tuple(_pct(v) for v in b) if b is not None else None for b in bounds]
+        shown = [t for t in texts if t is not None]
+        if not shown:
+            return [""] * len(bounds)
+        low_w = max(len(t[0]) for t in shown)
+        high_w = max(len(t[1]) for t in shown)
+        width = low_w + high_w + 4  # "[", ", ", "]"
+        return [
+            f"[{t[0]:>{low_w}}, {t[1]:>{high_w}}]" if t is not None else " " * width
+            for t in texts
+        ]
+
+    @classmethod
+    def _ci_cells(
+        cls, cfg: StatsConfig, all_stats: list[CaseStats]
+    ) -> list[str | None]:
         """The interval column, one padded cell per row (or ``None``s
         when the column is off).
 
         A single run says almost nothing about a rate, so rows with one
         run get a blank cell, and the column disappears entirely when no
-        row has more. Low and high are right-aligned separately so the
-        brackets and comma line up when widths vary.
+        row has more.
         """
         if not cfg.intervals or all(s.total <= 1 for s in all_stats):
             return [None] * len(all_stats)
-        bounds = [
-            tuple(_pct(v) for v in cfg.interval(s.passes, s.total))
-            if s.total > 1
-            else None
-            for s in all_stats
-        ]
-        low_w = max(len(b[0]) for b in bounds if b)
-        high_w = max(len(b[1]) for b in bounds if b)
-        width = low_w + high_w + 4  # "[", ", ", "]"
-        return [
-            f"[{b[0]:>{low_w}}, {b[1]:>{high_w}}]" if b else " " * width
-            for b in bounds
-        ]
+        return cls._interval_cells(
+            [
+                cfg.interval(s.passes, s.total) if s.total > 1 else None
+                for s in all_stats
+            ]
+        )
+
+    @staticmethod
+    def _status_text(s: CaseStats) -> str:
+        # Three run classes, spelled out: the status word names the
+        # combination, and mixed rows show the error count — marked
+        # "excluded" when the case's gate left errors out of its sample.
+        if s.errors and s.gate is not None and s.gate.errors == "exclude":
+            word = "" if s.status == "errored" else f"{s.status.upper()} "
+            return f"{word}({s.errors} errored, excluded)"
+        if s.status == "errored":
+            return f"{s.errors} ERRORED"
+        if s.status == "pass":
+            return ""
+        if s.errors and s.status != "error":
+            return f"{s.status.upper()} ({s.errors} errored)"
+        return s.status.upper()
+
+    def _gate_tally(self, results: dict[str, GateResult]) -> tuple[str, dict]:
+        """The footer's ``Gates:`` line and its color."""
+        gcfg = gate_config(self._config)
+        counts = Counter(r.verdict for r in results.values())
+        parts = []
+        if counts[PASS]:
+            parts.append(f"{counts[PASS]} passed")
+        if counts[FAIL]:
+            parts.append(f"{counts[FAIL]} failed")
+        if counts[UNDECIDED]:
+            allowed = "" if gcfg.fails(UNDECIDED) else " (allowed)"
+            parts.append(f"{counts[UNDECIDED]} undecided{allowed}")
+        if any(gcfg.fails(v) for v in counts):
+            markup = _VERDICT_MARKUP[FAIL]
+        elif counts[UNDECIDED]:
+            markup = _VERDICT_MARKUP[UNDECIDED]
+        else:
+            markup = _VERDICT_MARKUP[PASS]
+        return f"  Gates:   {', '.join(parts)}", markup
+
+    def _write_gates(self, tr, results: dict[str, GateResult]) -> None:
+        """The ``probability: gates`` block: every gate that did not
+        PASS, with the interval and bar its verdict came from."""
+        shown = [r for r in results.values() if r.verdict != PASS]
+        if not shown:
+            return
+        tr.write_sep("=", "probability: gates")
+        name_col = max(len(r.case) for r in shown)
+        fracs = [f"{r.passes}/{r.total}" for r in shown]
+        frac_col = max(len(f) for f in fracs)
+        # Always shown, whatever the interval column's settings: the
+        # verdict is read off this interval.
+        cells = self._interval_cells([r.interval for r in shown])
+        bars = [r.gate.bar() for r in shown]
+        bar_col = max(len(b) for b in bars)
+        for r, frac, cell, bar in zip(shown, fracs, cells, bars):
+            line = f"  {r.case:<{name_col}}  {frac:>{frac_col}}"
+            if cell:
+                line += f"  {cell}"
+            line += f"  {bar:<{bar_col}}  {r.verdict.upper()}"
+            if r.excluded:
+                line += f"  ({r.excluded} errored, excluded)"
+            tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:
         del exitstatus, config
@@ -915,14 +1497,9 @@ class ProbabilityAggregator:
                 line += f"  {ci}"
             if s.cost:
                 line += f"  ${s.cost:.4f}"
-            # Three run classes, spelled out: the status word names the
-            # combination, and mixed rows show the error count.
-            if s.status == "errored":
-                line += f"  {s.errors} ERRORED"
-            elif s.status != "pass":
-                line += f"  {s.status.upper()}"
-                if s.errors and s.status != "error":
-                    line += f" ({s.errors} errored)"
+            status = self._status_text(s)
+            if status:
+                line += f"  {status}"
             tr.write_line(line.rstrip(), **_MARKUP.get(s.status, {}))
 
         total_passes = sum(s.passes for s in all_stats)
@@ -934,6 +1511,10 @@ class ProbabilityAggregator:
             overall += f", {total_errors} errored"
         tr.write_line("")
         tr.write_line(overall, bold=True)
+        results = self.gate_results()
+        if results:
+            tally, markup = self._gate_tally(results)
+            tr.write_line(tally, **markup)
         total_cost = sum(s.cost for s in all_stats)
         if total_cost:
             tr.write_line(f"  Cost:    ${total_cost:.4f}")
@@ -955,3 +1536,4 @@ class ProbabilityAggregator:
                 tr.write_line(line.rstrip())
         if self._json_path:
             tr.write_line(f"  Report:  {self._json_path}")
+        self._write_gates(tr, results)

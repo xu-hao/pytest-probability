@@ -132,6 +132,40 @@ def bench_triage(text, style):
   triage::refund-chain_of_thought  10/10  [69%, 100%]  $0.0040
 ```
 
+### Gates: pass on a rate, not on every run
+
+By default any failing run fails the session. To hold a case to a pass
+rate instead, gate it:
+
+```python
+@pytest.mark.probability(min_rate=0.9)               # or --prob-min-rate=0.9 for every case
+@pytest.mark.parametrize("text,expected", CASES)
+def bench_classify(text, expected):
+    assert my_classifier(text) == expected
+```
+
+A gated case **passes** when its whole interval lies above the bar,
+**fails** when it lies entirely below, and is **undecided** (fails by
+default; `--prob-undecided=pass` relaxes it) in between. Its failing
+runs are reported as xfailed, so only the verdicts decide the exit
+status:
+
+```
+$ pytest benchmarks/ --prob-runs=40
+...
+  Overall: 80/120 passed (67%)
+  Gates:   1 passed, 1 failed, 1 undecided
+============================== probability: gates ==============================
+  classify::identify_pii  37/40  [80%, 98%]  ≥90%  UNDECIDED
+  classify::never          3/40  [ 2%, 20%]  ≥90%  FAIL
+```
+
+`min_passes=19, runs=20` gates on a count instead; `confidence=`,
+`method=` and `prior=` override the session's settings for one gate;
+`pytest.param(..., marks=pytest.mark.probability(...))` gates one case.
+A collection-time warning flags gates that can't pass with the runs
+they have (`min_rate=0.9` needs at least 36 at 95%).
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -143,6 +177,8 @@ def bench_triage(text, style):
 | `--prob-method=M` | CLI | ini or `exact` | row interval method: `exact` (Clopper-Pearson), `wilson`, or `bayes` |
 | `--prob-confidence=LEVEL` | CLI | ini or 0.95 | two-sided level for intervals |
 | `--prob-no-intervals` | CLI | ini or shown | hide the interval column |
+| `--prob-min-rate=RATE` | CLI | ini or none | gate every case on its pass rate |
+| `--prob-undecided={fail,pass}` | CLI | ini or `fail` | whether an UNDECIDED gate fails the session |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -151,6 +187,10 @@ def bench_triage(text, style):
 | `prob_confidence` | ini | 0.95 | default for `--prob-confidence` |
 | `prob_prior` | ini | `1,1` | Beta prior `a,b` for `bayes` |
 | `prob_intervals` | ini | true | show the interval column |
+| `prob_min_rate` | ini | — | default for `--prob-min-rate` |
+| `prob_undecided` | ini | `fail` | default for `--prob-undecided` |
+| `prob_errors` | ini | `count` | errored runs in gated cases: `count` as non-passes, or `exclude` |
+| `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior` |
 
 ## JSON report
 
@@ -209,7 +249,8 @@ set; workers never write partial reports.
   controller, which renders the table).
 - Exit code follows pytest: any failed or errored run fails the session,
   so a flaky case exits nonzero. For softer CI gates (e.g. alert only
-  below 80%), policy-check the JSON report in a follow-up step.
+  below 80%), gate the case: `@pytest.mark.probability(min_rate=0.8)` or
+  `--prob-min-rate=0.8`. Then the verdict, not each run, decides.
 - `--prob-delay` throttles between executions and never sleeps before the
   first; under pytest-xdist each worker throttles its own stream.
 - Default order is case-major (`alpha[run1]`, `alpha[run2]`, `beta[run1]`,
