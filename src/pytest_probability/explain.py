@@ -23,8 +23,8 @@ How it fits together:
   body, a ``tone`` (a verdict or status, for coloring) and the
   glossary ``terms`` it relied on. There is one function per kind of
   line: ``gate_reading``, ``row_reading`` and ``aggregate_reading``
-  today; later features add their own (``comparison_reading``, …) next
-  to them.
+  (which also reads ρ and the runs-vs-inputs projection) today; later
+  features add their own (``comparison_reading``, …) next to them.
 - The *glossary* ("Methods used") lists only the terms the readings
   used. Each entry is a function registered with ``@glossary_entry``
   under a key; a reading names ``(key, detail)`` pairs in ``terms``,
@@ -46,7 +46,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable, Iterable
 
-from .plugin import FAIL, PASS, UNDECIDED, _pct, _pct1, _pct_bar
+from .plugin import FAIL, PASS, UNDECIDED, _change, _pct, _pct1, _pct_bar
 
 #: The last line of the normal summary when something deserves a
 #: closer look and ``--prob-explain`` is off.
@@ -408,7 +408,7 @@ def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
             f"Next: add inputs (more parametrize cases) to reach {min_inputs}.",
         )
         return Reading(heading, paras, None, terms)
-    paras = (
+    paras = [
         f"{first} The true average pass rate is probably between"
         f" {_pct1(agg.ci[0])} and {_pct1(agg.ci[1])}"
         f" ({_pct_bar(agg.level)} confidence).",
@@ -417,11 +417,80 @@ def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
         " worse, not only for runs varying. If you picked the inputs by hand"
         " rather than at random, it measures the cases you chose, not inputs"
         " in general.",
-        "Next: to narrow the range, add inputs. More runs of the same inputs"
-        " narrow it less, often much less, because they can't show how other"
-        " inputs would do.",
+    ]
+    projection = agg.projection()
+    if projection is None:
+        paras.append(
+            "Next: to narrow the range, add inputs. More runs of the same inputs"
+            " narrow it less, often much less, because they can't show how"
+            " other inputs would do."
+        )
+        return Reading(heading, tuple(paras), None, terms)
+    heading += f"  ρ={agg.icc:.2f}"
+    terms += (("icc", None),)
+    paras.extend(_budget(agg, projection))
+    return Reading(heading, tuple(paras), None, terms)
+
+
+# More runs count as helping when doubling them buys at least this
+# share of what doubling the inputs would.
+_RUNS_HELP = 0.5
+
+
+def _budget(agg: Any, projection: tuple[float, float]) -> list[str]:
+    """The ρ and runs-vs-inputs paragraphs of an aggregate reading.
+
+    Doubling the inputs always narrows the range more than doubling the
+    runs (or as much, at ρ = 0), so the advice turns on whether runs
+    still buy a fair share of it.
+    """
+    runs, inputs = projection
+    runs_help = runs <= _RUNS_HELP * inputs
+    if runs_help:
+        reading = (
+            "Here it is low enough that the outputs vary noticeably from run"
+            " to run, so more runs of an input still tell you more about it."
+        )
+    else:
+        reading = (
+            "Here it is high enough that each input tends to be consistently"
+            " right or consistently wrong, so more runs of an input mostly"
+            " repeat what you already know about it."
+        )
+    body = (
+        f"ρ = {agg.icc:.2f} measures how alike the runs of one input are, from"
+        " 0 (an input's runs differ as much as runs of different inputs) to 1"
+        f" (every run of an input gives the same result). {reading} With twice"
+        f" the runs of every input the range would be {_narrower(runs)}; with"
+        f" twice as many inputs (and as many runs each), {_narrower(inputs)}."
     )
-    return Reading(heading, paras, None, terms)
+    if agg.cost:
+        body += (
+            " Either way the number of runs doubles, so each option would cost"
+            f" about ${agg.cost:.4f} more, assuming new inputs cost as much per"
+            " run as these did."
+        )
+    if runs_help:
+        step = (
+            "Next: to narrow the range, add runs or inputs: both help here, and"
+            " more runs are often easier, since they need no new inputs."
+        )
+    else:
+        step = (
+            "Next: to narrow the range, add inputs. More runs of the same inputs"
+            " would help much less."
+        )
+    return [body, step]
+
+
+def _narrower(change: float) -> str:
+    # The same rounding as the summary's continuation line.
+    text = _change(change)
+    if text == "±0%":
+        return "no narrower"
+    if text == "−<1%":
+        return "less than 1% narrower"
+    return f"about {text.removeprefix('−')} narrower"
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +597,25 @@ def _aggregate_entry(keys: list[tuple]) -> str:
                 for level, resamples, seed, min_inputs in keys
             ),
         ]
+    )
+
+
+@glossary_entry("icc", "ρ")
+def _icc_entry(_: list) -> str:
+    return (
+        "How alike the runs of one input are (the intraclass correlation),"
+        " from 0 (an input's runs differ as much as runs of different inputs)"
+        " to 1 (every run of an input gives the same result). Low: outputs"
+        " vary from run to run, so more runs help. High: each input is"
+        " consistently right or wrong, so add inputs instead. \"runs ×2\" and"
+        " \"inputs ×2\" are how much the range would narrow with twice the"
+        " runs of every input, or twice as many inputs; each doubles the"
+        " number of runs, and the cost shown assumes new inputs cost as much"
+        " per run as these did. With few inputs ρ is itself rough, so read"
+        " them as a direction, not a promise. (One-way analysis of variance"
+        " on every run's pass or fail, adjusted for inputs with different run"
+        " counts, kept between 0 and 1; the range scales with"
+        " √((1+(k−1)ρ)/k) for k runs per input.)"
     )
 
 

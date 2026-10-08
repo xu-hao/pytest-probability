@@ -313,6 +313,23 @@ Also in `plugin.py`, after `CaseStats`:
   interval, without Overall when there is a single function, and none
   under `--prob-no-intervals`.
 
+- `Aggregate.icc` is `stats.icc(counts)` — ICC(1) by one-way ANOVA on
+  the per-run 0/1 outcomes, computed from the `(passes, total)` counts
+  alone (for binary data the sums of squares follow from them), with
+  k₀ = (Σkᵢ − Σkᵢ²/Σkᵢ)/(N − 1) for unequal run counts, clipped to
+  [0, 1]. It is `None` when undefined: every case run once (no
+  within-input degrees of freedom) or every run with the same outcome
+  (both mean squares 0). `width_factor` is `stats.width_factor` at
+  `harmonic_runs` — the harmonic mean of the run counts, which makes
+  √(ρ + (1 − ρ)/k) exact for an equally weighted mean of per-case
+  fractions. `projection()` gives the relative width change for runs
+  ×2 and inputs ×2 through `stats.projected_width`; `cost` (the cases'
+  recorded cost, `math.fsum`, so arrival order can't change it) prices
+  both, since each doubles the number of runs. ρ is always computed,
+  suppressed or not, and goes to JSON as `icc`/`width_factor`;
+  `_aggregate_lines()` shows it, with the continuation line, only on
+  shown lines.
+
 Errored runs count as non-passes in an aggregate even under
 `prob_errors = exclude`: aggregates use the row's fraction, and the
 exclusion is a gate setting. Aggregates never touch gate verdicts or
@@ -331,7 +348,8 @@ it needs it).
   `paragraphs` (the last one usually `Next: …`), a `tone` for coloring
   and the glossary `terms` it used. There is one function per kind of
   line — `gate_reading(GateResult, …)`, `row_reading(CaseStats, …)`
-  and `aggregate_reading(Aggregate, min_inputs)` — and a new kind of
+  and `aggregate_reading(Aggregate, min_inputs)` (which adds the ρ and
+  runs-vs-inputs paragraphs when the aggregate has a ρ) — and a new kind of
   output line gets a new function beside them.
 - The glossary is a registry: `@glossary_entry(key, label)` registers
   `fn(details) -> text`. A reading lists `(key, detail)` pairs, and
@@ -387,4 +405,5 @@ down and users rely on:
     draws from cases sorted by id, with `stats.bootstrap`'s private
     seeded generator, on the process that has every result. The same
     results give the same intervals, with and without xdist, and the
-    global `random` state is never touched.
+    global `random` state is never touched. ρ and its projection are
+    exact functions of the same counts.

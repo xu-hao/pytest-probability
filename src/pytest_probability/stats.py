@@ -22,6 +22,10 @@ Contents:
   ``fisher_exact`` (p-value).
 - **Resampling** — ``bootstrap`` (seeded) and ``percentile_interval``,
   with ``normal_interval`` on a mean as the cross-check.
+- **Clustered runs** — ``icc`` (intraclass correlation of per-run
+  pass/fail outcomes, by one-way ANOVA), ``width_factor`` and
+  ``projected_width`` (how an interval over inputs scales with runs
+  and inputs).
 
 Conventions:
 
@@ -562,3 +566,95 @@ def normal_interval(data: Sequence[float], level: float = 0.95) -> tuple[float, 
     mean = statistics.fmean(data)
     half = z * statistics.stdev(data, mean) / math.sqrt(len(data))
     return mean - half, mean + half
+
+
+# ---------------------------------------------------------------------------
+# Clustered runs: intraclass correlation and interval width
+# ---------------------------------------------------------------------------
+
+
+def icc(counts: Sequence[tuple[int, int]], *, clip: bool = True) -> float | None:
+    """Intraclass correlation ρ of per-run pass/fail outcomes, grouped
+    by input: ``counts`` holds ``(passes, runs)`` per input.
+
+    One-way random-effects ANOVA on the 0/1 outcome of every run, with
+    inputs as groups — ICC(1). For binary outcomes the sums of squares
+    follow from the counts alone (a run's square is the run itself):
+
+    - between inputs: SSB = Σ xᵢ²/kᵢ − (Σ xᵢ)²/M, on N − 1 degrees of
+      freedom;
+    - within inputs: SSW = Σ xᵢ(kᵢ − xᵢ)/kᵢ, on M − N;
+
+    with xᵢ passes in kᵢ runs, N inputs and M = Σ kᵢ runs. Unequal run
+    counts use the adjusted average group size
+    k₀ = (M − Σ kᵢ²/M)/(N − 1), which is k when every input has k runs
+    (and never below 1), and
+
+        ρ = (MSB − MSW) / (MSB + (k₀ − 1)·MSW).
+
+    ρ near 0: an input's runs vary as much as runs of different inputs.
+    ρ near 1: every run of an input gives the same result. The estimate
+    can come out negative (inputs more alike than chance would allow);
+    with ``clip`` (the default) it is clipped to [0, 1], the range the
+    model allows. ``clip=False`` returns the raw value, for checking.
+
+    ``None`` when ρ is not defined: fewer than 2 inputs, every input
+    with a single run (nothing within an input to compare), or no
+    variation at all — every run passed, or every run failed — when
+    both mean squares are 0 and there is nothing to split.
+    """
+    pairs = [_check_counts(x, n, "passes", "runs") for x, n in counts]
+    n_inputs = len(pairs)
+    total = sum(n for _, n in pairs)
+    if n_inputs < 2 or total == n_inputs:
+        return None
+    passes = sum(x for x, _ in pairs)
+    ssb = math.fsum(x * x / n for x, n in pairs) - passes * passes / total
+    ssw = math.fsum(x * (n - x) / n for x, n in pairs)
+    # SSB is a difference of nearly equal sums when the inputs barely
+    # differ; rounding must not turn "no spread" into a negative one.
+    msb = max(0.0, ssb) / (n_inputs - 1)
+    msw = ssw / (total - n_inputs)
+    k0 = (total - math.fsum(n * n for _, n in pairs) / total) / (n_inputs - 1)
+    denominator = msb + (k0 - 1.0) * msw
+    if denominator <= 0.0:
+        return None
+    rho = (msb - msw) / denominator
+    return min(1.0, max(0.0, rho)) if clip else rho
+
+
+def width_factor(k: float, rho: float) -> float:
+    """√((1 + (k − 1)ρ)/k): the standard deviation of one input's pass
+    fraction over k runs, relative to that of a single run.
+
+    An interval over N inputs has a width proportional to
+    ``width_factor(k, ρ)/√N``. At ρ = 0 runs are as good as fresh inputs
+    and the factor is 1/√k; at ρ = 1 an input's extra runs add nothing
+    and it is 1. ``k`` may be fractional — for inputs with different run
+    counts, the harmonic mean of the counts gives the factor of their
+    equally weighted average exactly.
+    """
+    k = float(k)
+    if not (k >= 1.0 and math.isfinite(k)):
+        raise ValueError(f"k must be a finite number of at least 1, got {k}")
+    rho = _check_unit("rho", rho)
+    return math.sqrt((1.0 + (k - 1.0) * rho) / k)
+
+
+def projected_width(
+    k: float, rho: float, *, runs: float = 1.0, inputs: float = 1.0
+) -> float:
+    """How an interval's width over inputs would scale — new width over
+    today's — with ``runs`` times as many runs per input and ``inputs``
+    times as many inputs (new inputs alike to today's).
+
+    ``width_factor(runs·k, ρ)/width_factor(k, ρ)/√inputs``: doubling the
+    inputs always gives 1/√2 ≈ 0.71, while doubling the runs gives
+    between that (ρ = 0) and 1 (ρ = 1). At k = 10, doubling the runs
+    narrows the interval by about 22% at ρ = 0.025, 5% at ρ = 0.3 and 2%
+    at ρ = 0.6.
+    """
+    runs = _check_positive("runs", runs)
+    inputs = _check_positive("inputs", inputs)
+    before = width_factor(k, rho)
+    return width_factor(k * runs, rho) / before / math.sqrt(inputs)

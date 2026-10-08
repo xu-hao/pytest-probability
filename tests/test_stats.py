@@ -525,6 +525,158 @@ def test_cluster_bootstrap_performance():
 
 
 # ---------------------------------------------------------------------------
+# Intraclass correlation and interval width (#5)
+# ---------------------------------------------------------------------------
+
+# (passes, runs) per input: equal and unequal run counts, inputs that
+# are all-or-nothing, inputs that look alike, and a negative raw ρ.
+ICC_FIXTURES = {
+    "equal k": [(i % 5 * 2 + 2, 10) for i in range(12)],
+    "unequal k": [(3, 4), (0, 2), (5, 5), (1, 7), (6, 10), (2, 3), (0, 1)],
+    "mostly k=1": [(10, 10)] + [(0, 1)] * 9,
+    "all-or-nothing": [(5, 5), (0, 5), (5, 5), (0, 5)],
+    "alike inputs": [(5, 10), (5, 10), (5, 10), (4, 10), (6, 10)],
+    "negative raw": [(1, 2), (1, 2), (1, 2), (2, 2)],
+    "large": [(i * 37 % 51, 50 + i % 7) for i in range(40)],
+}
+
+
+def _icc_reference(counts):
+    """ρ by the textbook route, independently of the stats module:
+    statsmodels fits a one-way ANOVA to one 0/1 row per run, and k₀ is
+    computed from the group sizes."""
+    pd = pytest.importorskip("pandas")
+    smf = pytest.importorskip("statsmodels.formula.api")
+    sm_anova = pytest.importorskip("statsmodels.stats.anova")
+    rows = [
+        {"input": f"i{i}", "y": float(r < x)}
+        for i, (x, n) in enumerate(counts)
+        for r in range(n)
+    ]
+    table = sm_anova.anova_lm(smf.ols("y ~ C(input)", pd.DataFrame(rows)).fit())
+    msb = table.loc["C(input)", "mean_sq"]
+    msw = table.loc["Residual", "mean_sq"]
+    sizes = [n for _, n in counts]
+    m = sum(sizes)
+    k0 = (m - sum(n * n for n in sizes) / m) / (len(sizes) - 1)
+    return (msb - msw) / (msb + (k0 - 1) * msw)
+
+
+@pytest.mark.parametrize("name", ICC_FIXTURES)
+def test_icc_matches_anova_reference(name):
+    counts = ICC_FIXTURES[name]
+    want = _icc_reference(counts)
+    got = stats.icc(counts, clip=False)
+    assert close(got, want, rel=1e-9, abs_=1e-12), (got, want)
+    assert close(stats.icc(counts), min(1.0, max(0.0, want)), rel=1e-9, abs_=1e-12)
+
+
+def test_icc_hand_computed():
+    # Two inputs, 2 runs each, 1/2 and 2/2: M = 4, ȳ = 3/4.
+    # SSB = 2·(1/2 − 3/4)² + 2·(1 − 3/4)² = 1/4 on 1 df; SSW = 1/2 on 2.
+    # MSB = MSW = 1/4, so ρ = 0 exactly.
+    assert stats.icc([(1, 2), (2, 2)], clip=False) == pytest.approx(0.0, abs=1e-15)
+    # Equal k = 4, inputs 2/4 and 4/4: M = 8, ȳ = 3/4. SSB = 4·(1/16)·2
+    # = 1/2 (1 df); SSW = 1 (6 df). ρ = (1/2 − 1/6)/(1/2 + 3/6) = 1/3.
+    assert stats.icc([(2, 4), (4, 4)]) == pytest.approx(1 / 3)
+    # Unequal sizes 2 and 3, inputs 1/2 and 3/3: M = 5, k₀ = (5 − 13/5)/1
+    # = 2.4. SSB = 1/2 + 3 − 16/5 = 0.3; SSW = 1/2 (3 df), MSW = 1/6.
+    # ρ = (0.3 − 1/6)/(0.3 + 1.4/6) = 0.25.
+    assert stats.icc([(1, 2), (3, 3)]) == pytest.approx(0.25)
+    # Each input all-pass or all-fail: no variation within inputs, ρ = 1.
+    assert stats.icc([(4, 4), (0, 4)]) == 1.0
+    assert stats.icc([(2, 2), (0, 3)]) == 1.0
+
+
+def test_icc_clips_to_unit_interval():
+    raw = stats.icc(ICC_FIXTURES["negative raw"], clip=False)
+    assert raw < 0
+    assert stats.icc(ICC_FIXTURES["negative raw"]) == 0.0
+    # never above 1, even unclipped: k₀ ≥ 1 keeps the denominator ≥ MSB
+    for counts in ICC_FIXTURES.values():
+        assert stats.icc(counts, clip=False) <= 1.0 + 1e-12
+
+
+@pytest.mark.parametrize(
+    "counts, why",
+    [
+        ([(1, 1), (0, 1), (1, 1)], "every input run once"),
+        ([(3, 3)], "a single input"),
+        ([], "no inputs"),
+        ([(5, 5), (10, 10), (2, 2)], "every run passed"),
+        ([(0, 5), (0, 10), (0, 2)], "every run failed"),
+    ],
+)
+def test_icc_undefined(counts, why):
+    assert stats.icc(counts) is None, why
+    assert stats.icc(counts, clip=False) is None, why
+
+
+def test_icc_order_independent():
+    counts = ICC_FIXTURES["unequal k"]
+    assert stats.icc(counts) == stats.icc(list(reversed(counts)))
+
+
+@pytest.mark.parametrize("bad", [[(3, 2)], [(1, 0)], [(-1, 2)], [(1.5, 2)]])
+def test_icc_validates(bad):
+    with pytest.raises(ValueError):
+        stats.icc(bad + [(1, 2)])
+
+
+@pytest.mark.parametrize("concentration", [0.5, 2.0, 10.0, 50.0])
+def test_icc_recovers_a_known_correlation(concentration):
+    # Per-input rates from a Beta with concentration c give ρ = 1/(1+c).
+    cases = _clustered_cases(random.Random(5), 3000, 10, 0.7, concentration)
+    rho = stats.icc([(s.passes, s.total) for s in cases])
+    assert rho == pytest.approx(1 / (1 + concentration), abs=0.02)
+
+
+def test_width_factor():
+    assert stats.width_factor(1, 0.37) == 1.0
+    assert stats.width_factor(10, 1.0) == 1.0
+    assert stats.width_factor(16, 0.0) == pytest.approx(0.25)
+    assert stats.width_factor(10, 0.6) == pytest.approx(0.8)
+    assert stats.width_factor(10, 0.025) == pytest.approx(0.35)
+    # the harmonic-mean k is exact for an equally weighted average:
+    # mean over inputs of (ρ + (1 − ρ)/kᵢ)
+    ks, rho = [2, 5, 10, 10, 40], 0.2
+    k_h = len(ks) / sum(1 / k for k in ks)
+    per_input = sum(rho + (1 - rho) / k for k in ks) / len(ks)
+    assert stats.width_factor(k_h, rho) == pytest.approx(math.sqrt(per_input))
+
+
+@pytest.mark.parametrize(
+    "k, rho", [(0.5, 0.2), (0, 0.2), (math.inf, 0.2), (10, -0.1), (10, 1.1)]
+)
+def test_width_factor_validates(k, rho):
+    with pytest.raises(ValueError):
+        stats.width_factor(k, rho)
+
+
+@pytest.mark.parametrize("rho, shrink", [(0.025, 22), (0.3, 5), (0.6, 2)])
+def test_projection_matches_issue_table(rho, shrink):
+    # #5: going from k = 10 to 20 runs per input.
+    change = stats.projected_width(10, rho, runs=2) - 1
+    assert round(-change * 100) == shrink
+    # doubling the inputs is 1/√2 whatever ρ is: about −29%
+    inputs = stats.projected_width(10, rho, inputs=2) - 1
+    assert inputs == pytest.approx(1 / math.sqrt(2) - 1)
+    assert round(-inputs * 100) == 29
+
+
+def test_projection_limits():
+    # ρ = 0: runs are as good as inputs; ρ = 1: runs add nothing.
+    assert stats.projected_width(10, 0.0, runs=2) == pytest.approx(1 / math.sqrt(2))
+    assert stats.projected_width(10, 1.0, runs=2) == 1.0
+    assert stats.projected_width(10, 0.4) == 1.0
+    # more runs never beat the same factor of fresh inputs
+    for rho in (0.0, 0.01, 0.2, 0.9):
+        assert stats.projected_width(7, rho, runs=3) >= stats.projected_width(
+            7, rho, inputs=3
+        ) - 1e-15
+
+
+# ---------------------------------------------------------------------------
 # Module hygiene
 # ---------------------------------------------------------------------------
 

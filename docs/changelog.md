@@ -65,6 +65,20 @@
   gains `resamples`, `seed` and `min_inputs`. `--prob-explain` reads
   each line in plain words, including what treating the inputs as a
   sample means for a hand-picked suite.
+- **Runs or inputs:** with more than one run per case, each
+  function-level line also shows ρ, how alike the runs of one input are
+  (intraclass correlation by one-way ANOVA on every run's pass/fail,
+  adjusted for unequal run counts, clipped to [0, 1]), and an indented
+  line projects how much doubling the runs or doubling the inputs
+  would narrow its interval, priced at the recorded cost per run —
+  `runs ×2 → interval −1%  ·  inputs ×2 → −29%  ·  each +$0.0400`. Low
+  ρ: outputs vary from run to run, so more runs help; high ρ: each
+  input is consistently right or wrong, so add inputs. Left out when
+  every case ran once or every run had the same outcome, and shown
+  only with its interval line. **JSON:** `aggregates[]` gain `icc` and
+  `width_factor` (`null` when left out). `--prob-explain` explains ρ
+  and the projection in words and bases its next step on them. New
+  `stats.icc`, `stats.width_factor` and `stats.projected_width`.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function
