@@ -12,10 +12,13 @@ uv venv
 uv pip install -e .
 ```
 
-There are no development dependencies beyond pytest itself — the test
-suite runs on the same interpreter:
+The plugin needs nothing beyond pytest. The `test` extra adds the
+reference libraries the `stats` module is cross-checked against
+(scipy, statsmodels) plus pytest-xdist; without them those
+cross-checks skip and the rest of the suite still runs:
 
 ```bash
+uv pip install -e '.[test]'
 .venv/bin/python -m pytest tests -q
 ```
 
@@ -26,6 +29,10 @@ The suite is end-to-end by design: every test uses pytest's own
 fixture to write a case file into a temp directory, run a real
 in-process pytest session with the plugin active, and assert on
 outcomes, item ids, and the rendered summary.
+
+The one exception is `tests/test_stats.py`: the `stats` module is pure
+functions, so it is unit-tested directly, against scipy/statsmodels
+reference values.
 
 ```python
 def test_fraction_and_flaky_in_summary(pytester):
