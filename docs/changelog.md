@@ -152,6 +152,28 @@
   previous JSON report's cost per run. A one-line plain-language note
   explains each column. New `stats.detection_chance` and
   `stats.runs_to_see_failure`.
+- **Baseline:** `--prob-baseline=main.json` sets this run against an
+  earlier `--prob-json` report (0.2.0 reports work: only `rows[]`
+  `case`, `passes` and `total` are read), pairing cases by case id. A
+  `probability: baseline` block names the report and how many cases
+  paired, then gives one line per bench function — `triage  current −
+  baseline  −15.0 pp [−25.0, −5.8]  p=0.03  12 paired, 1 unpaired
+  ≥−5 pp  FAIL` — with the same intervals, p-values and regimes as a
+  comparison (adjusted by `--prob-adjust` as a family of their own),
+  and lists the cases found in only one report, which are never
+  paired. `--prob-margin=0.05` makes it a non-inferiority gate per
+  function (lower bound above −5 points): the failing runs of cases
+  found in the baseline are xfailed and the verdicts set the exit
+  status, with `--prob-undecided` as for gates; new cases keep plain
+  pytest semantics. Without `--prob-margin` it only reports and the
+  exit status is unchanged. A missing or malformed file, a margin
+  outside [0, 1), or `--prob-margin` alone is a usage error.
+  **JSON:** a new top-level `baseline` (`null` without the option:
+  path, created, margin, paired, only_current, only_baseline and
+  per-function `comparisons[]`). `--prob-explain` reads the block and
+  each line in plain words. The `jq` recipe for diffing two reports
+  is replaced by `--prob-baseline` and a GitHub Actions example that
+  caches main's report.
 
 ## 0.2.0 (2026-07-08)
 

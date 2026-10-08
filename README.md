@@ -152,6 +152,12 @@ margin=0.02)` makes it a gate — the arm may be at most 2 points worse
 (`equivalence=True`: within ±2 points) — and `--prob-adjust=holm`
 corrects p for several arms.
 
+The same comparison guards against regressions between runs:
+`--prob-baseline=main.json --prob-margin=0.05` pairs every case with
+its row in an earlier `--prob-json` report and fails a function whose
+pass rate may have dropped by more than 5 points; new and removed
+cases are listed, not compared.
+
 ### Gates: pass on a rate, not on every run
 
 By default any failing run fails the session. To hold a case to a pass
@@ -255,6 +261,8 @@ Windows `cmd`).
 | `--prob-plan-assume=RATE` | CLI | 0.97 | true pass rate `--prob-plan` plans for |
 | `--prob-plan-flake=RATES` | CLI | `0.1,0.01` | failure rates `--prob-plan` plans to catch |
 | `--prob-plan-report=PATH` | CLI | — | previous JSON report to read cost per run from, for `--prob-plan` |
+| `--prob-baseline=PATH` | CLI | none | compare every function with an earlier `--prob-json` report, pairing cases by id |
+| `--prob-margin=MARGIN` | CLI | none (report only) | with `--prob-baseline`: fail a function whose pass rate may have dropped by more than MARGIN |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |

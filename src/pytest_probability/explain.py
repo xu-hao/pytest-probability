@@ -868,6 +868,249 @@ def comparison_reading(
 
 
 # ---------------------------------------------------------------------------
+# Baseline (regression gate)
+# ---------------------------------------------------------------------------
+
+
+def _cases(n: int) -> str:
+    return f"{n} case" if n == 1 else f"{n} cases"
+
+
+def baseline_summary_reading(result: Any) -> Reading:
+    """The baseline block's header explained: which report, how the
+    cases were paired, what happened to the rest, and what the margin
+    (or its absence) does. ``result`` is a ``BaselineResult``."""
+    from .plugin import _baseline_header
+
+    b = result.baseline
+    when = f", written {b.created}" if b.created else ""
+    paras = [
+        f"This run is set against an earlier report, {b.path}{when}, case by"
+        " case: a case found in both is paired with itself, and each bench"
+        " function's pass rate is compared, this run minus the baseline."
+    ]
+    left_out = []
+    if result.only_current:
+        n = len(result.only_current)
+        left_out.append(
+            f"{_cases(n)} ran only in this run (new, or with a changed"
+            " parametrize id)"
+        )
+    if result.only_baseline:
+        n = len(result.only_baseline)
+        left_out.append(
+            f"{_cases(n)} {'is' if n == 1 else 'are'} only in the baseline"
+            " (removed, renamed, or not selected this time with -k or -m)"
+        )
+    if left_out:
+        one = len(result.only_current) + len(result.only_baseline) == 1
+        paras.append(
+            f"{' and '.join(left_out)}: listed below the comparisons and left"
+            f" out of them, so {'it' if one else 'they'} can't fail the gate."
+        )
+    tone = None
+    if not result.paired:
+        tone = UNDECIDED
+        paras.append(
+            "No case is in both reports, so nothing is compared and the"
+            " baseline can't fail the test session."
+        )
+    elif b.margin is None:
+        paras.append(
+            "No --prob-margin is set, so the comparison only reports: it never"
+            " changes the exit status, and failing runs fail the session as"
+            " usual."
+        )
+    else:
+        paras.append(
+            f"With --prob-margin={b.margin:g}, each function's verdict decides:"
+            " the failing runs of cases found in the baseline are reported as"
+            " xfailed, and a function that FAILs fails the test session."
+        )
+    if not result.paired:
+        paras.append(
+            "Next: check that the baseline report comes from the same suite;"
+            " case ids look like function::parametrize-id."
+        )
+    return Reading(
+        _baseline_header(result), tuple(paras), tone, (("baseline", None),)
+    )
+
+
+def _baseline_margin_paragraph(cmp: Any, undecided_fails: bool) -> str:
+    margin, verdict = cmp.spec.margin, cmp.verdict
+    size = f"{margin * 100:g} points"
+    if margin == 0:
+        body = (
+            "Your margin (--prob-margin) is 0: this run passes only if it is"
+            " shown to do better than the baseline, which needs the whole range"
+            " above 0."
+        )
+    else:
+        body = (
+            f"Your margin (--prob-margin) is {size}: this run passes if it is"
+            f" at most {size} worse than the baseline, which needs the whole"
+            f" range above −{size}."
+        )
+    if verdict == PASS:
+        body += (
+            f" It is, so {cmp.function} has not dropped by more than the margin"
+            " allows."
+        )
+    elif verdict == FAIL:
+        body += (
+            f" The whole range is below it, so {cmp.function} dropped by more"
+            " than the margin allows."
+        )
+    else:
+        if cmp.ci is None:
+            body += " There is no range yet, so the verdict is UNDECIDED."
+        else:
+            body += (
+                " The range has values on both sides of that, so there isn't"
+                " enough data yet to tell: the verdict is UNDECIDED."
+            )
+        body += " " + (
+            "Until that's settled, it fails the test session"
+            " (--prob-undecided=pass would let it through)."
+            if undecided_fails
+            else "This session lets undecided verdicts through"
+            " (--prob-undecided=pass), so it doesn't fail the test session."
+        )
+    return body
+
+
+def baseline_reading(
+    cmp: Any, *, path: str, undecided_fails: bool = True, min_inputs: int = 10
+) -> Reading:
+    """One function against the baseline explained: the change, its
+    range, the p-value and the margin verdict, if any.
+
+    ``cmp`` is the function's ``Comparison`` (arm ``current``, baseline
+    ``baseline``), ``path`` the baseline report's.
+    """
+    from .plugin import _comparison_lines
+
+    heading = _comparison_lines([cmp], label=lambda c: c.function)[0][0].strip()
+    dec = _pp_decimals(cmp)
+    fn = cmp.function
+    terms: list[tuple[str, Hashable]] = [("baseline", None)]
+    paras: list[str] = []
+    if cmp.pairs == 1:
+        only = cmp.inputs[0]
+        (xa, na), (xb, nb) = only.arm, only.baseline
+        who = (
+            f"{fn}::{only.input}, the one case of {fn} in both reports,"
+            if only.input
+            else f"{fn}, a single case in both reports,"
+        )
+        body = (
+            f"{who} passed {xa} of {na} runs now and {xb} of {nb} in the"
+            f" baseline ({path}): a change of {points(cmp.estimate, dec)}."
+        )
+    elif cmp.estimate == 0:
+        body = (
+            f"Over the {cmp.pairs} cases of {fn} in both reports, this run"
+            f" passed as many of its runs as the baseline ({path}) on average,"
+            " each case counting equally."
+        )
+    else:
+        body = (
+            f"Over the {cmp.pairs} cases of {fn} in both reports, this run"
+            f" passed {_pp(abs(cmp.estimate), dec).lstrip('+')} points"
+            f" {'fewer' if cmp.estimate < 0 else 'more'} of its runs than the"
+            f" baseline ({path}) on average, each case counting equally."
+        )
+    if cmp.unpaired:
+        n = len(cmp.unpaired)
+        body += (
+            f" {_cases(n)} of {fn} {'is' if n == 1 else 'are'} in only one of"
+            f" the two reports and {'was' if n == 1 else 'were'} left out."
+        )
+    setup = (cmp.level, cmp.resamples, cmp.seed, min_inputs)
+    if cmp.ci is not None:
+        terms.append(("difference", (cmp.ci_method, *setup)))
+        low, high = cmp.ci
+        if low > 0:
+            direction = "so this run probably does better than the baseline."
+        elif high < 0:
+            direction = "so this run probably does worse than the baseline."
+        else:
+            direction = (
+                "so the data can't tell yet whether it changed: the range"
+                " includes no change at all."
+            )
+        body += (
+            f" The true change is probably between {_pp(low, dec)} and"
+            f" {_pp(high, dec)} points ({_pct_bar(cmp.level)} confidence),"
+            f" {direction}"
+        )
+    else:
+        terms.append(("difference", ("suppressed", *setup)))
+        body += (
+            f" No range is shown: with fewer than {min_inputs} paired cases"
+            " (prob_min_inputs), a range worked out from the cases alone comes"
+            " out too narrow. Each case's own change and range are listed with"
+            " it instead."
+        )
+    paras.append(body)
+    if cmp.pairs == 1:
+        paras.append(
+            "With a single case, this compares the two reports on that case"
+            " only: it says nothing about other inputs."
+        )
+    elif cmp.ci is not None:
+        paras.append(
+            f"That range treats these {cmp.pairs} cases as a random sample of"
+            f" the inputs {fn} will meet, keeping each case's runs from both"
+            " reports together, so it allows for other inputs doing better or"
+            " worse, not only for runs varying."
+        )
+    if cmp.p is not None:
+        terms.append(("p", (cmp.p_method, cmp.exact, cmp.resamples, cmp.seed)))
+        if cmp.adjustment != "none" or cmp.exploratory:
+            terms.append(("adjust", cmp.adjustment))
+        paras.append(_p_paragraph(cmp))
+    if cmp.cost_ratio is not None:
+        times = _ratio(cmp.cost_ratio).lstrip("×")
+        paras.append(
+            "Per run, this run cost about the same as the baseline."
+            if times == "1.0"
+            else f"Per run, this run cost {times} times as much as the baseline."
+        )
+    if cmp.verdict is not None:
+        terms.append(("margin", None))
+        paras.append(_baseline_margin_paragraph(cmp, undecided_fails))
+
+    if cmp.ci is None:
+        paras.append(
+            f"Next: add inputs (more parametrize cases) to reach {min_inputs}"
+            " paired cases."
+        )
+    elif cmp.verdict == FAIL:
+        paras.append(
+            f"Next: look at {fn}'s failing runs (-rx lists them) and at what"
+            " changed since the baseline."
+        )
+    elif cmp.verdict != PASS and (
+        cmp.ci[0] <= 0 <= cmp.ci[1] or cmp.verdict == UNDECIDED
+    ):
+        # A PASS needs no next step, even when the range includes no change.
+        if cmp.pairs == 1:
+            paras.append(
+                "Next: to tell the two apart, add inputs (more parametrize"
+                " cases); more runs of this one narrow its range too."
+            )
+        else:
+            paras.append(
+                "Next: to narrow the range, add inputs (more parametrize"
+                " cases); more runs help less when each input is consistently"
+                " right or wrong."
+            )
+    return Reading(heading, tuple(paras), cmp.verdict, tuple(terms))
+
+
+# ---------------------------------------------------------------------------
 # Glossary ("Methods used")
 # ---------------------------------------------------------------------------
 
@@ -1130,6 +1373,19 @@ def _adjust_entry(methods: list[str]) -> str:
                 text += " Holm is never stricter than Bonferroni."
             texts.append(text)
     return " ".join(texts)
+
+
+@glossary_entry("baseline", "current − baseline")
+def _baseline_entry(_: list) -> str:
+    return (
+        "--prob-baseline: this run set against an earlier --prob-json report."
+        " Cases are paired by case id and each bench function is compared,"
+        " this run's pass fraction minus the baseline's, with the same ranges"
+        " and p-values as a comparison (+N pp, p). Cases in only one report"
+        " are listed and left out. With --prob-margin=N, a function passes"
+        " when the whole range is above −N points (≥−N pp) and fails when it"
+        " is entirely below."
+    )
 
 
 def glossary(terms: Iterable[tuple[str, Hashable]]) -> list[tuple[str, str]]:
