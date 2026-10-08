@@ -27,7 +27,8 @@ pytest_collect_file            (file name matches prob_pattern)
 BenchItem.runtest()            (one (case, run) execution)
   ├─ optional inter-run delay
   ├─ run the bench_* body; classify by exception type
-  ├─ publish ("probability", {..., "gate": {...}, "compare": {...}})
+  ├─ publish ("probability", {..., "gate": {...}, "compare": {...},
+  │                            "latency": {...}})
   │   onto item.user_properties
   └─ let exceptions propagate
 
@@ -37,11 +38,13 @@ pytest_runtest_makereport      (hookwrapper)
 
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
-  ├─ pytest_sessionfinish:     decide gates and margins (axis and
-  │                            baseline) → exit status, then write the
+  ├─ pytest_sessionfinish:     decide gates (rate and latency) and
+  │                            margins (axis and baseline) → exit
+  │                            status, then write the
   │                            JSON report (controller only)
   └─ pytest_terminal_summary:  render the fraction table, function-level
-                               lines, metrics block, comparisons block,
+                               lines, metrics block, latency block,
+                               comparisons block,
                                baseline block, gates block and
                                (--prob-explain) explain section
 
@@ -157,7 +160,7 @@ never converted, and `--runxfail` disables the conversion, as it does
 for xfail marks.
 
 Around the call, `runtest()` starts a `perf_counter` clock (the run's
-`elapsed`) and installs a `_RunRecorder` into a `ContextVar` —
+`elapsed`, read through the module global `_clock`) and installs a `_RunRecorder` into a `ContextVar` —
 `record_usage()`/`record_cost()` resolve it and append. The
 `finally` block publishes the record whatever the outcome, which is
 why usage recorded before a failing assert survives. The ContextVar
@@ -198,7 +201,9 @@ xdist controller that decides verdicts never collects items and so has
 no other way to learn a case's gate. The `compare` key, present only
 for cases of a compared function, is the same idea for comparisons:
 the function's `CompareSpec.to_record()` (axis, baseline, margin,
-equivalence) plus the case's `input`, `arm` and `arm_index`.
+equivalence) plus the case's `input`, `arm` and `arm_index`. The
+`latency` key, present only when a case's marks set `latency_quantile`
+or `max_latency`, is its `LatencySpec.to_record()`.
 
 Alternatives considered and rejected:
 
@@ -470,6 +475,57 @@ comparison whose two arms are two reports, so it reuses
   `pytest_sessionfinish` adds the baseline verdicts to the ones it
   passes through `GateConfig.fails()`.
 
+## Latency
+
+Also in `plugin.py`, next to the gates:
+
+- **The clock.** `runtest()` times the body with the module global
+  `_clock` (`time.perf_counter`), looked up at every run so tests can
+  swap in a fake that only moves when a bench body advances it
+  (`tests/test_latency.py` installs one from a conftest, so xdist
+  workers get it too). The record's `elapsed` is the only input.
+- **At collection**, `_latency_plan()` reads `latency_quantile` and
+  `max_latency` from the case's merged `probability` marks (the same
+  `_merge_probability_marks()` as `_case_plan()`, so a case mark
+  overrides the function's key by key) and returns a frozen
+  `LatencySpec` — quantile, level (the mark's `confidence` for a
+  latency gate, else the session's), `max_latency`, the session's
+  `prob_errors` and the planned runs — or `None` when the marks set
+  neither. A spec travels in every run record as `latency`
+  (`to_record()`), like `gate`; unmarked cases have no `latency` key
+  and get the session default on the aggregating process
+  (`prob_latency_quantile` from `LatencyConfig`, at `prob_confidence`).
+- **Aggregation.** `pytest_runtest_logreport` appends each record's
+  `elapsed` to `CaseStats.times`, or `error_times` for an errored run.
+  `ProbabilityAggregator.latency_results()` calls
+  `LatencySpec.evaluate()` for every row, once, and caches the dict.
+  `evaluate()` takes every time, less `error_times` when the case is
+  gated (a rate or a latency gate) under `prob_errors = exclude`,
+  **sorts** them (arrival order differs under xdist), and computes
+  `stats.sample_quantile` and `stats.quantile_ranks`: the interval is
+  the order statistics at those ranks, with `None` for an end that
+  doesn't exist yet. `stats.quantile_coverage` is the guarantee
+  reported in JSON.
+- **Verdicts.** `latency_verdict(low, high, max_latency)` is
+  `interval_verdict(-high, -low, -max_latency)`, with a missing end
+  mapped to ∓∞ so it can't PASS without an upper end or FAIL without a
+  lower one. `pytest_sessionfinish` adds latency verdicts to those it
+  passes through `GateConfig.fails()`, the `Gates:` tally counts them,
+  and `_write_gates()` lists non-PASS ones after the rate gates
+  through `_latency_lines()`, which also renders the `--prob-latency`
+  block (`_write_latency()`) and each reading's heading, so the three
+  can't disagree. `_secs()` formats durations.
+- **Not judged.** A latency gate doesn't set `BenchItem.judged`: the
+  makereport wrapper keeps reporting failing runs of a latency-only
+  case as failures, because the gate says nothing about answers.
+- `_warn_infeasible()` warns about latency gates whose planned runs
+  are below `LatencySpec.min_runs()` (`stats.quantile_min_n`), keyed by
+  spec like rate gates.
+- `explain.latency_reading()` explains a `LatencyResult`;
+  `_write_explained()` adds one for every latency-gated case, and with
+  `--prob-latency` for a shown line missing an end, and the glossary
+  gets `latency` (per level) and `latency-limit` entries.
+
 ## Explanations
 
 `--prob-explain` keeps its wording out of `plugin.py`: every sentence
@@ -615,3 +671,13 @@ down and users rely on:
     `--prob-margin` it never changes the exit status or xfails a run.
     Only cases found in the baseline are judged, and a margin only
     ever changes the exit status from `OK` to `TESTS_FAILED`.
+16. Latency results are a function of the records' `elapsed` values,
+    the `latency` specs in the records and the settings only: times
+    are sorted before anything is computed, on the process that has
+    every result, so lines, JSON and verdicts are the same with and
+    without xdist. Cases without `latency_quantile`/`max_latency` have
+    no `latency` key in their records; without `--prob-latency` there
+    is no latency block, and without `max_latency` nothing about the
+    exit status, xfails or the gates block changes. A latency gate
+    never xfails a run and only ever changes the exit status from `OK`
+    to `TESTS_FAILED`.

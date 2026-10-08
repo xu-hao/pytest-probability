@@ -945,3 +945,209 @@ def test_pass_k_edges_and_large_n():
     assert stats.pass_at_k(1, 10**6, 3) == 3e-6
     # fewer failures than k: some attempt always passes
     assert stats.pass_at_k(n - 4, n, 5) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Quantiles: order-statistic intervals
+# ---------------------------------------------------------------------------
+
+QUANTILES = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+QUANTILE_LEVELS = [0.8, 0.9, 0.95, 0.99]
+QUANTILE_NS = [1, 2, 3, 5, 6, 7, 10, 20, 35, 36, 37, 50, 71, 72, 100, 250]
+
+
+def _brute_ranks(n, q, level, ties=False):
+    """quantile_ranks by exact integer arithmetic and a linear scan.
+
+    With q = a/d and α/2 = t/u as exact decimals, P(B = k) is
+    C(n, k)·aᵏ·(d − a)ⁿ⁻ᵏ / dⁿ, so every comparison of a tail with α/2
+    is one between integers — ties included.
+    """
+    from fractions import Fraction
+    from itertools import accumulate
+
+    qf, tail = Fraction(str(q)), (1 - Fraction(str(level))) / 2
+    a, d = qf.numerator, qf.denominator
+    weights = [math.comb(n, k) * a**k * (d - a) ** (n - k) for k in range(n + 1)]
+    total = d**n
+    below = [0, *accumulate(weights)]  # below[k] = dⁿ · P(B ≤ k − 1)
+
+    def within(mass):  # mass / dⁿ ≤ α/2
+        return mass * tail.denominator <= tail.numerator * total
+
+    if ties:
+        # Whether some tail is exactly α/2: there, floating point decides.
+        return any(
+            mass * tail.denominator == tail.numerator * total
+            for k in range(n + 2)
+            for mass in (below[k], total - below[k])
+        )
+    # r: the largest r with P(B ≤ r − 1) ≤ α/2
+    lows = [r for r in range(1, n + 1) if within(below[r])]
+    # s: the smallest s with P(B ≥ s) = 1 − P(B ≤ s − 1) ≤ α/2
+    highs = [s for s in range(1, n + 1) if within(total - below[s])]
+    return (max(lows) if lows else None, min(highs) if highs else None)
+
+
+@pytest.mark.parametrize("level", QUANTILE_LEVELS)
+@pytest.mark.parametrize("q", QUANTILES)
+def test_quantile_ranks_match_brute_force(q, level):
+    for n in QUANTILE_NS:
+        assert stats.quantile_ranks(n, q, level) == _brute_ranks(n, q, level), n
+
+
+@pytest.mark.parametrize("level", QUANTILE_LEVELS)
+@pytest.mark.parametrize("q", QUANTILES)
+def test_quantile_interval_matches_scipy(scipy_stats, q, level):
+    # scipy's quantile_test inverts the same binomial test; with the
+    # values 1..n each bound is its own rank, and nan is a missing bound.
+    # Where a tail is exactly α/2 (q = 0.9 at 80% and n = 1) rounding
+    # decides scipy's answer; quantile_ranks counts the tie as within,
+    # as exact arithmetic does (test_quantile_ranks_match_brute_force).
+    np = pytest.importorskip("numpy")
+    for n in QUANTILE_NS:
+        if _brute_ranks(n, q, level, ties=True):
+            continue
+        values = [float(v) for v in range(1, n + 1)]
+        ci = scipy_stats.quantile_test(np.array(values), q=0, p=q).confidence_interval(
+            level
+        )
+        expected = tuple(None if math.isnan(b) else float(b) for b in ci)
+        assert stats.quantile_interval(values, q, level) == expected, n
+
+
+@pytest.mark.parametrize("level", QUANTILE_LEVELS)
+@pytest.mark.parametrize("q", QUANTILES)
+def test_quantile_coverage_is_at_least_the_level(q, level):
+    """The exact coverage for a continuous distribution, P(r ≤ B ≤ s − 1),
+    is never below the level — with both bounds, or with an open side —
+    and each side misses with probability at most α/2."""
+    # α/2 as quantile_ranks compares it: ties count as within
+    tail = (1 - level) / 2 * (1 + stats._TAIL_SLACK)
+    for n in QUANTILE_NS:
+        r, s = stats.quantile_ranks(n, q, level)
+        coverage = stats.quantile_coverage(n, q, r, s)
+        assert coverage >= level - 1e-12, (n, r, s)
+        if r is not None:
+            assert stats.binom_cdf(r - 1, n, q) <= tail
+            # one rank higher would miss too often: r is the tightest
+            if r < n:
+                assert stats.binom_cdf(r, n, q) > tail
+        if s is not None:
+            assert stats.binom_sf(s - 1, n, q) <= tail
+            if s > 1:
+                assert stats.binom_sf(s - 2, n, q) > tail
+        if r is not None and s is not None:
+            # the estimate's rank sits inside, and the interval is proper
+            assert r <= math.ceil(n * q - 1e-9) <= s and r < s
+
+
+def test_quantile_coverage_formula():
+    # [X(90), X(100)] for p95 of 100: P(90 ≤ B ≤ 99), B ~ Binomial(100, 0.95)
+    pmf = [math.comb(100, k) * 0.95**k * 0.05 ** (100 - k) for k in range(101)]
+    assert stats.quantile_ranks(100, 0.95) == (90, 100)
+    assert close(stats.quantile_coverage(100, 0.95, 90, 100), sum(pmf[90:100]))
+    # an open side never misses: [X(8), ∞) for p95 of 10 is P(B ≥ 8)
+    pmf10 = [math.comb(10, k) * 0.95**k * 0.05 ** (10 - k) for k in range(11)]
+    assert stats.quantile_ranks(10, 0.95) == (8, None)
+    assert close(stats.quantile_coverage(10, 0.95, 8, None), sum(pmf10[8:]))
+    assert stats.quantile_coverage(3, 0.5, None, None) == 1.0
+
+
+@pytest.mark.parametrize(
+    "q, level, n", [(0.5, 0.95, 6), (0.9, 0.95, 36), (0.95, 0.95, 72),
+                    (0.99, 0.95, 368), (0.95, 0.9, 59), (0.05, 0.95, 72)]
+)
+def test_quantile_min_n_known_values(q, level, n):
+    assert stats.quantile_min_n(q, level) == n
+
+
+@pytest.mark.parametrize("level", QUANTILE_LEVELS)
+@pytest.mark.parametrize("q", QUANTILES)
+def test_quantile_min_n_is_where_both_bounds_appear(q, level):
+    n = stats.quantile_min_n(q, level)
+    assert None not in stats.quantile_ranks(n, q, level)
+    for smaller in range(1, n):
+        assert None in stats.quantile_ranks(smaller, q, level)
+
+
+def test_quantile_simulated_coverage():
+    """Seeded simulation: each side of a 90% interval misses at most 5%
+    of the time, for a continuous distribution and for one with ties."""
+    rng = random.Random(10)
+    level, tail, reps = 0.9, 0.05, 3000
+    cases = [
+        # (draw, q, true quantile)
+        (lambda: rng.expovariate(1.0), 0.9, math.log(10)),
+        # 1..5 equally likely: the median is 3 (F(3) = 0.6 ≥ 0.5)
+        (lambda: rng.randint(1, 5), 0.5, 3),
+        # P(1) = 0.95, P(9) = 0.05: p95 is 1, every bound is mostly a tie
+        (lambda: 1 if rng.random() < 0.95 else 9, 0.95, 1),
+    ]
+    for draw, q, true in cases:
+        for n in (30, 60):
+            below = above = 0
+            for _ in range(reps):
+                low, high = stats.quantile_interval([draw() for _ in range(n)], q, level)
+                below += low is not None and low > true
+                above += high is not None and high < true
+            # 3 standard errors of slack on a 5% rate over 3000 draws
+            slack = 3 * math.sqrt(tail * (1 - tail) / reps)
+            assert below / reps <= tail + slack, (q, n, below)
+            assert above / reps <= tail + slack, (q, n, above)
+
+
+@pytest.mark.parametrize("q", QUANTILES)
+def test_sample_quantile_matches_numpy_inverted_cdf(q):
+    np = pytest.importorskip("numpy")
+    rng = random.Random(3)
+    for n in (1, 2, 5, 20, 99, 100):
+        values = [rng.random() for _ in range(n)]
+        expected = float(np.quantile(values, q, method="inverted_cdf"))
+        assert stats.sample_quantile(values, q) == expected, n
+
+
+def test_sample_quantile_exact_ranks():
+    # n·q an integer up to rounding still picks that rank: 0.95 · 20 = 19
+    values = list(range(1, 21))
+    assert stats.sample_quantile(values, 0.95) == 19
+    assert stats.sample_quantile(values, 0.5) == 10
+    assert stats.sample_quantile(values, 0.96) == 20
+    assert stats.sample_quantile([5.0, 1.0, 3.0], 0.5) == 3.0
+
+
+@pytest.mark.parametrize("level", QUANTILE_LEVELS)
+@pytest.mark.parametrize("q", QUANTILES)
+def test_sample_quantile_inside_its_interval(q, level):
+    rng = random.Random(4)
+    for n in QUANTILE_NS:
+        values = [rng.random() for _ in range(n)]
+        low, high = stats.quantile_interval(values, q, level)
+        est = stats.sample_quantile(values, q)
+        assert low is None or low <= est
+        assert high is None or est <= high
+
+
+def test_quantile_interval_ignores_input_order():
+    values = [0.3, 0.1, 0.9, 0.5] * 25
+    shuffled = list(values)
+    random.Random(1).shuffle(shuffled)
+    assert stats.quantile_interval(values, 0.9) == stats.quantile_interval(shuffled, 0.9)
+
+
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        (lambda: stats.quantile_ranks(0, 0.5), "n must be at least 1"),
+        (lambda: stats.quantile_ranks(10, 1.0), "q must be strictly between"),
+        (lambda: stats.quantile_ranks(10, 0.0), "q must be strictly between"),
+        (lambda: stats.quantile_ranks(10, 0.5, 1.0), "level must be strictly"),
+        (lambda: stats.quantile_ranks(True, 0.5), "n must be an integer"),
+        (lambda: stats.quantile_interval([], 0.5), "values must not be empty"),
+        (lambda: stats.sample_quantile([], 0.5), "values must not be empty"),
+        (lambda: stats.quantile_min_n(1.5), "q must be strictly between"),
+    ],
+)
+def test_quantile_validation(call, message):
+    with pytest.raises(ValueError, match=message):
+        call()

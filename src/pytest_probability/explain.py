@@ -24,8 +24,8 @@ How it fits together:
   glossary ``terms`` it relied on. There is one function per kind of
   line: ``gate_reading``, ``row_reading``, ``aggregate_reading``
   (which also reads ρ and the runs-vs-inputs projection),
-  ``metric_reading`` (pass^k and pass@k) and ``comparison_reading``;
-  later features add their own next to them.
+  ``metric_reading`` (pass^k and pass@k), ``comparison_reading`` and
+  ``latency_reading``; later features add their own next to them.
 - The *glossary* ("Methods used") lists only the terms the readings
   used. Each entry is a function registered with ``@glossary_entry``
   under a key; a reading names ``(key, detail)`` pairs in ``terms``,
@@ -60,6 +60,7 @@ from .plugin import (
     _pp,
     _pp_decimals,
     _ratio,
+    _secs,
 )
 
 #: The last line of the normal summary when something deserves a
@@ -1111,6 +1112,142 @@ def baseline_reading(
 
 
 # ---------------------------------------------------------------------------
+# Latency
+# ---------------------------------------------------------------------------
+
+
+def percentile(q: float) -> str:
+    """``95th percentile``, ``99.9th percentile``, ``50th percentile
+    (the median)``."""
+    number = f"{q * 100:g}"
+    suffix = "th"
+    if "." not in number and not 11 <= int(number) % 100 <= 13:
+        suffix = {"1": "st", "2": "nd", "3": "rd"}.get(number[-1], "th")
+    text = f"{number}{suffix} percentile"
+    return f"{text} (the median)" if number == "50" else text
+
+
+def latency_terms(result: Any) -> tuple[str, Hashable]:
+    """The glossary term a latency line uses: its interval's level."""
+    return ("latency", result.spec.level)
+
+
+_LATENCY_VERDICTS = {
+    PASS: "Your limit is {bar}, and that whole range is below it, so this case"
+    " is fast enough.",
+    FAIL: "Your limit is {bar}, and that whole range is above it, so this case"
+    " is too slow.",
+    UNDECIDED: "Your limit is {bar}, and that range has values both below and"
+    " above it, so there isn't enough data yet to tell whether this case is"
+    " fast enough.",
+}
+
+
+def latency_reading(result: Any, *, undecided_fails: bool = True) -> Reading:
+    """A latency line explained: the quantile, its range and, for a
+    latency gate (``max_latency``), the verdict.
+
+    ``result`` is a ``LatencyResult``; ``undecided_fails`` the
+    session's UNDECIDED policy.
+    """
+    from .plugin import _latency_lines
+
+    spec, n, verdict = result.spec, result.total, result.verdict
+    heading = _latency_lines([result])[0][0].strip()
+    terms: list[tuple[str, Hashable]] = [latency_terms(result)]
+    if verdict is not None:
+        terms.append(("latency-limit", None))
+    if result.excluded:
+        terms.append(("excluded", None))
+    what = percentile(spec.quantile)
+    share = f"{spec.quantile * 100:g}%"
+    level = f"{_pct_bar(spec.level)} confidence"
+    need = spec.min_runs()
+    paras: list[str] = []
+
+    if not n:
+        body = (
+            f"All {_runs(result.excluded)} errored ({_ERRORED}), and this case"
+            " leaves errored runs out (prob_errors = exclude), so there are no"
+            " run times to measure"
+        )
+        if verdict is not None:
+            body += ": the verdict is UNDECIDED. " + _UNDECIDED_POLICY[undecided_fails]
+        else:
+            body += "."
+        paras.append(body)
+        paras.append(
+            "Next: fix what raised the errors (-rx lists each one with its"
+            " exception), then run again."
+        )
+        return Reading(heading, tuple(paras), verdict, tuple(terms))
+
+    body = (
+        f"The {what} of this case's run time, the time {share} of its runs"
+        f" finish within, was {_secs(result.estimate)} over {_runs(n)}"
+    )
+    if result.excluded:
+        body += (
+            f", not counting {result.excluded} errored"
+            f" {'run' if result.excluded == 1 else 'runs'} (prob_errors = exclude)"
+        )
+    body += "."
+    low, high = result.interval
+    few = f"{_runs(n)} {'is' if n == 1 else 'are'} too few"
+    if low is not None and low == high:
+        # Many runs took exactly this long: both ends land on it.
+        body += f" The true {what} is probably {_secs(low)} ({level})."
+    elif low is not None and high is not None:
+        body += (
+            f" The true {what} is probably between {_secs(low)} and"
+            f" {_secs(high)} ({level})."
+        )
+    elif low is not None:
+        body += (
+            f" The true {what} is probably at least {_secs(low)} ({level}), but"
+            f" {few} to put an upper limit on it: that takes at least {need} runs."
+        )
+    elif high is not None:
+        body += (
+            f" The true {what} is probably at most {_secs(high)} ({level}), but"
+            f" {few} to put a lower limit on it: that takes at least {need} runs."
+        )
+    else:
+        body += (
+            f" {few[0].upper()}{few[1:]} to put any limit on it at {level}: that"
+            f" takes at least {need} runs."
+        )
+    if verdict is not None:
+        bar = f"{spec.max_latency:g}s"
+        if verdict == UNDECIDED and high is None:
+            body += (
+                f" Your limit is {bar}. Without an upper limit on the range, the"
+                " data can't show yet that this case is fast enough."
+            )
+        else:
+            body += " " + _LATENCY_VERDICTS[verdict].format(bar=bar)
+        if verdict == UNDECIDED:
+            body += " " + _UNDECIDED_POLICY[undecided_fails]
+    paras.append(body)
+
+    if not result.complete and verdict in (None, UNDECIDED):
+        paras.append(
+            f"Next: run it at least {need} times (runs={need} on the mark, or"
+            " --prob-runs) to get a full range."
+        )
+    elif verdict == FAIL:
+        paras.append(
+            "Next: find out what makes the slow runs slow: the JSON report"
+            " (--prob-json) has every run's elapsed time in records[]. If a"
+            f" slower {spec.label()} is acceptable for this case, raise"
+            " max_latency."
+        )
+    elif verdict == UNDECIDED:
+        paras.append("Next: run more: more runs narrow the range.")
+    return Reading(heading, tuple(paras), verdict, tuple(terms))
+
+
+# ---------------------------------------------------------------------------
 # Glossary ("Methods used")
 # ---------------------------------------------------------------------------
 
@@ -1194,6 +1331,40 @@ def _excluded_entry(_: list) -> str:
     return (
         f"Runs that errored ({_ERRORED}). Under prob_errors = exclude a gate"
         " leaves them out, so they count neither for nor against the case."
+    )
+
+
+@glossary_entry("latency", "pN [low, high]")
+def _latency_entry(levels: list[float]) -> str:
+    return " ".join(
+        [
+            "A latency quantile: p95 is the run time that 95% of runs finish"
+            " within, from each run's elapsed time (the bench body only, not"
+            " the delay between runs). Every run counts, failed and errored"
+            " ones too, unless a gate leaves errored runs out. The range is"
+            " where the true value probably falls: two of the observed run"
+            " times, picked so that whatever the shape of the run-time"
+            " distribution, each end is wrong only rarely. — marks an end"
+            " that needs more runs: the higher the quantile, the more runs an"
+            " upper end takes (72 for p95 at 95% confidence).",
+            *(
+                f"(Distribution-free, from the ordered run times,"
+                f" {_pct_bar(level)} confidence: each end is wrong at most"
+                f" {_pct_bar((1 - level) / 2)} of the time.)"
+                for level in levels
+            ),
+        ]
+    )
+
+
+@glossary_entry("latency-limit", "≤Ns")
+def _latency_limit_entry(_: list) -> str:
+    return (
+        "A latency limit (max_latency): PASS when the whole range is below"
+        " it, FAIL when the whole range is above it, UNDECIDED otherwise,"
+        " including when the range has no upper end yet. It judges speed"
+        " only: failing runs still fail the session unless the case also has"
+        " a pass-rate gate."
     )
 
 

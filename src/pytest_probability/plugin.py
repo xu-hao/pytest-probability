@@ -39,6 +39,10 @@ Design notes:
   case id and compares each function, current − baseline, through the
   same ``compare_pairs()`` as an axis comparison; ``--prob-margin``
   makes that a gate.
+- Every run's ``elapsed`` gives each case a latency quantile with a
+  distribution-free order-statistic interval (``LatencySpec``);
+  ``max_latency=`` gates on it (lower is better) and ``--prob-latency``
+  shows it.
 """
 from __future__ import annotations
 
@@ -325,6 +329,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="With --prob-baseline: fail a function whose pass rate may have"
         " dropped by more than MARGIN, e.g. 0.02 (default: report only)",
     )
+    group.addoption(
+        "--prob-latency",
+        dest="prob_latency",
+        action="store_true",
+        default=None,
+        help="Show each case's latency quantile (prob_latency_quantile, or the"
+        " mark's latency_quantile) with its interval"
+        " (default: prob_latency ini or off)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -402,6 +415,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "prob_metric",
         "Metrics to report, comma-separated: pass^K and/or pass@K",
         default="",
+    )
+    parser.addini(
+        "prob_latency",
+        "Show each case's latency quantile and its interval",
+        type="bool",
+        default=False,
+    )
+    parser.addini(
+        "prob_latency_quantile",
+        "The latency quantile reported for cases whose mark sets none",
+        default="0.95",
     )
 
 
@@ -588,10 +612,12 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "probability(min_rate=None, min_passes=None, runs=None,"
         " confidence=None, method=None, prior=None, compare=None,"
-        " baseline=None, margin=None, equivalence=False): gate a benchmark"
+        " baseline=None, margin=None, equivalence=False,"
+        " latency_quantile=None, max_latency=None): gate a benchmark"
         " case on its pass rate (min_rate) or pass count (min_passes), set its"
-        " run count, and/or compare the values of one parametrize argument"
-        " (compare) against a baseline. See"
+        " run count, compare the values of one parametrize argument"
+        " (compare) against a baseline, and/or gate a latency quantile"
+        " (max_latency). See"
         " https://pytest-probability.readthedocs.io/en/latest/reference.html",
     )
     # Resolve (and validate) up front so a bad value is a usage error
@@ -603,6 +629,7 @@ def pytest_configure(config: pytest.Config) -> None:
     metrics_config(config)
     plan_config(config)
     baseline_of(config)
+    latency_config(config)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -832,6 +859,38 @@ def metrics_config(config: pytest.Config) -> tuple[Metric, ...]:
             metrics = parse_metrics(raw, "--prob-metric")
         config.stash[_METRICS] = metrics
     return metrics
+
+
+@dataclass(frozen=True)
+class LatencyConfig:
+    """Session-wide latency settings: ``show`` is
+    ``--prob-latency``/``prob_latency`` (the terminal's latency block),
+    ``quantile`` the ``prob_latency_quantile`` reported for cases whose
+    mark sets no ``latency_quantile``."""
+
+    show: bool = False
+    quantile: float = 0.95
+
+
+_LATENCY_CONFIG = pytest.StashKey[LatencyConfig]()
+
+
+def _resolve_latency_config(config: pytest.Config) -> LatencyConfig:
+    show = config.getoption("prob_latency")
+    if show is None:
+        show = bool(config.getini("prob_latency"))
+    quantile = _parse_level(
+        config.getini("prob_latency_quantile"), "prob_latency_quantile"
+    )
+    return LatencyConfig(show=show, quantile=quantile)
+
+
+def latency_config(config: pytest.Config) -> LatencyConfig:
+    """The session's resolved ``LatencyConfig`` (validated at configure)."""
+    cfg = config.stash.get(_LATENCY_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_LATENCY_CONFIG] = _resolve_latency_config(config)
+    return cfg
 
 
 def _pct_bar(rate: float) -> str:
@@ -1078,11 +1137,229 @@ class GateResult:
         }
 
 
+def latency_verdict(
+    low: float | None, high: float | None, max_latency: float
+) -> str:
+    """The verdict on a latency interval against a maximum: lower is
+    better, so this is ``interval_verdict`` on the negated interval —
+    PASS when the whole interval lies below ``max_latency``, FAIL when
+    it lies entirely above, UNDECIDED otherwise. A bound that doesn't
+    exist yet (``None``) is open on its side: with no upper bound the
+    gate can't PASS, with no lower bound it can't FAIL.
+    """
+    return interval_verdict(
+        -math.inf if high is None else -high,
+        math.inf if low is None else -low,
+        -max_latency,
+    )
+
+
+@dataclass(frozen=True)
+class LatencySpec:
+    """One case's latency settings: the ``quantile`` of its run times
+    that is reported, at ``level``, and — with ``max_latency`` (seconds)
+    — a gate on it. ``errors`` is the session's error mode and ``runs``
+    the case's planned run count.
+
+    Built at collection when a mark sets ``latency_quantile`` or
+    ``max_latency``, and shipped in every run record (``to_record()``)
+    like a ``Gate``; other cases get the session's default on the
+    process that aggregates.
+    """
+
+    quantile: float
+    level: float
+    max_latency: float | None = None
+    errors: str = "count"
+    runs: int = 1
+
+    @property
+    def gated(self) -> bool:
+        return self.max_latency is not None
+
+    def label(self) -> str:
+        """``p95``, ``p99.9``."""
+        return f"p{self.quantile * 100:g}"
+
+    def bar(self) -> str:
+        """The limit as the gates block prints it: ``≤2s``."""
+        return f"≤{self.max_latency:g}s" if self.gated else ""
+
+    def describe(self) -> str:
+        """``max_latency=2 (p95) at 95%``."""
+        return (
+            f"max_latency={self.max_latency:g} ({self.label()})"
+            f" at {_pct_bar(self.level)}"
+        )
+
+    def min_runs(self) -> int:
+        """Fewest timed runs for which both bounds exist: below it the
+        interval has no upper bound, so a latency gate can't PASS."""
+        return stats.quantile_min_n(self.quantile, self.level)
+
+    def evaluate(self, s: CaseStats) -> LatencyResult:
+        """The quantile, its interval and (when gated) verdict over a
+        case's run times.
+
+        Every recorded run counts — passed, failed and errored — except
+        that a gated case (a rate or a latency gate) under
+        ``prob_errors = exclude`` leaves its errored runs out, as its
+        rate gate does. The times are sorted first, so the order runs
+        arrived in (xdist) can't matter.
+        """
+        exclude = self.errors == "exclude" and (self.gated or s.gate is not None)
+        times = sorted(s.times if exclude else [*s.times, *s.error_times])
+        excluded = len(s.error_times) if exclude else 0
+        n = len(times)
+        if not n:
+            return LatencyResult(
+                case=s.case,
+                spec=self,
+                total=0,
+                excluded=excluded,
+                estimate=None,
+                interval=(None, None),
+                ranks=(None, None),
+                coverage=None,
+                verdict=UNDECIDED if self.gated else None,
+            )
+        r, k = stats.quantile_ranks(n, self.quantile, self.level)
+        low = times[r - 1] if r is not None else None
+        high = times[k - 1] if k is not None else None
+        return LatencyResult(
+            case=s.case,
+            spec=self,
+            total=n,
+            excluded=excluded,
+            estimate=stats.sample_quantile(times, self.quantile),
+            interval=(low, high),
+            ranks=(r, k),
+            coverage=stats.quantile_coverage(n, self.quantile, r, k),
+            verdict=(
+                latency_verdict(low, high, self.max_latency) if self.gated else None
+            ),
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "quantile": self.quantile,
+            "confidence": self.level,
+            "max_latency": self.max_latency,
+            "errors": self.errors,
+            "runs": self.runs,
+        }
+
+    @classmethod
+    def from_record(cls, rec: dict[str, Any]) -> LatencySpec:
+        return cls(
+            quantile=rec["quantile"],
+            level=rec["confidence"],
+            max_latency=rec["max_latency"],
+            errors=rec["errors"],
+            runs=rec["runs"],
+        )
+
+
+@dataclass(frozen=True)
+class LatencyResult:
+    """A case's latency quantile: ``estimate`` (the sample quantile) and
+    ``interval`` (the order statistics at ``ranks``; a ``None`` bound is
+    open) over ``total`` timed runs, with ``excluded`` errored runs left
+    out, ``coverage`` the interval's guaranteed coverage and the gate's
+    ``verdict`` (``None`` when ungated)."""
+
+    case: str
+    spec: LatencySpec
+    total: int
+    excluded: int
+    estimate: float | None
+    interval: tuple[float | None, float | None]
+    ranks: tuple[int | None, int | None]
+    coverage: float | None
+    verdict: str | None
+
+    @property
+    def complete(self) -> bool:
+        """Whether both bounds exist."""
+        return None not in self.interval
+
+    def to_json(self) -> dict[str, Any]:
+        ci = None
+        if self.total:
+            ci = {
+                "method": "order-statistic",
+                "level": self.spec.level,
+                "low": self.interval[0],
+                "high": self.interval[1],
+                "ranks": list(self.ranks),
+                "coverage": self.coverage,
+            }
+        return {
+            "quantile": self.spec.quantile,
+            "total": self.total,
+            "excluded": self.excluded,
+            "estimate": self.estimate,
+            "ci": ci,
+            "min_runs": self.spec.min_runs(),
+            "max_latency": self.spec.max_latency,
+            "verdict": self.verdict,
+        }
+
+
+def _positive_seconds(raw: Any, name: str) -> float:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{name} must be a number of seconds, got {raw!r}")
+    value = float(raw)
+    # Positive test so NaN fails too.
+    if not (value > 0.0 and math.isfinite(value)):
+        raise ValueError(f"{name} must be a positive number of seconds, got {raw!r}")
+    return value
+
+
+def _latency_plan(
+    config: pytest.Config, marks: list, runs: int
+) -> LatencySpec | None:
+    """A case's ``LatencySpec`` from its ``probability`` marks (closest
+    first), or ``None`` when no mark sets ``latency_quantile`` or
+    ``max_latency`` — the case then gets the session's default when its
+    runs are aggregated.
+
+    ``latency_quantile`` defaults to ``prob_latency_quantile``. A
+    latency gate's level is the mark's ``confidence``, else the
+    session's, as for a rate gate. Bad values raise
+    ``ValueError``/``pytest.UsageError``.
+    """
+    settings = _merge_probability_marks(marks)
+    if "latency_quantile" not in settings and "max_latency" not in settings:
+        return None
+    if "latency_quantile" in settings:
+        raw = settings["latency_quantile"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"latency_quantile must be a number, got {raw!r}")
+        quantile = _parse_level(raw, "latency_quantile")
+    else:
+        quantile = latency_config(config).quantile
+    max_latency = settings.get("max_latency")
+    if max_latency is not None:
+        max_latency = _positive_seconds(max_latency, "max_latency")
+    level = stats_config(config).level
+    if max_latency is not None and "confidence" in settings:
+        level = _parse_level(settings["confidence"], "confidence")
+    return LatencySpec(
+        quantile=quantile,
+        level=level,
+        max_latency=max_latency,
+        errors=gate_config(config).errors,
+        runs=runs,
+    )
+
+
 # Arguments that set up a function's comparison: a case can't have one.
 _COMPARE_ARGS = ("compare", "baseline", "margin", "equivalence")
+_LATENCY_ARGS = ("latency_quantile", "max_latency")
 _MARK_ARGS = (
     "min_rate", "min_passes", "runs", "confidence", "method", "prior",
-    *_COMPARE_ARGS,
+    *_COMPARE_ARGS, *_LATENCY_ARGS,
 )
 
 
@@ -1510,6 +1787,8 @@ class _CasePlan(NamedTuple):
     gate: Gate | None
     # The case's part in its function's comparison (run record form).
     compare: dict[str, Any] | None = None
+    # The case's latency settings, when a mark sets them.
+    latency: LatencySpec | None = None
 
 
 class BenchFunction(pytest.Collector):
@@ -1555,12 +1834,15 @@ class BenchFunction(pytest.Collector):
                             " put it on the bench function's mark"
                         )
                 runs, gate = _case_plan(self.config, [*case_prob, *fn_prob])
+                latency = _latency_plan(self.config, [*case_prob, *fn_prob], runs)
             except (ValueError, pytest.UsageError) as exc:
                 raise self.CollectError(
                     f"{case}: invalid probability mark: {exc}"
                 ) from None
             plans.append(
-                _CasePlan(variant_id, params, vmarks, case, runs, gate, compare)
+                _CasePlan(
+                    variant_id, params, vmarks, case, runs, gate, compare, latency
+                )
             )
         self._warn_infeasible(short, plans)
 
@@ -1595,6 +1877,7 @@ class BenchFunction(pytest.Collector):
                 case=plan.case,
                 gate=plan.gate,
                 compare=plan.compare,
+                latency=plan.latency,
             )
             for mark in (*other_marks, *plan.marks):
                 # add_marker() only accepts MarkDecorator; these are raw
@@ -1605,13 +1888,14 @@ class BenchFunction(pytest.Collector):
             yield item
 
     def _warn_infeasible(self, short: str, plans: list[_CasePlan]) -> None:
-        """Warn about gates that cannot pass even if every run passes.
+        """Warn about gates that cannot pass even if every run passes —
+        or, for a latency gate, however fast every run is.
 
         One warning per distinct gate, naming the case — or, when
         several cases share it (a global gate), how many.
         """
-        infeasible: dict[Gate, list[str]] = {}
-        passable: dict[Gate, bool] = {}
+        infeasible: dict[Gate | LatencySpec, list[str]] = {}
+        passable: dict[Gate | LatencySpec, bool] = {}
         for plan in plans:
             gate = plan.gate
             if gate is None:
@@ -1620,6 +1904,15 @@ class BenchFunction(pytest.Collector):
                 passable[gate] = gate.verdict(gate.runs, gate.runs) == PASS
             if not passable[gate]:
                 infeasible.setdefault(gate, []).append(plan.case)
+        # A latency gate below min_runs has no upper bound to pass on.
+        for plan in plans:
+            spec = plan.latency
+            if spec is None or not spec.gated:
+                continue
+            if spec not in passable:
+                passable[spec] = spec.runs >= spec.min_runs()
+            if not passable[spec]:
+                infeasible.setdefault(spec, []).append(plan.case)
         code = getattr(self.bench_fn, "__code__", None)
         for gate, cases in infeasible.items():
             if len(cases) == 1:
@@ -1659,6 +1952,12 @@ def _usage_to_dict(u: Any) -> dict[str, Any]:
     }
 
 
+# The clock behind every run's ``elapsed``: perf_counter around the
+# body, not the inter-run delay. A module global looked up at each run,
+# so tests can substitute a deterministic fake.
+_clock: Callable[[], float] = time.perf_counter
+
+
 class BenchItem(pytest.Item):
     """One (case, run) execution of a bench function.
 
@@ -1681,6 +1980,7 @@ class BenchItem(pytest.Item):
         case: str,
         gate: Gate | None = None,
         compare: dict[str, Any] | None = None,
+        latency: LatencySpec | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -1692,6 +1992,11 @@ class BenchItem(pytest.Item):
         self.gate = gate
         # The case's input, arm and its function's comparison spec.
         self.compare = compare
+        # Latency settings from a mark. A latency gate judges speed, not
+        # answers, so it doesn't make the case judged: failing runs
+        # still fail the session unless a rate gate or a margin judges
+        # the case.
+        self.latency = latency
 
     @property
     def judged(self) -> bool:
@@ -1715,7 +2020,7 @@ class BenchItem(pytest.Item):
 
         recorder = _RunRecorder()
         token = _RUN_RECORDER.set(recorder)
-        start = time.perf_counter()
+        start = _clock()
         outcome: str | None = None
         message: str | None = None
         error: str | None = None
@@ -1748,7 +2053,7 @@ class BenchItem(pytest.Item):
                     "outcome": outcome,
                     "message": message,
                     "error": error,
-                    "elapsed": time.perf_counter() - start,
+                    "elapsed": _clock() - start,
                     "cost": cost or None,
                     "usage": recorder.usage,
                 }
@@ -1759,6 +2064,9 @@ class BenchItem(pytest.Item):
                 if self.compare is not None:
                     # Likewise the comparison, with this case's input/arm.
                     record["compare"] = dict(self.compare)
+                if self.latency is not None:
+                    # And the latency settings a mark gave the case.
+                    record["latency"] = self.latency.to_record()
                 # Plain dicts only: user_properties must survive xdist's
                 # worker-to-controller serialization.
                 self.user_properties.append(("probability", record))
@@ -1857,6 +2165,13 @@ class CaseStats:
     # The case's part in a comparison (its first record's ``compare``
     # dict: spec, input and arm); None: not compared.
     compare: dict[str, Any] | None = None
+    # Latency settings from the case's marks (its first record's
+    # ``latency``); None: the session's default.
+    latency: LatencySpec | None = None
+    # Every run's elapsed seconds, in arrival order: passed and failed
+    # runs, and errored ones apart (a gate may leave them out).
+    times: list[float] = field(default_factory=list)
+    error_times: list[float] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -2911,6 +3226,28 @@ def _pct1(p: float) -> str:
     return f"{tenths / 10:.1f}%"
 
 
+def _secs(t: float | None) -> str:
+    """A duration to three significant figures in s, ms or µs —
+    ``2.40s``, ``512ms``, ``12.3ms``, ``850µs`` — rounded half up (the
+    JSON report keeps the unrounded value). ``None``, a bound that
+    doesn't exist yet, is ``—``."""
+    if t is None:
+        return "—"
+    if t <= 0.0:
+        return "0s"
+    # Thresholds sit where rounding carries into the next unit or
+    # digit: 0.9996s is 1.00s, not 1000ms; 9.996s is 10.0s.
+    if t >= 0.9995:
+        value, unit = t, "s"
+    elif t >= 0.0009995:
+        value, unit = t * 1e3, "ms"
+    else:
+        value, unit = t * 1e6, "µs"
+    decimals = 0 if value >= 99.95 else 1 if value >= 9.995 else 2
+    scale = 10**decimals
+    return f"{math.floor(value * scale + 0.5) / scale:.{decimals}f}{unit}"
+
+
 def _change(c: float) -> str:
     """A relative change in interval width as a whole percent with a
     real minus sign — ``−22%``. A shrink too small to round to 1% is
@@ -3060,6 +3397,45 @@ def _comparison_lines(
             note = f"p adjusted for {family} comparisons ({adjustment})"
         lines.append(("", None))
         lines.append((f"  {note}", None))
+    return lines
+
+
+def _latency_lines(
+    results: list[LatencyResult], name_col: int = 0
+) -> list[tuple[str, str | None]]:
+    """One line per latency result, columns aligned across them —
+    ``classify::slow  40 runs  p95  2.40s  [2.10s, 2.90s]  ≤2s  FAIL`` —
+    each with its verdict (``None``: ungated). A bound that doesn't
+    exist yet prints as ``—``; the bar and verdict appear on gated
+    lines only."""
+    if not results:
+        return []
+    names = [r.case for r in results]
+    runs = [f"{r.total} run" + ("" if r.total == 1 else "s") for r in results]
+    labels = [r.spec.label() for r in results]
+    ests = [_secs(r.estimate) for r in results]
+    bounds = [tuple(_secs(v) for v in r.interval) for r in results]
+    bars = [r.spec.bar() for r in results]
+    name_w = max(name_col, *(len(x) for x in names))
+    runs_w = max(len(x) for x in runs)
+    label_w = max(len(x) for x in labels)
+    est_w = max(len(x) for x in ests)
+    low_w = max(len(b[0]) for b in bounds)
+    high_w = max(len(b[1]) for b in bounds)
+    bar_w = max(len(x) for x in bars)
+    lines = []
+    for r, name, n, label, est, (low, high), bar in zip(
+        results, names, runs, labels, ests, bounds, bars
+    ):
+        line = (
+            f"  {name:<{name_w}}  {n:>{runs_w}}  {label:<{label_w}}  {est:>{est_w}}"
+            f"  [{low:>{low_w}}, {high:>{high_w}}]"
+        )
+        if r.verdict is not None:
+            line += f"  {bar:<{bar_w}}  {r.verdict.upper()}"
+        if r.excluded:
+            line += f"  ({r.excluded} errored, excluded)"
+        lines.append((line.rstrip(), r.verdict))
     return lines
 
 
@@ -3234,6 +3610,8 @@ class ProbabilityAggregator:
         self._comparisons: list[Comparison] | None = None
         # baseline_result(), likewise; stays None without --prob-baseline.
         self._baseline_result: BaselineResult | None = None
+        # latency_results(), likewise.
+        self._latency: dict[str, LatencyResult] | None = None
 
     def pytest_runtest_logreport(self, report) -> None:
         if getattr(report, "when", None) != "call":
@@ -3243,12 +3621,18 @@ class ProbabilityAggregator:
                 continue
             gate = value.get("gate")
             compare = value.get("compare")
+            latency = value.get("latency")
             if self._records is not None:
-                # The gate and comparison specs are per case: rows[].gate
-                # and comparisons[] report them once.
+                # The gate, comparison and latency specs are per case:
+                # rows[].gate, comparisons[] and rows[].latency report
+                # them once.
                 self._records.append(
-                    {k: v for k, v in value.items() if k not in ("gate", "compare")}
-                    if gate is not None or compare is not None
+                    {
+                        k: v
+                        for k, v in value.items()
+                        if k not in ("gate", "compare", "latency")
+                    }
+                    if gate is not None or compare is not None or latency is not None
                     else value
                 )
             st = self._stats.setdefault(value["case"], CaseStats(case=value["case"]))
@@ -3256,6 +3640,8 @@ class ProbabilityAggregator:
                 st.gate = Gate.from_record(gate)
             if compare is not None and st.compare is None:
                 st.compare = compare
+            if latency is not None and st.latency is None:
+                st.latency = LatencySpec.from_record(latency)
             outcome = value["outcome"]
             if outcome == "pass":
                 st.passes += 1
@@ -3263,6 +3649,9 @@ class ProbabilityAggregator:
                 st.errors += 1
             else:
                 st.fails += 1
+            (st.error_times if outcome == "error" else st.times).append(
+                value["elapsed"]
+            )
             if value["cost"]:
                 st.cost += value["cost"]
             for usage in value.get("usage", ()):
@@ -3275,6 +3664,27 @@ class ProbabilityAggregator:
             for s in self._stats.values()
             if s.gate is not None
         }
+
+    def latency_results(self) -> dict[str, LatencyResult]:
+        """Every row's latency quantile, interval and (when gated)
+        verdict, from its aggregated run times, computed once after
+        every result is in. A case whose mark set no latency arguments
+        gets the session's ``prob_latency_quantile`` at
+        ``prob_confidence``."""
+        if self._latency is None:
+            default = LatencySpec(
+                quantile=latency_config(self._config).quantile,
+                level=stats_config(self._config).level,
+                errors=gate_config(self._config).errors,
+            )
+            self._latency = {
+                s.case: (s.latency or default).evaluate(s)
+                for s in self._stats.values()
+            }
+        return self._latency
+
+    def _latency_gates(self) -> list[LatencyResult]:
+        return [r for r in self.latency_results().values() if r.verdict is not None]
 
     def aggregates(self) -> list[Aggregate]:
         """One ``Aggregate`` per bench function, by name, then the
@@ -3374,11 +3784,15 @@ class ProbabilityAggregator:
             return
         results = self.gate_results()
         gcfg = gate_config(session.config)
-        verdicts = [r.verdict for r in results.values()] + [
-            c.verdict
-            for c in (*self.comparisons(), *self._baseline_comparisons())
-            if c.verdict is not None
-        ]
+        verdicts = (
+            [r.verdict for r in results.values()]
+            + [
+                c.verdict
+                for c in (*self.comparisons(), *self._baseline_comparisons())
+                if c.verdict is not None
+            ]
+            + [r.verdict for r in self._latency_gates()]
+        )
         if exitstatus == pytest.ExitCode.OK and any(map(gcfg.fails, verdicts)):
             # Every run passed or was xfailed, but a gate or a margin did
             # not hold. Any other status (failures, interrupts) already
@@ -3389,6 +3803,7 @@ class ProbabilityAggregator:
         all_stats = list(self._stats.values())
         cfg = stats_config(session.config)
         metrics = metrics_config(session.config)
+        latency = self.latency_results()
         payload = {
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "runs": _runs(session.config),
@@ -3422,6 +3837,7 @@ class ProbabilityAggregator:
                     "gate": (
                         results[s.case].to_json() if s.case in results else None
                     ),
+                    "latency": latency[s.case].to_json(),
                     "cost": s.cost,
                     "usage": s.usage,
                     "metrics": {m.name: m.of(s) for m in metrics},
@@ -3444,6 +3860,9 @@ class ProbabilityAggregator:
                     row["gate"]["explanation"] = self._gate_reading(
                         s, results[s.case]
                     ).text()
+                row["latency"]["explanation"] = self._latency_reading(
+                    latency[s.case]
+                ).text()
             for agg, entry in zip(self.aggregates(), payload["aggregates"]):
                 entry["explanation"] = self._aggregate_reading(agg).text()
                 for m in agg.metrics:
@@ -3537,10 +3956,11 @@ class ProbabilityAggregator:
             return f"{s.status.upper()} ({s.errors} errored)"
         return s.status.upper()
 
-    def _gate_tally(self, results: dict[str, GateResult]) -> tuple[str, dict]:
-        """The footer's ``Gates:`` line and its color."""
+    def _gate_tally(self, verdicts: list[str]) -> tuple[str, dict]:
+        """The footer's ``Gates:`` line and its color: every rate and
+        latency gate's verdict."""
         gcfg = gate_config(self._config)
-        counts = Counter(r.verdict for r in results.values())
+        counts = Counter(verdicts)
         parts = []
         if counts[PASS]:
             parts.append(f"{counts[PASS]} passed")
@@ -3559,12 +3979,25 @@ class ProbabilityAggregator:
 
     def _write_gates(self, tr, results: dict[str, GateResult]) -> None:
         """The ``probability: gates`` block: every gate that did not
-        PASS, with the interval and bar its verdict came from."""
+        PASS, with the interval and bar its verdict came from — rate
+        gates, then latency gates."""
         shown = [r for r in results.values() if r.verdict != PASS]
-        if not shown:
+        slow = [r for r in self._latency_gates() if r.verdict != PASS]
+        if not shown and not slow:
             return
         tr.write_sep("=", "probability: gates")
-        name_col = max(len(r.case) for r in shown)
+        name_col = max(len(r.case) for r in [*shown, *slow])
+        for line, verdict in self._rate_gate_lines(shown, name_col):
+            tr.write_line(line, **_VERDICT_MARKUP[verdict])
+        for line, verdict in _latency_lines(slow, name_col):
+            tr.write_line(line, **_VERDICT_MARKUP[verdict])
+
+    def _rate_gate_lines(
+        self, shown: list[GateResult], name_col: int
+    ) -> list[tuple[str, str]]:
+        if not shown:
+            return []
+        lines = []
         fracs = [f"{r.passes}/{r.total}" for r in shown]
         frac_col = max(len(f) for f in fracs)
         # Always shown, whatever the interval column's settings: the
@@ -3579,7 +4012,18 @@ class ProbabilityAggregator:
             line += f"  {bar:<{bar_col}}  {r.verdict.upper()}"
             if r.excluded:
                 line += f"  ({r.excluded} errored, excluded)"
-            tr.write_line(line, **_VERDICT_MARKUP[r.verdict])
+            lines.append((line, r.verdict))
+        return lines
+
+    def _write_latency(self, tr) -> None:
+        """The ``probability: latency`` block (``--prob-latency``): every
+        row's latency quantile and interval, with the verdict of a
+        latency gate."""
+        if not latency_config(self._config).show:
+            return
+        tr.write_sep("=", "probability: latency")
+        for line, verdict in _latency_lines(list(self.latency_results().values())):
+            tr.write_line(line, **_VERDICT_MARKUP.get(verdict, {}))
 
     def _write_metrics(self, tr) -> None:
         """The ``probability: metrics`` block (nothing without
@@ -3718,6 +4162,13 @@ class ProbabilityAggregator:
         )
         return explain.row_reading(s, interval, cfg, gated=judged)
 
+    def _latency_reading(self, result: LatencyResult):
+        from . import explain
+
+        return explain.latency_reading(
+            result, undecided_fails=gate_config(self._config).fails(UNDECIDED)
+        )
+
     def _write_explained(
         self, tr, all_stats: list[CaseStats], results: dict[str, GateResult]
     ) -> None:
@@ -3731,12 +4182,18 @@ class ProbabilityAggregator:
         """
         from . import explain
 
+        latency = self.latency_results()
+        show_latency = latency_config(self._config).show
         readings = []
         for s in all_stats:
             if s.case in results:
                 readings.append(self._gate_reading(s, results[s.case]))
             elif s.status != "pass":
                 readings.append(self._row_reading(s))
+            # A latency gate, or a shown latency line missing a bound.
+            lat = latency[s.case]
+            if lat.verdict is not None or (show_latency and not lat.complete):
+                readings.append(self._latency_reading(lat))
         readings.extend(self._aggregate_reading(a) for a in self._shown_aggregates())
         readings.extend(self._metric_reading(a, m) for a, m in self._shown_metrics())
         readings.extend(self._comparison_reading(c) for c in self.comparisons())
@@ -3751,6 +4208,9 @@ class ProbabilityAggregator:
         extra = []
         if any(c is not None for c in self._ci_cells(cfg, all_stats)):
             extra.append(("interval", explain.stats_key(cfg)))
+        if show_latency:
+            # So does the latency block.
+            extra.extend(explain.latency_terms(r) for r in latency.values())
         width = getattr(getattr(tr, "_tw", None), "fullwidth", 80)
         tr.write_sep("=", "probability: explained")
         markup = {**_MARKUP, **_VERDICT_MARKUP}
@@ -3882,8 +4342,11 @@ class ProbabilityAggregator:
         tr.write_line("")
         tr.write_line(overall, bold=True)
         results = self.gate_results()
-        if results:
-            tally, markup = self._gate_tally(results)
+        verdicts = [r.verdict for r in results.values()] + [
+            r.verdict for r in self._latency_gates()
+        ]
+        if verdicts:
+            tally, markup = self._gate_tally(verdicts)
             tr.write_line(tally, **markup)
         total_cost = sum(s.cost for s in all_stats)
         if total_cost:
@@ -3907,6 +4370,7 @@ class ProbabilityAggregator:
         if self._json_path:
             tr.write_line(f"  Report:  {self._json_path}")
         self._write_metrics(tr)
+        self._write_latency(tr)
         self._write_comparisons(tr)
         self._write_baseline(tr)
         self._write_gates(tr, results)
@@ -3916,7 +4380,7 @@ class ProbabilityAggregator:
             self.comparisons()
             or self._shown_metrics()
             or self._baseline_comparisons()
-            or any(r.verdict != PASS for r in results.values())
+            or any(v != PASS for v in verdicts)
         ):
             from .explain import HINT
 

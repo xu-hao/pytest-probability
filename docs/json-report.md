@@ -60,6 +60,12 @@ only the controller writes it, with the full result set.
                "runs": 10, "passes": 8, "total": 10, "excluded": 0,
                "low": 0.4439045376923587, "high": 0.9747892736731666,
                "verdict": "undecided"},
+      "latency": {"quantile": 0.95, "total": 10, "excluded": 0,
+                  "estimate": 0.0123,
+                  "ci": {"method": "order-statistic", "level": 0.95,
+                         "low": 0.0101, "high": null, "ranks": [8, null],
+                         "coverage": 0.9884964426207031},
+                  "min_runs": 72, "max_latency": null, "verdict": null},
       "cost": 0.001,
       "usage": {
         "m-small": {"input_tokens": 1200, "output_tokens": 80,
@@ -186,6 +192,7 @@ Top level:
 | `status` | `str` | `"pass"`, `"flaky"`, `"errored"`, `"fail"`, or `"error"` — see the status table in {doc}`reference` |
 | `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal. Always the session's method and level over every run, even for a gated row |
 | `gate` | object \| `null` | The case's gate and its verdict (below); `null` for an ungated case |
+| `latency` | object | A quantile of the case's run times, its interval and, with `max_latency`, the latency gate's verdict (below). Always present, with or without `--prob-latency` |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
 | `metrics` | object | One entry per `--prob-metric`, keyed by its name (`"pass^3"`, `"pass@5"`), in option order: the case's unbiased estimate in [0, 1], or `null` when the case has fewer than k runs. `{}` without `--prob-metric` |
@@ -210,6 +217,24 @@ Top level:
 The gate's interval equals `ci` when the gate uses the session's
 method and level and errors count; otherwise it is the one its verdict
 was read from.
+
+`rows[].latency` — a quantile of the case's run times (see Latency in
+{doc}`reference`), for every row:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `quantile` | `float` | The quantile: the mark's `latency_quantile`, else `prob_latency_quantile` (`0.95` is p95) |
+| `total` | `int` | Timed runs: every recorded run, less `excluded` |
+| `excluded` | `int` | Errored runs left out: a gated case under `prob_errors = exclude`; else 0 |
+| `estimate` | `float \| null` | The sample quantile in seconds — the ⌈q·n⌉-th fastest run time; `null` when `total` is 0 |
+| `ci` | object \| `null` | `method` (`"order-statistic"`), `level`, unrounded `low`/`high` in seconds — each `null` while there are too few runs for that end — `ranks` (`[r, s]`: the interval is the r-th and s-th fastest run times, `null` for a missing end) and `coverage`, the probability the interval covers the true quantile for continuous run times (at least `level`; at least that with ties). `null` when `total` is 0 |
+| `min_runs` | `int` | Fewest timed runs with both ends at this quantile and level (72 for p95 at 95%) |
+| `max_latency` | `float \| null` | The latency gate's limit in seconds; `null` when the case has none |
+| `verdict` | `str \| null` | `"pass"` (`high` below the limit), `"fail"` (`low` above it) or `"undecided"`, read off `ci`; `null` without `max_latency` |
+| `explanation` | `str` | Only with `--prob-explain`: the line in plain language |
+
+`records[].elapsed` holds every run's time, so other quantiles can be
+worked out from the report itself.
 
 `aggregates[]` — the function-level and overall intervals (see
 Function-level intervals in {doc}`reference`). Every function is
@@ -352,7 +377,7 @@ without pytest-xdist.
 | `outcome` | `str` | `"pass"`, `"fail"`, or `"error"` — the run's class (a gated case's failing runs are xfailed in pytest's output, but stay `"fail"` here) |
 | `message` | `str \| null` | First line of the assert's message on failure |
 | `error` | `str \| null` | `"ExceptionType: text"` on error |
-| `elapsed` | `float` | Wall-clock seconds, measured by the plugin |
+| `elapsed` | `float` | Wall-clock seconds of the bench body (not the delay between runs), measured by the plugin; the input of `rows[].latency` |
 | `cost` | `float \| null` | The run's recorded cost |
 | `usage` | array | Raw `record_usage` entries, in call order |
 
@@ -383,6 +408,16 @@ example as a PR comment (needs `--prob-explain`):
 ```bash
 jq -r '.rows[] | select(.gate and .gate.verdict != "pass")
     | "\(.case): \(.gate.verdict | ascii_upcase)\n\(.gate.explanation)\n"' report.json
+```
+
+List each case's p95 with its interval, and the latency gates that did
+not pass:
+
+```bash
+jq '.rows[] | {case, p: .latency.quantile, est: .latency.estimate,
+    low: .latency.ci.low, high: .latency.ci.high}' report.json
+jq '.rows[] | select(.latency.verdict and .latency.verdict != "pass")
+    | {case, verdict: .latency.verdict, max: .latency.max_latency}' report.json
 ```
 
 List each function's ρ — high means add inputs rather than runs:
