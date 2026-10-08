@@ -71,7 +71,8 @@ only the controller writes it, with the full result set.
         "m-small": {"input_tokens": 1200, "output_tokens": 80,
                     "cached_input_tokens": 640, "cost": 0.001}
       },
-      "metrics": {"pass^3": 0.4666666666666667, "pass@5": 1.0}
+      "metrics": {"pass^3": 0.4666666666666667, "pass@5": 1.0},
+      "stopped": null
     }
   ],
   "aggregates": [
@@ -99,15 +100,16 @@ only the controller writes it, with the full result set.
                           "low": 0.5762, "high": 0.7989},
                    "normal_ci": {"method": "normal", "level": 0.95,
                                  "low": 0.5770, "high": 0.8040},
-                   "suppressed": null},
+                   "suppressed": null, "stopped": 0},
         "pass@5": {"k": 5, "inputs": 40, "left_out": 0,
                    "estimate": 0.9132,
                    "ci": {"method": "bootstrap", "level": 0.95,
                           "low": 0.8611, "high": 0.9583},
                    "normal_ci": {"method": "normal", "level": 0.95,
                                  "low": 0.8659, "high": 0.9605},
-                   "suppressed": null}
-      }
+                   "suppressed": null, "stopped": 0}
+      },
+      "stopped": 0
     }
   ],
   "comparisons": [
@@ -144,10 +146,13 @@ only the controller writes it, with the full result set.
                 "low": -0.1123531026122217, "high": 0.5098375284633582},
          "p": 0.4736842105263155,
          "p_method": "fisher"}
-      ]
+      ],
+      "stopped": 0
     }
   ],
   "baseline": null,
+  "stopping": {"mode": "off", "active": false, "cases": 0,
+               "runs_skipped": 0, "runs_planned": 50, "cost_avoided": null},
   "records": [
     {
       "case": "triage::refund-terse",
@@ -179,6 +184,7 @@ Top level:
 | `aggregates` | array | One entry per bench function, by name, then one for Overall (below); empty when nothing ran |
 | `comparisons` | array | One entry per compared arm (below): functions by name, arms in parametrize order; empty when nothing is compared |
 | `baseline` | object \| `null` | This run against `--prob-baseline` (below); `null` without it |
+| `stopping` | object | Early stopping (`--prob-stop`, below): always present |
 | `records` | array | One entry per executed run |
 
 `rows[]` — the aggregate view, mirroring the terminal table:
@@ -196,6 +202,7 @@ Top level:
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
 | `metrics` | object | One entry per `--prob-metric`, keyed by its name (`"pass^3"`, `"pass@5"`), in option order: the case's unbiased estimate in [0, 1], or `null` when the case has fewer than k runs. `{}` without `--prob-metric` |
+| `stopped` | object \| `null` | How the case stopped early under `--prob-stop=curtail` (below); `null` when it ran every run |
 | `explanation` | `str` | Only with `--prob-explain`: a plain-language reading of the row (its fraction and the `ci` interval), paragraphs separated by `\n`. A gated row's next step is in `gate.explanation` instead |
 
 `rows[].gate` — present when the case is gated (see Gates in
@@ -236,6 +243,18 @@ was read from.
 `records[].elapsed` holds every run's time, so other quantiles can be
 worked out from the report itself.
 
+`rows[].stopped` — present when the case stopped early (see Early
+stopping in {doc}`reference`). The row's counts, `ci`, `gate` and
+`metrics` are those of the runs that ran:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `after` | `int` | The case's runs (including any that skipped themselves) when its verdict settled |
+| `planned` | `int` | The case's runs in the session, after `-k`/`-m` |
+| `skipped` | `int` | Runs skipped because of the stop: `planned − after` |
+| `verdict` | `str` | The verdict it settled on; always equal to `gate.verdict` |
+| `cost_avoided` | `float \| null` | `skipped` × the case's recorded cost per run; `null` when it recorded none |
+
 `aggregates[]` — the function-level and overall intervals (see
 Function-level intervals in {doc}`reference`). Every function is
 listed, including those with too few cases for a terminal line, and
@@ -253,10 +272,11 @@ Overall always is, even when the terminal leaves it out:
 | `resamples` / `seed` | `int` | The bootstrap's settings |
 | `resampling_unit` | `str` | Always `"input"`: whole cases are resampled, keeping all their runs |
 | `note` | `str` | Always `"inputs treated as a sample"`: the interval allows for a different set of inputs; for a hand-picked suite it measures the cases chosen, not a wider population |
-| `suppressed` | `str \| null` | Why there is no interval, e.g. `"fewer than 10 inputs"`; `null` when there is one |
+| `suppressed` | `str \| null` | Why there is no interval: `"fewer than 10 inputs"`, or `"3 cases stopped early"` (`--prob-stop=curtail`); `null` when there is one |
 | `icc` | `float \| null` | ρ, the intraclass correlation of the runs' pass/fail outcomes (one-way ANOVA, adjusted for unequal run counts, clipped to [0, 1]): 0 when an input's runs vary as much as runs of different inputs, 1 when every run of an input gives the same result. `null` when every case ran once, or every run passed or every run failed. Computed even when `suppressed` |
 | `width_factor` | `float \| null` | √((1 + (k − 1)ρ)/k), with k the harmonic mean of the run counts: how much one input's runs pin down its pass rate compared with a single run (1/√k at ρ = 0, 1 at ρ = 1). The interval's width scales with `width_factor`/√N, so doubling the runs changes it by `width_factor(2k)/width_factor(k)` and doubling the inputs by 1/√2. `null` with `icc` |
 | `metrics` | object | One entry per `--prob-metric`, keyed by its name, in option order (below); `{}` without `--prob-metric` |
+| `stopped` | `int` | Cases that stopped early under `--prob-stop=curtail`: with any, `ci` and `normal_ci` are `null` (the estimate, `icc` and `width_factor` stay, as data, but lean toward those cases' verdicts) |
 | `explanation` | `str` | Only with `--prob-explain`: the line in plain language, ending with a `Next:` line |
 
 `aggregates[].metrics[name]` — a metric (see Metrics in {doc}`reference`) over
@@ -269,7 +289,8 @@ the function's (or the session's) cases that have at least k runs:
 | `left_out` | `int` | Cases with fewer than k runs, left out (their `rows[].metrics` value is `null`) |
 | `estimate` | `float \| null` | Mean of the per-case values over `inputs`, in [0, 1]; `null` when `inputs` is 0 |
 | `ci` / `normal_ci` | object \| `null` | As for the aggregate itself — the cluster bootstrap's percentile interval and the normal cross-check, at the same `level`, `resamples` and `seed` — over those `inputs` |
-| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 inputs"`, or `"no input with at least 5 runs"` |
+| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 inputs"`, `"no input with at least 5 runs"`, or `"3 cases stopped early"` |
+| `stopped` | `int` | Of `inputs`, how many stopped early; with any, no `ci` or `normal_ci`, and the terminal shows no value |
 | `explanation` | `str` | Only with `--prob-explain`: the line in plain language |
 
 The bootstrap draws from the cases in case-id order with the recorded
@@ -297,10 +318,11 @@ Comparisons in {doc}`reference`):
 | `exploratory` | `bool` | `true` when `adjustment` is `"none"` and `family` > 1 |
 | `margin` / `equivalence` | `float \| null` / `bool` | The comparison's margin (`null`: no verdict) and rule |
 | `verdict` | `str \| null` | `"pass"`, `"fail"` or `"undecided"` with a margin, read off `ci`; `null` without one |
-| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 paired inputs"`, `"no paired inputs"` |
+| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 paired inputs"`, `"no paired inputs"`, or `"8 cases stopped early"` |
 | `resamples` / `seed` | `int` | The bootstrap's and the Monte Carlo sign-flip test's settings |
 | `cost_ratio` | `float \| null` | The arm's recorded cost per run over the baseline's, on the paired inputs; `null` unless both recorded cost |
 | `inputs` | array | One entry per paired input, sorted by id: `input`, `baseline` and `arm` as `{passes, total}`, `difference`, a Newcombe `ci`, a Fisher `p` (never adjusted) |
+| `stopped` | `int` | Paired cases of the arm or the baseline that stopped early under `--prob-stop=curtail`: with any, `ci`, `p`, `p_method`, `exact` and `p_adjusted` are `null` and the comparison leaves the adjustment's family; `difference` and `inputs` stay, as data |
 | `explanation` | `str` | Only with `--prob-explain`: the comparison in plain language |
 
 Inputs are sorted by id and the bootstrap and sign-flip test are
@@ -352,7 +374,8 @@ without pytest-xdist.
                 "low": -0.6759121533048664, "high": 0.002356109392247785},
          "p": 0.1408668730650158,
          "p_method": "fisher"}
-      ]
+      ],
+      "stopped": 0
     }
   ]
 }
@@ -382,8 +405,20 @@ without pytest-xdist.
 | `usage` | array | Raw `record_usage` entries, in call order |
 
 Cases deselected with `-k`/`-m`, and runs that never
-executed (e.g. after `-x`), are absent — the report describes what
-actually ran.
+executed (e.g. after `-x`, or skipped by `--prob-stop=curtail`), are
+absent — the report describes what actually ran.
+
+`stopping` — early stopping (see Early stopping in {doc}`reference`),
+always present:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `mode` | `str` | `--prob-stop`: `"off"` or `"curtail"` |
+| `active` | `bool` | Whether cases could stop early in this session: `false` when off, and under pytest-xdist without `--dist loadgroup` |
+| `cases` | `int` | Cases that stopped early |
+| `runs_skipped` | `int` | Runs skipped because of a stop, summed over `rows[].stopped.skipped` |
+| `runs_planned` | `int` | The runs that ran plus `runs_skipped` |
+| `cost_avoided` | `float \| null` | Summed `rows[].stopped.cost_avoided`; `null` when no stopped case recorded cost |
 
 ## Recipes
 
@@ -446,6 +481,14 @@ List each comparison with its interval and p-value:
 ```bash
 jq '.comparisons[] | {function, arm, baseline, pairs, difference,
     low: .ci.low, high: .ci.high, p: .p_adjusted, verdict}' report.json
+```
+
+See what `--prob-stop=curtail` saved, and where:
+
+```bash
+jq '.stopping, [.rows[] | select(.stopped)
+    | {case, verdict: .stopped.verdict, after: .stopped.after,
+       planned: .stopped.planned}]' report.json
 ```
 
 Pull the flaky rows with `jq`:

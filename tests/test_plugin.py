@@ -1912,7 +1912,7 @@ def test_aggregate_json(pytester):
     assert set(classify) == {
         "scope", "name", "inputs", "runs", "estimate", "ci", "normal_ci",
         "resamples", "seed", "resampling_unit", "note", "suppressed",
-        "icc", "width_factor", "metrics",
+        "icc", "width_factor", "metrics", "stopped",
     }
     # no --prob-metric: empty, in rows too
     assert all(a["metrics"] == {} for a in data["aggregates"])
@@ -2758,6 +2758,7 @@ def test_comparison_json(pytester):
              "arm": {"passes": 10, "total": 10}, "difference": pytest.approx(0.2),
              "ci": cmp["ci"], "p": cmp["p"], "p_method": "fisher"},
         ],
+        "stopped": 0,
     }
     # the spec rides in user_properties, but records don't repeat it
     assert all("compare" not in r for r in data["records"])
@@ -3036,13 +3037,14 @@ def test_metric_json(pytester):
             "method": "normal", "level": 0.95, "low": normal[0], "high": normal[1],
         },
         "suppressed": None,
+        "stopped": 0,
     }
     assert aggs["Overall"]["pass^2"]["estimate"] == _expected_metric(
         "^", 2, METRIC_COUNTS
     )[0]
     assert aggs["ok"]["pass^2"] == {
         "k": 2, "inputs": 1, "left_out": 0, "estimate": 1.0, "ci": None,
-        "normal_ci": None, "suppressed": "fewer than 10 inputs",
+        "normal_ci": None, "suppressed": "fewer than 10 inputs", "stopped": 0,
     }
 
 
@@ -3095,6 +3097,7 @@ def test_metric_short_cases_are_left_out():
     assert none.to_json() == {
         "k": 13, "inputs": 0, "left_out": 12, "estimate": None, "ci": None,
         "normal_ci": None, "suppressed": "no input with at least 13 runs",
+        "stopped": 0,
     }
 
 

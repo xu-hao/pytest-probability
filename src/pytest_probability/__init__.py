@@ -1,6 +1,7 @@
 """pytest-probability — empirical pass probabilities for flaky-prone tests."""
 
 from pytest_probability.plugin import (
+    CurtailmentWarning,
     InfeasibleGateWarning,
     TokenUsage,
     record_cost,
@@ -8,4 +9,10 @@ from pytest_probability.plugin import (
 )
 
 __version__ = "0.2.0"
-__all__ = ["InfeasibleGateWarning", "TokenUsage", "record_cost", "record_usage"]
+__all__ = [
+    "CurtailmentWarning",
+    "InfeasibleGateWarning",
+    "TokenUsage",
+    "record_cost",
+    "record_usage",
+]

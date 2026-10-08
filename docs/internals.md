@@ -36,6 +36,12 @@ pytest_runtest_makereport      (hookwrapper)
   └─ gated case, margin comparison, or baseline case under
      --prob-margin: report a failing run as xfailed
 
+Curtailer                      (--prob-stop=curtail; registered in
+  │                             pytest_configure where items run)
+  └─ pytest_runtest_protocol:  tally each case's runs; once
+                               Gate.settled() names a verdict, skip
+                               the rest (skip mark + probability_stop)
+
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
   ├─ pytest_sessionfinish:     decide gates (rate and latency) and
@@ -606,6 +612,69 @@ column notes in `explain.py` (`plan_notes()`, `render_notes()`).
   rate, the flake rates and the cost per run read from
   `--prob-plan-report` (`rows[].cost / rows[].total`).
 
+## Early stopping
+
+`--prob-stop=curtail` (issue #9) lives in `plugin.py`, in three parts:
+
+- **The rule:** `Gate.cutoffs(total)` is `(pass_at, fail_at)` — the
+  fewest passes that PASS at `total` judged runs (`critical_passes`,
+  `total + 1` when none) and the most that FAIL (bisection, `-1` when
+  none) — cached per gate and total by `functools.lru_cache`, since
+  under `exclude` every error changes the total. `Gate.settled(passes,
+  fails, errors, remaining)` returns the verdict when it can no longer
+  change, else `None`. Bounds rise with passes and fall with
+  non-passes, for every method and prior, so of all the ways the
+  remaining runs could go (pass, fail, error, or no sample — under
+  `exclude` an error is no sample too) the two extremes decide: PASS if
+  `passes ≥ pass_at(total)` with `total` the judged runs so far plus
+  `remaining` (every remaining run failing), FAIL if `passes +
+  remaining ≤ fail_at(total)` (every one passing), UNDECIDED if neither
+  is reachable. The same monotonicity makes the verdict on the runs so
+  far already that verdict, which is why a stopped case can be judged
+  on the runs it has. Two corners: nothing recorded yet never settles
+  (stopping would leave no row), and with every run so far excluded the
+  verdict on zero runs must agree too. `tests/test_stop.py` checks the
+  rule against every completion for small run counts — every method,
+  level, prior and error mode — including that it never waits longer
+  than it must.
+- **Deciding:** `stop_config(config)` (a frozen `StopConfig`, resolved
+  in `pytest_configure`) says whether this process curtails: in-process
+  yes; on an xdist worker only under `--dist loadgroup` (xdist turns it
+  into `config.option.loadgroup` there); on the xdist controller never,
+  with a `CurtailmentWarning` unless `--dist loadgroup`. Where it does,
+  a `Curtailer` is registered. On the first item it plans from
+  `session.items` (after `-k`/`-m`): the stoppable cases are those whose
+  every item is `BenchItem.curtailable` — gated, and with no comparison
+  margin, `--prob-margin` baseline or latency gate needing its runs —
+  with one gate. Its `pytest_runtest_protocol` hookwrapper counts each
+  finished item of such a case (the `"probability"` record it left on
+  `user_properties`, or none) and asks `settled()` with the items left;
+  once it answers, every later item of the case gets a `skip` mark
+  (reason `probability gate: decided after 12/40 runs (FAIL)`, reported
+  at the bench file) and a `("probability_stop", {case, run, after,
+  planned, verdict})` property, so it is a skip, not a sample.
+  `runtest()` skips too when `-p no:skipping` ignores the mark. Under
+  loadgroup, collection gives each stoppable item without an
+  `xdist_group` of its own one named after its case (`@` and `]`
+  replaced, since xdist splits node ids on them), so one worker runs
+  every run of the case. The decision only needs counts, so order —
+  case-major, `--prob-transpose`, or xdist's — doesn't matter.
+- **Reporting:** `ProbabilityAggregator` rebuilds a `Stop` per case
+  from the skipped runs' setup (or call) reports, wherever it runs:
+  rows and gates lines get `Stop.label()`, the footer `_stop_line()`,
+  and the JSON report `rows[].stopped` and `stopping`.
+  `suppress_stopped(agg, stops)` drops the intervals of any aggregate
+  (and of each metric's inner aggregate) over a stopped case and sets
+  `stopped`; `suppress_stopped_comparison()` drops a comparison's
+  interval and p-value when its arm's or baseline's paired cases
+  include a stopped one, before the p-values are adjusted, so the
+  family is the comparisons that keep a p-value. The same goes for
+  baseline comparisons, by function. `_shown_aggregates()` keeps a
+  stopped aggregate that would have had an interval, and
+  `_aggregate_lines()`, `_metric_lines()` and `_comparison_lines()`
+  print a note in its place. The explain readings take the `Stop`
+  (`gate_reading`, `row_reading`) or read `stopped` off the objects.
+
 ## Invariants worth preserving
 
 If you change the plugin, these are the properties the test suite pins
@@ -615,7 +684,8 @@ down and users rely on:
    (xdist serialization).
 2. Item ids are stable and predictable
    (`file::bench_fn::case-id[runN]`) — people script against them with
-   `-k` and `--deselect`.
+   `-k` and `--deselect`. (Under `--dist loadgroup`, xdist appends
+   `@group` — with `--prob-stop=curtail`, the case's own group.)
 3. Parametrize ids and ordering match real pytest for the same
    decorators.
 4. Outcome classes are exception-derived and exact: `AssertionError` →
@@ -681,3 +751,15 @@ down and users rely on:
     exit status, xfails or the gates block changes. A latency gate
     never xfails a run and only ever changes the exit status from `OK`
     to `TESTS_FAILED`.
+17. Early stopping never changes a verdict: a case stops only when
+    every way its remaining runs could go gives the verdict it has
+    then, so every gate, margin and latency verdict — and the exit
+    status — is the one all the runs would give. Only cases whose runs
+    no other verdict needs are stopped, and only by the process that
+    runs all of a case's runs (in-process, or one xdist worker under
+    `--dist loadgroup`). Skipped runs are pytest skips, never samples
+    (invariant 4), and the aggregator learns of them from their
+    reports, so the output is the same with and without xdist.
+    Intervals and p-values over a stopped case are suppressed, never
+    shown. Without `--prob-stop=curtail` nothing changes: no marks, no
+    skips, `stopped` is `null` in rows and 0 elsewhere.

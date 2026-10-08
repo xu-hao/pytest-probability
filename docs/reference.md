@@ -141,6 +141,13 @@ All options live in the `probability` group of `pytest --help`.
   gates are judged, and listed in the gates block, without it.
   **Default:** the `prob_latency` ini value, else off.
 
+`--prob-stop={off,curtail}`
+: `curtail` skips a gated case's remaining runs as soon as its verdict
+  can no longer change: see [Early stopping](#early-stopping). The
+  verdicts are the same as running every run. Under pytest-xdist it
+  needs `--dist loadgroup`; otherwise it warns and every run runs.
+  **Default:** the `prob_stop` ini value, else `off`.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -224,6 +231,9 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 : The latency quantile reported for cases whose mark sets no
   `latency_quantile`, strictly between 0 and 1 — `0.99`, not `99`.
   Ini only; use `-o prob_latency_quantile=0.99` for a one-off.
+
+`prob_stop` *(string, default `"off"`)*
+: Default for `--prob-stop`: `off` or `curtail`.
 
 Invalid values for the statistical, bootstrap and gate options are
 reported as pytest usage errors before anything runs.
@@ -777,13 +787,119 @@ on unrounded bounds:
 - Durations print to three significant figures in s, ms or µs; the JSON
   report keeps the unrounded seconds, and the verdict uses those.
 
+## Early stopping
+
+A gated case often settles long before its last run: 9 failures in a
+row already rule out `min_rate=0.9` over 40 runs, and 19 passes meet
+`min_passes=19` whatever the twentieth does. `--prob-stop=curtail`
+skips the rest:
+
+```text
+$ pytest benchmarks/ --prob-stop=curtail
+================================= probability ==================================
+  classify::solid  40/40  [91%, 100%]  $0.0400
+  classify::close  37/38  [86%,  99%]  $0.0380  FLAKY  decided after 38/40
+  classify::weak    3/12  [ 5%,  57%]  $0.0120  FLAKY  decided after 12/40
+  smoke::steady    19/19  [82%, 100%]  $0.0190  decided after 19/20
+  smoke::broken      2/4  [ 7%,  93%]  $0.0040  FLAKY  decided after 4/20
+
+  Overall: 101/113 passed (89%)
+  Gates:   2 passed, 2 failed, 1 undecided
+  Stopped: 4 cases early, saving 47 of 160 runs (29%) and about $0.0470
+  Cost:    $0.1130
+```
+
+**When a case stops.** After each run, the plugin asks whether every
+way the remaining runs could go — each passing, failing, erroring or
+skipping itself — gives the same verdict at the case's planned run
+count. Interval bounds rise with passes and fall with non-passes, so
+the two extremes decide:
+
+| Stops as | when it holds even if |
+|---|---|
+| PASS | every remaining run fails |
+| FAIL | every remaining run passes |
+| UNDECIDED | neither PASS nor FAIL is reachable any more |
+
+The thresholds come from the gate itself: for a fixed number of runs,
+the fewest passes that PASS and the most that FAIL, found once by
+bisection over the gate's own `verdict()`. With `min_rate=0.9` over 40
+runs at 95% (exact), PASS needs 40 of 40 and FAIL is at most 31
+passes, so `close` above (37 passes, then failures) stops as UNDECIDED
+at its first failure, and `weak` (3 passes, then failures) as FAIL at
+its ninth.
+
+**Exact.** A stopped case's verdict is the one all its runs would have
+given, so error rates are those of running every run: a stop is only
+made when no remaining outcome could change the verdict. The verdict on
+the runs that did run is then already the same, so the gates block and
+the JSON report judge the case on those runs, with the interval its
+verdict was read from. It stops as soon as that holds, not later: one
+run fewer and some outcome of the rest would still change the verdict.
+
+- **Errors.** Under `prob_errors = count` a remaining run may error
+  as a non-pass; under `exclude` it may leave the sample instead, so
+  the case's final sample could be anything from today's runs to all
+  of them. Both are covered: a case whose every run so far errored and
+  was excluded only stops when judging it on no runs at all would also
+  give its verdict.
+- **Runs that skip themselves** (`pytest.skip`) are not samples, as
+  always; they still count among the planned runs.
+- **What is never stopped:** ungated cases; a case with no recorded
+  run yet (stopping would leave it without a row); and gated cases
+  whose runs another verdict needs — those of a function with a
+  comparison `margin=`, those paired against `--prob-baseline` with
+  `--prob-margin`, and those with a latency gate (`max_latency=`),
+  whose sample of run times skipping would shrink. Being conservative
+  keeps every verdict in the session the one all the runs would give.
+- "Remaining" is the case's items still to run in this session, after
+  `-k`/`-m`, in whatever order they run: case-major or
+  `--prob-transpose`.
+
+**Skipped runs** are reported by pytest as skipped, with the reason
+`probability gate: decided after 38/40 runs (UNDECIDED)` (`-rs` lists
+them), and are not samples: they are neither in the row nor in the
+JSON `records`. Rows of stopped cases end with `decided after 38/40`,
+here and in the gates block. The `Stopped:` footer line counts the
+cases, the runs skipped out of the runs that ran plus those skipped,
+and, when cost was recorded, the cost avoided: each stopped case's
+skipped runs at its own average cost per run.
+
+**What it hides.** A case that stops as soon as its verdict is certain
+has a fraction from fewer runs that leans toward that verdict: 3/12
+for `weak` above, where all 40 runs give 3/40. So any function
+(and Overall) with a stopped case shows no function-level interval but
+a note, `classify  N=40 inputs × k=12–40  interval hidden: 3 cases
+stopped early`; its [metrics](#metrics) line shows `hidden: 3 cases
+stopped early` instead of a value; and a [comparison](#comparisons) or
+[baseline](#baseline) line over a stopped case shows neither difference,
+interval nor p-value, only the note. The JSON report keeps the
+estimates as data, with `suppressed` and `stopped` saying why there is
+no interval. The row's own interval stays: it describes the runs that
+ran. A latency quantile of a stopped case comes from the runs that ran.
+
+**Under pytest-xdist**, a case can only be stopped by the process that
+runs all of its runs, so `--prob-stop=curtail` needs `--dist
+loadgroup`: the plugin puts each stoppable case's items in an
+`xdist_group` of its own (named after the case, which xdist appends to
+the node id: `…::weak[run3]@classify::weak`), so one worker runs them
+and decides. A case that already has an `xdist_group` mark keeps it.
+With any other `--dist`, a `CurtailmentWarning` says so and every run
+runs. Either way, the controller rebuilds the stops from the skipped
+runs' reports, so the summary and JSON report match a serial run.
+
+`--prob-explain` says, for each stopped case, why it could stop and
+what that means for its numbers, and for each hidden line why it is
+hidden.
+
 ## Python API
 
 Everything importable lives in the top-level package:
 
 ```python
 from pytest_probability import (
-    InfeasibleGateWarning, TokenUsage, record_cost, record_usage,
+    CurtailmentWarning, InfeasibleGateWarning, TokenUsage, record_cost,
+    record_usage,
 )
 ```
 
@@ -822,6 +938,13 @@ for aggregation rules.
 A `pytest.PytestWarning` subclass, raised at collection for a gate that
 cannot pass even if every run passes. See
 [Feasibility warning](#feasibility-warning).
+
+### `CurtailmentWarning`
+
+A `pytest.PytestWarning` subclass, raised at startup when
+`--prob-stop=curtail` runs under pytest-xdist without `--dist
+loadgroup`: no case can stop early then. See
+[Early stopping](#early-stopping).
 
 ## Benchmark module contract
 
@@ -909,6 +1032,7 @@ sample.
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Gates:   3 passed, 1 failed, 1 undecided     # only when a case is gated
+  Stopped: 2 cases early, saving 30 of 80 runs (38%) and about $0.0030   # --prob-stop=curtail
   Cost:    $0.0110                                 # only when cost was recorded
   Tokens:  m-small  1,200 in / 80 out / 640 cached  $0.0010   # per model,
            m-large  4,800 in / 900 out              $0.0040   # only with usage
@@ -951,8 +1075,9 @@ with the interval and bar each verdict came from:
 
 ### The explain section
 
-When any gate is FAIL or UNDECIDED, or any comparison, metric or
-baseline line is shown, the summary ends with a hint:
+When any gate is FAIL or UNDECIDED, any comparison, metric or
+baseline line is shown, or any case [stopped early](#early-stopping),
+the summary ends with a hint:
 
 ```text
   Run with --prob-explain for a plain-language reading.
@@ -1024,6 +1149,15 @@ interval method and level actually in effect:
   "a sample of inputs" means for it, p as how often a gap this big
   would turn up by chance if there were no real difference, any
   adjustment, the cost ratio, the margin's verdict, and a next step.
+- A case that [stopped early](#early-stopping) gets a paragraph saying
+  after how many of its planned runs it stopped, why its verdict could
+  no longer change ("it would fall short of the bar even if every
+  remaining run passed"), that the verdict is the one all its runs
+  would give, and that its fraction can lean toward the verdict. A
+  function-level, metrics, comparison or baseline line hidden by a
+  stopped case says why it is hidden and that running without
+  `--prob-stop=curtail` shows it. The glossary explains "decided
+  after".
 - Under pytest-xdist the controller writes the section from the
   aggregated counts, so it reads the same as a serial run.
 
@@ -1178,4 +1312,6 @@ pytest's last line counts runs, not gates, so a session can end
 gates block (or the verdicts in the comparisons block) say why.
 Comparisons without a margin, and a baseline without
 `--prob-margin`, never change the exit status. The JSON report's `exit_status` is the final code,
-gates included.
+gates included. `--prob-stop=curtail` never changes it either: every
+verdict is the one all the runs would give, and the skipped runs are
+skips.
