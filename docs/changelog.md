@@ -110,6 +110,25 @@
   without a compared function are unchanged apart from the empty
   `comparisons` list. New `stats.sign_flip_test` and
   `stats.adjust_pvalues`.
+- **pass^k and pass@k:** `--prob-metric=pass^3,pass@5` (repeatable,
+  or `prob_metric` in the ini file) also reports pass^k, the chance
+  that k runs of the same input all pass (reliability), and pass@k,
+  the chance that at least one of k does (best-of-k). Per case they
+  are the unbiased estimates C(c, k)/C(n, k) and
+  1 − C(n − c, k)/C(n, k) from c passes in n runs (errored runs count
+  as non-passes); cases with fewer than k runs are left out and
+  counted. Each function and Overall gets the mean over its cases with
+  the same cluster-bootstrap interval as its function-level line, in a
+  new `probability: metrics` block —
+  `classify  pass^3  N=12 inputs  34.3%  [17.2%,  53.8%]` — shown
+  whatever the number of inputs (the interval still needs
+  `prob_min_inputs`). **JSON:** `rows[]` gain `metrics`
+  (`{"pass^3": 0.47, "pass@5": null}`, `null` below k runs) and
+  `aggregates[]` gain `metrics` (`{"pass^3": {k, inputs, left_out,
+  estimate, ci, normal_ci, suppressed}}`), both `{}` without the
+  option. `--prob-explain` reads each line in plain words and the
+  glossary explains both metrics. Without the option the output is
+  unchanged. New `stats.pass_hat_k` and `stats.pass_at_k`.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function

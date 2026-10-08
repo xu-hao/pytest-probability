@@ -64,7 +64,8 @@ only the controller writes it, with the full result set.
       "usage": {
         "m-small": {"input_tokens": 1200, "output_tokens": 80,
                     "cached_input_tokens": 640, "cost": 0.001}
-      }
+      },
+      "metrics": {"pass^3": 0.4666666666666667, "pass@5": 1.0}
     }
   ],
   "aggregates": [
@@ -84,7 +85,23 @@ only the controller writes it, with the full result set.
       "note": "inputs treated as a sample",
       "suppressed": null,
       "icc": 0.6033,
-      "width_factor": 0.8018541014424008
+      "width_factor": 0.8018541014424008,
+      "metrics": {
+        "pass^3": {"k": 3, "inputs": 40, "left_out": 0,
+                   "estimate": 0.6905,
+                   "ci": {"method": "bootstrap", "level": 0.95,
+                          "low": 0.5762, "high": 0.7989},
+                   "normal_ci": {"method": "normal", "level": 0.95,
+                                 "low": 0.5770, "high": 0.8040},
+                   "suppressed": null},
+        "pass@5": {"k": 5, "inputs": 40, "left_out": 0,
+                   "estimate": 0.9132,
+                   "ci": {"method": "bootstrap", "level": 0.95,
+                          "low": 0.8611, "high": 0.9583},
+                   "normal_ci": {"method": "normal", "level": 0.95,
+                                 "low": 0.8659, "high": 0.9605},
+                   "suppressed": null}
+      }
     }
   ],
   "comparisons": [
@@ -169,6 +186,7 @@ Top level:
 | `gate` | object \| `null` | The case's gate and its verdict (below); `null` for an ungated case |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
+| `metrics` | object | One entry per `--prob-metric`, keyed by its name (`"pass^3"`, `"pass@5"`), in option order: the case's unbiased estimate in [0, 1], or `null` when the case has fewer than k runs. `{}` without `--prob-metric` |
 | `explanation` | `str` | Only with `--prob-explain`: a plain-language reading of the row (its fraction and the `ci` interval), paragraphs separated by `\n`. A gated row's next step is in `gate.explanation` instead |
 
 `rows[].gate` — present when the case is gated (see Gates in
@@ -211,7 +229,21 @@ Overall always is, even when the terminal leaves it out:
 | `suppressed` | `str \| null` | Why there is no interval, e.g. `"fewer than 10 inputs"`; `null` when there is one |
 | `icc` | `float \| null` | ρ, the intraclass correlation of the runs' pass/fail outcomes (one-way ANOVA, adjusted for unequal run counts, clipped to [0, 1]): 0 when an input's runs vary as much as runs of different inputs, 1 when every run of an input gives the same result. `null` when every case ran once, or every run passed or every run failed. Computed even when `suppressed` |
 | `width_factor` | `float \| null` | √((1 + (k − 1)ρ)/k), with k the harmonic mean of the run counts: how much one input's runs pin down its pass rate compared with a single run (1/√k at ρ = 0, 1 at ρ = 1). The interval's width scales with `width_factor`/√N, so doubling the runs changes it by `width_factor(2k)/width_factor(k)` and doubling the inputs by 1/√2. `null` with `icc` |
+| `metrics` | object | One entry per `--prob-metric`, keyed by its name, in option order (below); `{}` without `--prob-metric` |
 | `explanation` | `str` | Only with `--prob-explain`: the line in plain language, ending with a `Next:` line |
+
+`aggregates[].metrics[name]` — a metric (see Metrics in {doc}`reference`) over
+the function's (or the session's) cases that have at least k runs:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `k` | `int` | The k of `pass^k` or `pass@k`: how many runs the metric draws |
+| `inputs` | `int` | Cases with at least k runs: the ones averaged |
+| `left_out` | `int` | Cases with fewer than k runs, left out (their `rows[].metrics` value is `null`) |
+| `estimate` | `float \| null` | Mean of the per-case values over `inputs`, in [0, 1]; `null` when `inputs` is 0 |
+| `ci` / `normal_ci` | object \| `null` | As for the aggregate itself — the cluster bootstrap's percentile interval and the normal cross-check, at the same `level`, `resamples` and `seed` — over those `inputs` |
+| `suppressed` | `str \| null` | Why there is no `ci`: `"fewer than 10 inputs"`, or `"no input with at least 5 runs"` |
+| `explanation` | `str` | Only with `--prob-explain`: the line in plain language |
 
 The bootstrap draws from the cases in case-id order with the recorded
 `seed`, and entries are sorted by name, so the same results give the
@@ -294,6 +326,14 @@ List each function's ρ — high means add inputs rather than runs:
 
 ```bash
 jq '.aggregates[] | select(.icc != null) | {name, icc, width_factor}' report.json
+```
+
+Print each function's pass^3 next to its pass rate (needs
+`--prob-metric=pass^3`):
+
+```bash
+jq '.aggregates[] | {name, pass_rate: .estimate, "pass^3": .metrics["pass^3"].estimate,
+    left_out: .metrics["pass^3"].left_out}' report.json
 ```
 
 Print each function's average and interval, with the cross-check:

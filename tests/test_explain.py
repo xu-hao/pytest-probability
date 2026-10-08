@@ -1447,3 +1447,241 @@ def test_margin_row_has_no_gate_advice(pytester, columns):
     text = "\n".join(_section(result))
     assert "gate it" not in text
     assert "Your margin is 10 points" in text
+
+
+# ---------------------------------------------------------------------------
+# pass^k and pass@k (#7)
+# ---------------------------------------------------------------------------
+
+
+def _metric(counts, *metrics, scope="function", name="classify", **cfg):
+    """The metric readings of an aggregate over cases with these
+    (passes, runs), one per metric (``"^3"``, ``"@5"``)."""
+    from pytest_probability.plugin import Metric, aggregate
+
+    cases = [
+        CaseStats(f"{name}::{i}", p, n - p) for i, (p, n) in enumerate(counts)
+    ]
+    cfg = StatsConfig(**cfg)
+    agg = aggregate(
+        scope, name, cases, cfg, metrics=[Metric(m[0], int(m[1:])) for m in metrics]
+    )
+    return [explain.metric_reading(agg, m, cfg.min_inputs) for m in agg.metrics]
+
+
+HAT3 = (
+    "pass^3 is the chance that 3 runs of the same input all pass: reliability,"
+    " for code that has to work every time it is called."
+)
+AT5 = (
+    "pass@5 is the chance that at least one of 5 runs of the same input"
+    " passes: best-of-5, for when a failed attempt can be retried, or the best"
+    " of 5 answers kept."
+)
+NO_RANGE = (
+    " No range is shown: with fewer than 10 inputs (prob_min_inputs), a range"
+    " worked out from the inputs alone comes out too narrow."
+)
+
+
+def test_metric_pass_hat_template():
+    (r,) = _metric(AGG_COUNTS, "^3")
+    assert r.heading == "classify  pass^3  N=12 inputs  28.1%  [10.6%, 49.4%]"
+    assert r.paragraphs == (
+        f"{HAT3} Averaged over classify's 12 inputs, each input counting"
+        " equally, it is 28.1%. For comparison, the same inputs passed 55.0% of"
+        " their runs; pass^3 is lower because all 3 runs have to pass. The true"
+        " average is probably between 10.6% and 49.4% (95% confidence),"
+        " treating these inputs as a random sample of the inputs classify will"
+        " meet.",
+    )
+    assert r.tone is None
+    assert r.terms == (("pass^k", None), ("aggregate", (0.95, 5000, 0, 10)))
+
+
+def test_metric_pass_at_template():
+    (r,) = _metric(AGG_COUNTS, "@5")
+    assert r.heading == "classify  pass@5  N=12 inputs  93.8%  [88.5%, 98.8%]"
+    assert r.paragraphs == (
+        f"{AT5} Averaged over classify's 12 inputs, each input counting"
+        " equally, it is 93.8%. For comparison, the same inputs passed 55.0% of"
+        " their runs; pass@5 is higher because one pass in 5 runs is enough."
+        " The true average is probably between 88.5% and 98.8% (95%"
+        " confidence), treating these inputs as a random sample of the inputs"
+        " classify will meet.",
+    )
+    assert r.terms == (("pass@k", None), ("aggregate", (0.95, 5000, 0, 10)))
+
+
+def test_metric_left_out_overall_template():
+    (r,) = _metric(AGG_COUNTS + [(1, 2)], "@5", scope="overall", name="Overall")
+    assert r.heading == (
+        "Overall  pass@5  N=12 inputs  93.8%  [88.5%, 98.8%]"
+        "  1 left out (fewer than 5 runs)"
+    )
+    assert r.paragraphs[0].startswith(
+        f"{AT5} Averaged over the 12 inputs in this session, each input"
+        " counting equally, it is 93.8%. 1 input had fewer than 5 runs and was"
+        " left out. For comparison,"
+    )
+    assert r.paragraphs[0].endswith("the inputs your code will meet.")
+    assert r.paragraphs[1] == (
+        "Next: give every case at least 5 runs (--prob-runs=5 or more, or runs="
+        " on its mark), so that no input is left out."
+    )
+
+
+def test_metric_too_few_inputs_template():
+    hat, at = _metric([(3, 4), (4, 4)], "^2", "@2", name="small")
+    assert hat.heading == "small  pass^2  N=2 inputs  75.0%"
+    assert hat.text() == (
+        "pass^2 is the chance that 2 runs of the same input all pass:"
+        " reliability, for code that has to work every time it is called."
+        " Averaged over small's 2 inputs, each input counting equally, it is"
+        " 75.0%. For comparison, the same inputs passed 87.5% of their runs;"
+        f" pass^2 is lower because both runs have to pass.{NO_RANGE}\n"
+        "Next: add inputs (more parametrize cases) to reach 10."
+    )
+    assert hat.terms == (("pass^k", None),)
+    assert at.paragraphs[0].endswith(
+        f"pass@2 is higher because one pass in 2 runs is enough.{NO_RANGE}"
+    )
+
+
+def test_metric_no_eligible_input_template():
+    (r,) = _metric([(3, 4), (4, 4)], "@5", name="small")
+    assert r.heading == "small  pass@5  N=0 inputs  2 left out (fewer than 5 runs)"
+    assert r.paragraphs == (
+        f"{AT5} No input of small has 5 runs, so it can't be worked out yet: an"
+        " input needs at least 5 runs for it.",
+        "Next: give every case at least 5 runs (--prob-runs=5 or more, or runs="
+        " on its mark).",
+    )
+    (r,) = _metric([(3, 4)], "^5", scope="overall", name="Overall")
+    assert "No input in this session has 5 runs" in r.paragraphs[0]
+
+
+def test_metric_k1_and_no_spread_templates():
+    (one,) = _metric(AGG_COUNTS, "^1")
+    assert one.paragraphs[0].startswith(
+        "pass^1 is the chance that one run of an input passes: the pass rate."
+        " Averaged over classify's 12 inputs, each input counting equally, it"
+        " is 55.0%. The true average"
+    )
+    # every input always or never passes: no gap to explain
+    (same,) = _metric([(0, 4), (4, 4)], "^2", name="det")
+    assert "passed 50.0% of their runs." + NO_RANGE in same.paragraphs[0]
+
+
+def test_metric_heading_follows_the_block_without_intervals():
+    from pytest_probability.plugin import CaseStats, Metric, aggregate
+
+    cases = [CaseStats(f"c::{i}", p, n - p) for i, (p, n) in enumerate(AGG_COUNTS)]
+    agg = aggregate("function", "c", cases, StatsConfig(), metrics=[Metric("^", 3)])
+    r = explain.metric_reading(agg, agg.metrics[0], 10, intervals=False)
+    assert r.heading == "c  pass^3  N=12 inputs  28.1%"
+    # the range is still read out
+    assert "between 10.6% and 49.4%" in r.text()
+
+
+def test_metric_avoids_jargon():
+    text = " ".join(
+        p
+        for readings in (
+            _metric(AGG_COUNTS + [(1, 2)], "^3", "@5", "^1"),
+            _metric([(3, 4), (4, 4)], "^2", "@5"),
+        )
+        for r in readings
+        for p in r.paragraphs
+    ).lower()
+    for word in (
+        "null hypothesis", "reject", "significant", "alpha", "unbiased",
+        "estimator", "bootstrap", "binomial", "expected value",
+    ):
+        assert word not in text
+
+
+def test_glossary_metric_entries():
+    entries = _entries(("pass^k", None), ("pass@k", None))
+    assert list(entries) == ["pass^k", "pass@k"]
+    tail = (
+        " Each input's value comes from its own runs, on average neither too"
+        " high nor too low, and the line averages it over the inputs, each"
+        " counting equally; inputs with fewer than k runs are left out. k is"
+        " the number of runs the metric draws, not the runs each input had."
+    )
+    assert entries["pass^k"] == (
+        "The chance that k runs of the same input all pass: reliability, for"
+        " code that has to work every time it is called. It can only fall as k"
+        f" grows; pass^1 is the pass rate.{tail} (Of all the ways to pick k of"
+        " an input's n runs, the share in which all k passed: C(c,k)/C(n,k)"
+        " for c passes.)"
+    )
+    assert entries["pass@k"] == (
+        "The chance that at least one of k runs of the same input passes:"
+        " best-of-k, for when a failed attempt can be retried, or the best of k"
+        f" answers kept. It can only rise as k grows; pass@1 is the pass rate.{tail}"
+        " (Of all the ways to pick k of an input's n runs, the share with at"
+        " least one pass: 1 − C(n−c,k)/C(n,k) for c passes.)"
+    )
+    # only the kinds used
+    assert list(_entries(("pass@k", None))) == ["pass@k"]
+
+
+BENCH_METRIC = """
+import pytest
+
+_calls = {}
+
+# Under --prob-runs=3, input 4 passes 2 of its runs and the others all 3.
+@pytest.mark.parametrize("i", range(10))
+def bench_classify(i):
+    _calls[i] = _calls.get(i, 0) + 1
+    assert _calls[i] <= (2 if i == 4 else 3)
+"""
+
+
+def test_metric_explained_end_to_end(pytester, columns):
+    pytester.makepyfile(bench_m=BENCH_METRIC)
+    result = _run(
+        pytester, "--prob-runs=3", "--prob-metric=pass^3,pass@2", "--prob-explain",
+        "--prob-json=r.json",
+    )
+    assert HINT not in result.stdout.lines
+    blocks = _blocks(_section(result))
+    headings = [b[0] for b in blocks]
+    hat = headings.index("  classify  pass^3  N=10 inputs  90.0%  [70.0%, 100.0%]")
+    at = headings.index("  classify  pass@2  N=10 inputs  100.0%  [100.0%, 100.0%]")
+    # after the aggregate reading, in option order
+    assert headings[hat - 1].startswith("  classify  N=10 inputs × k=3")
+    assert at == hat + 1
+    assert blocks[hat][1] == (
+        "    pass^3 is the chance that 3 runs of the same input all pass:"
+        " reliability,"
+    )
+    glossary = blocks[-1]
+    for label, start in (("pass^k", "The chance that k runs"),
+                         ("pass@k", "The chance that at least")):
+        assert any(ln.startswith(f"    {label}        {start}") for ln in glossary)
+    data = json.loads((pytester.path / "r.json").read_text())
+    metrics = data["aggregates"][0]["metrics"]
+    assert metrics["pass^3"]["explanation"].startswith(
+        "pass^3 is the chance that 3 runs"
+    )
+    assert metrics["pass@2"]["explanation"].endswith("the inputs classify will meet.")
+
+
+def test_hint_when_metrics_are_shown(pytester, columns):
+    # every run passes: only the metrics block earns the hint
+    pytester.makepyfile(bench_fine="def bench_fine():\n    assert True\n")
+    result = _run(pytester, "--prob-runs=2", "--prob-metric=pass^2")
+    assert result.ret == pytest.ExitCode.OK
+    lines = result.stdout.lines
+    at = lines.index(HINT)
+    assert lines[at - 1] == ""
+    assert "= probability: metrics =" in "\n".join(lines[:at])
+    assert HINT not in _run(pytester, "--prob-runs=2").stdout.lines
+    # and with the flag, the section reads the line
+    section = _section(_run(pytester, "--prob-runs=2", "--prob-metric=pass^2",
+                            "--prob-explain"))
+    assert section[0] == "  fine  pass^2  N=1 input  100.0%"

@@ -29,6 +29,9 @@ Contents:
   pass/fail outcomes, by one-way ANOVA), ``width_factor`` and
   ``projected_width`` (how an interval over inputs scales with runs
   and inputs).
+- **Repeated attempts** — ``pass_hat_k`` (pass^k, all k attempts at
+  an input pass) and ``pass_at_k`` (pass@k, at least one does): the
+  unbiased estimators from c passes in n runs.
 
 Conventions:
 
@@ -808,3 +811,49 @@ def projected_width(
     inputs = _check_positive("inputs", inputs)
     before = width_factor(k, rho)
     return width_factor(k * runs, rho) / before / math.sqrt(inputs)
+
+
+# ---------------------------------------------------------------------------
+# Repeated attempts: pass^k and pass@k
+# ---------------------------------------------------------------------------
+
+
+def _check_attempts(passes: object, runs: object, k: object) -> tuple[int, int, int]:
+    c, n = _check_counts(passes, runs, "passes", "runs")
+    k = _check_int("k", k)
+    if not 1 <= k <= n:
+        raise ValueError(f"k must be between 1 and runs={n}, got {k}")
+    return c, n, k
+
+
+def pass_hat_k(passes: int, runs: int, k: int) -> float:
+    """pass^k: the chance that k attempts at one input all pass.
+
+    C(c, k)/C(n, k) for c passes in n runs, 1 ≤ k ≤ n: of all the ways
+    to pick k of the n runs, the share in which every one passed. It is
+    an unbiased estimate of p^k when the runs are independent with pass
+    probability p (E[C(c, k)] = C(n, k)·p^k for binomial c), unlike
+    (c/n)^k, which overstates it. ``pass_hat_k(c, n, 1)`` is c/n.
+
+    The ratio of two exact integers, correctly rounded: no overflow or
+    cancellation at any n.
+    """
+    c, n, k = _check_attempts(passes, runs, k)
+    return math.comb(c, k) / math.comb(n, k)
+
+
+def pass_at_k(passes: int, runs: int, k: int) -> float:
+    """pass@k: the chance that at least one of k attempts at one input
+    passes.
+
+    1 − C(n − c, k)/C(n, k) for c passes in n runs, 1 ≤ k ≤ n: of all
+    the ways to pick k of the n runs, the share with at least one pass.
+    Unbiased for 1 − (1 − p)^k, as ``pass_hat_k`` is for p^k; 1 as soon
+    as fewer than k runs failed. ``pass_at_k(c, n, 1)`` is c/n.
+
+    Computed as (C(n, k) − C(n − c, k))/C(n, k) in exact integers, so a
+    value near 0 keeps its precision.
+    """
+    c, n, k = _check_attempts(passes, runs, k)
+    total = math.comb(n, k)
+    return (total - math.comb(n - c, k)) / total

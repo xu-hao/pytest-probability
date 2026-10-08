@@ -22,9 +22,10 @@ How it fits together:
   with the line itself as its ``heading``, a few ``paragraphs`` of
   body, a ``tone`` (a verdict or status, for coloring) and the
   glossary ``terms`` it relied on. There is one function per kind of
-  line: ``gate_reading``, ``row_reading`` and ``aggregate_reading``
-  (which also reads ρ and the runs-vs-inputs projection) today; later
-  features add their own (``comparison_reading``, …) next to them.
+  line: ``gate_reading``, ``row_reading``, ``aggregate_reading``
+  (which also reads ρ and the runs-vs-inputs projection),
+  ``metric_reading`` (pass^k and pass@k) and ``comparison_reading``;
+  later features add their own next to them.
 - The *glossary* ("Methods used") lists only the terms the readings
   used. Each entry is a function registered with ``@glossary_entry``
   under a key; a reading names ``(key, detail)`` pairs in ``terms``,
@@ -507,6 +508,116 @@ def _narrower(change: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Metrics: pass^k and pass@k
+# ---------------------------------------------------------------------------
+
+
+def _metric_meaning(metric: Any) -> str:
+    """What a metric measures, in one sentence."""
+    name, k = metric.name, metric.k
+    if k == 1:
+        return f"{name} is the chance that one run of an input passes: the pass rate."
+    if metric.kind == "^":
+        return (
+            f"{name} is the chance that {k} runs of the same input all pass:"
+            " reliability, for code that has to work every time it is called."
+        )
+    return (
+        f"{name} is the chance that at least one of {k} runs of the same input"
+        f" passes: best-of-{k}, for when a failed attempt can be retried, or the"
+        f" best of {k} answers kept."
+    )
+
+
+def _inputs(n: int) -> str:
+    return f"{n} input" if n == 1 else f"{n} inputs"
+
+
+def metric_reading(
+    agg: Any, m: Any, min_inputs: int, *, intervals: bool = True
+) -> Reading:
+    """A line of the metrics block explained: what the metric means, its
+    average over inputs and range, how many inputs were too short for
+    it, and a next step.
+
+    ``agg`` is the ``Aggregate`` the line belongs to and ``m`` its
+    ``MetricAggregate``; ``min_inputs`` the session's
+    ``prob_min_inputs``; ``intervals`` whether the block shows ranges.
+    """
+    from .plugin import _metric_lines
+
+    heading = _metric_lines([(agg, m)], intervals)[0].strip()
+    metric, k = m.metric, m.metric.k
+    kind = "pass^k" if metric.kind == "^" else "pass@k"
+    terms: list[tuple[str, Hashable]] = [(kind, None)]
+    meaning = _metric_meaning(metric)
+    step = (
+        f"Next: give every case at least {k} runs (--prob-runs={k} or more, or"
+        " runs= on its mark)"
+    )
+    if m.aggregate is None:
+        where = "in this session" if agg.scope == "overall" else f"of {agg.name}"
+        paras = (
+            f"{meaning} No input {where} has {k} runs, so it can't be worked"
+            f" out yet: an input needs at least {k} runs for it.",
+            f"{step}.",
+        )
+        return Reading(heading, paras, None, tuple(terms))
+
+    inner, n = m.aggregate, m.inputs
+    if agg.scope == "overall":
+        whose, subject = f"the {_inputs(n)} in this session", "your code"
+    else:
+        whose, subject = f"{agg.name}'s {_inputs(n)}", agg.name
+    est = _pct1(inner.estimate)
+    body = (
+        f"{meaning} Averaged over {whose}, each input counting equally, it is"
+        f" {est}."
+    )
+    if m.left_out:
+        body += (
+            f" {_inputs(m.left_out).capitalize()} had fewer than {k} runs and"
+            f" {'was' if m.left_out == 1 else 'were'} left out."
+        )
+    if k > 1:
+        mean_rate = sum(c / t for c, t in inner.counts) / n
+        body += (
+            f" For comparison, the same inputs passed {_pct1(mean_rate)} of"
+            " their runs"
+        )
+        if metric.kind == "^" and inner.estimate < mean_rate:
+            every = "both runs" if k == 2 else f"all {k} runs"
+            body += f"; {metric.name} is lower because {every} have to pass."
+        elif metric.kind == "@" and inner.estimate > mean_rate:
+            body += f"; {metric.name} is higher because one pass in {k} runs is enough."
+        else:
+            body += "."
+    if inner.ci is not None:
+        setup = (inner.level, inner.resamples, inner.seed, min_inputs)
+        terms.append(("aggregate", setup))
+        body += (
+            f" The true average is probably between {_pct1(inner.ci[0])} and"
+            f" {_pct1(inner.ci[1])} ({_pct_bar(inner.level)} confidence),"
+            f" treating these inputs as a random sample of the inputs {subject}"
+            " will meet."
+        )
+    else:
+        body += (
+            f" No range is shown: with fewer than {min_inputs} inputs"
+            " (prob_min_inputs), a range worked out from the inputs alone comes"
+            " out too narrow."
+        )
+    paras = [body]
+    if m.left_out:
+        paras.append(f"{step}, so that no input is left out.")
+    elif inner.ci is None:
+        paras.append(
+            f"Next: add inputs (more parametrize cases) to reach {min_inputs}."
+        )
+    return Reading(heading, tuple(paras), None, tuple(terms))
+
+
+# ---------------------------------------------------------------------------
 # Comparisons
 # ---------------------------------------------------------------------------
 
@@ -879,6 +990,37 @@ def _icc_entry(_: list) -> str:
         " on every run's pass or fail, adjusted for inputs with different run"
         " counts, kept between 0 and 1; the range scales with"
         " √((1+(k−1)ρ)/k) for k runs per input.)"
+    )
+
+
+_METRIC_TAIL = (
+    " Each input's value comes from its own runs, on average neither too"
+    " high nor too low, and the line averages it over the inputs, each"
+    " counting equally; inputs with fewer than k runs are left out. k is"
+    " the number of runs the metric draws, not the runs each input had."
+)
+
+
+@glossary_entry("pass^k", "pass^k")
+def _pass_hat_entry(_: list) -> str:
+    return (
+        "The chance that k runs of the same input all pass: reliability, for"
+        " code that has to work every time it is called. It can only fall as"
+        " k grows; pass^1 is the pass rate." + _METRIC_TAIL + " (Of all the"
+        " ways to pick k of an input's n runs, the share in which all k"
+        " passed: C(c,k)/C(n,k) for c passes.)"
+    )
+
+
+@glossary_entry("pass@k", "pass@k")
+def _pass_at_entry(_: list) -> str:
+    return (
+        "The chance that at least one of k runs of the same input passes:"
+        " best-of-k, for when a failed attempt can be retried, or the best of"
+        " k answers kept. It can only rise as k grows; pass@1 is the pass"
+        " rate." + _METRIC_TAIL + " (Of all the ways to pick k of an input's"
+        " n runs, the share with at least one pass: 1 − C(n−c,k)/C(n,k)"
+        " for c passes.)"
     )
 
 

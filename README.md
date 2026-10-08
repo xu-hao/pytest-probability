@@ -208,6 +208,30 @@ narrow the interval, at the recorded cost. Low ρ (triage): outputs vary
 from run to run, so more runs help. High ρ (classify): each input is
 consistently right or wrong, so add inputs instead.
 
+### pass^k and pass@k
+
+How often does an input pass three runs in a row, or at least one of
+five? `--prob-metric` reports either, per case (in the JSON report),
+per function and overall, with the same bootstrap interval:
+
+```
+$ pytest benchmarks/ --prob-runs=10 --prob-metric='pass^3,pass@5'
+...
+============================= probability: metrics =============================
+  classify  pass^3  N=12 inputs  34.3%  [17.2%,  53.8%]
+            pass@5  N=12 inputs  99.4%  [98.8%, 100.0%]
+  triage    pass^3  N=3 inputs   69.4%
+            pass@5  N=2 inputs   99.8%                   1 left out (fewer than 5 runs)
+  Overall   pass^3  N=15 inputs  41.3%  [22.9%,  61.2%]
+            pass@5  N=14 inputs  99.5%  [98.9%,  99.9%]  1 left out (fewer than 5 runs)
+```
+
+pass^k is reliability — all k runs of the same input pass — and pass@k
+is best-of-k — at least one does. Each case's value is the unbiased
+estimate from its runs, and cases with fewer than k runs are left out.
+Quote `^` in shells that treat it specially (zsh with `extendedglob`,
+Windows `cmd`).
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -226,6 +250,7 @@ consistently right or wrong, so add inputs instead.
 | `--prob-seed=SEED` | CLI | ini or 0 | seed for every resampling procedure |
 | `--prob-compare=AXIS` | CLI | ini or none | compare the values of parametrize argument AXIS, each against the first |
 | `--prob-adjust=M` | CLI | ini or `none` | adjust comparison p-values: `none` (exploratory), `holm`, `bonferroni`, `bh` |
+| `--prob-metric=M` | CLI | ini or none | also report `pass^K` (all K runs of an input pass: reliability) and/or `pass@K` (at least one of K passes: best-of-K); comma-separated, repeatable |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -243,6 +268,7 @@ consistently right or wrong, so add inputs instead.
 | `prob_min_inputs` | ini | 10 | fewest cases a function needs for its function-level interval (and fewest paired inputs for a comparison's) |
 | `prob_compare` | ini | — | default for `--prob-compare` |
 | `prob_adjust` | ini | `none` | default for `--prob-adjust` |
+| `prob_metric` | ini | — | default for `--prob-metric` (comma- or space-separated) |
 | `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`) |
 
 ## JSON report

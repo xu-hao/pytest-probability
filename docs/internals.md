@@ -39,8 +39,9 @@ ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_sessionfinish:     decide gates and margins → exit status,
   │                            then write the JSON report (controller only)
   └─ pytest_terminal_summary:  render the fraction table, function-level
-                               lines, comparisons block, gates block and
-                               (--prob-explain) explain section
+                               lines, metrics block, comparisons block,
+                               gates block and (--prob-explain) explain
+                               section
 ```
 
 The load-bearing design decision is in the middle: **execution
@@ -340,6 +341,42 @@ Errored runs count as non-passes in an aggregate even under
 exclusion is a gate setting. Aggregates never touch gate verdicts or
 the exit status.
 
+## Metrics
+
+pass^k and pass@k (`--prob-metric`) ride on the aggregates:
+
+- `stats.pass_hat_k(c, n, k)` = C(c, k)/C(n, k) and
+  `stats.pass_at_k(c, n, k)` = 1 − C(n − c, k)/C(n, k), with
+  `math.comb` and one exact integer division each, so they are
+  correctly rounded at any n. Both need 1 ≤ k ≤ n.
+- `Metric(kind, k)` (`kind` `"^"` or `"@"`) is one requested metric:
+  `name` is its spelling (`pass^3`), `value(passes, total)` the
+  estimator and `of(CaseStats)` a row's value, `None` below k runs.
+  `parse_metrics()` reads `--prob-metric` (append, each value split on
+  commas and whitespace) or `prob_metric`, in first-seen order without
+  duplicates, and `metrics_config(config)` keeps the result on
+  `config.stash`, resolved and validated in `pytest_configure` like the
+  other settings.
+- `aggregate(..., metrics=...)` adds one `MetricAggregate` per metric
+  to the `Aggregate`'s `metrics`: `aggregate(scope, name, eligible,
+  cfg, value=metric.value)` over the cases with at least k runs — the
+  same canonical order, seed, level and `min_inputs` rule, so the
+  interval comes for free — or `None` when no case has k runs, plus
+  `left_out`, the number of shorter cases. The inner aggregate's ρ is
+  that of the eligible cases' pass/fail counts and is not shown.
+  `ProbabilityAggregator.aggregates()` passes the session's metrics,
+  so they are cached with the rest.
+- `rows[].metrics` is `{name: Metric.of(row)}` and
+  `aggregates[].metrics` is `{name: MetricAggregate.to_json()}`; both
+  are `{}` without the option. `_shown_metrics()` picks the block's
+  `(Aggregate, MetricAggregate)` pairs — every function, then Overall
+  unless there is a single function, whatever their size — and
+  `_metric_lines()` aligns them; its one-line form is also a reading's
+  heading.
+- Metrics never touch verdicts or the exit status. Comparisons and
+  gates on a metric would reuse `Metric.value` with `compare_pairs` and
+  `aggregate`; neither exists yet.
+
 ## Comparisons
 
 Also in `plugin.py`, after the aggregates:
@@ -401,7 +438,8 @@ it needs it).
   and the glossary `terms` it used. There is one function per kind of
   line — `gate_reading(GateResult, …)`, `row_reading(CaseStats, …)`,
   `aggregate_reading(Aggregate, min_inputs)` (which adds the ρ and
-  runs-vs-inputs paragraphs when the aggregate has a ρ) and
+  runs-vs-inputs paragraphs when the aggregate has a ρ),
+  `metric_reading(Aggregate, MetricAggregate, min_inputs)` and
   `comparison_reading(Comparison, …)` — and a new kind of
   output line gets a new function beside them.
 - The glossary is a registry: `@glossary_entry(key, label)` registers
@@ -468,3 +506,9 @@ down and users rely on:
     `compare` key in records and the same exit status; a comparison
     without a margin never changes the exit status, and a margin only
     ever changes it from `OK` to `TESTS_FAILED`.
+13. Metrics are a function of the aggregated counts, the requested
+    metrics, the seed and the settings only, computed by `aggregate()`
+    on the process that has every result, so they are the same with
+    and without xdist. Without `--prob-metric`/`prob_metric` the
+    terminal output is unchanged and `metrics` is `{}`; metrics never
+    change the exit status.
