@@ -109,6 +109,7 @@ Top level:
 | `gate` | object \| `null` | The case's gate and its verdict (below); `null` for an ungated case |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
+| `explanation` | `str` | Only with `--prob-explain`: a plain-language reading of the row (its fraction and the `ci` interval), paragraphs separated by `\n`. A gated row's next step is in `gate.explanation` instead |
 
 `rows[].gate` — present when the case is gated (see Gates in
 {doc}`reference`):
@@ -124,6 +125,7 @@ Top level:
 | `excluded` | `int` | Errored runs left out (0 under `count`) |
 | `low` / `high` | `float \| null` | The gate's interval, unrounded; `null` when `total` is 0 |
 | `verdict` | `str` | `"pass"`, `"fail"` or `"undecided"` |
+| `explanation` | `str` | Only with `--prob-explain`: the verdict in plain language, ending with a `Next:` line when there is a next step — the same text as the terminal's explain section, unwrapped |
 
 The gate's interval equals `ci` when the gate uses the session's
 method and level and errors count; otherwise it is the one its verdict
@@ -161,6 +163,14 @@ CI gate on this, use `--prob-min-rate=0.8` instead):
 
 ```bash
 jq '.rows[] | select(.ci.low < 0.8) | {case, low: .ci.low, high: .ci.high}' report.json
+```
+
+Post the plain-language reading of every gate that did not pass, for
+example as a PR comment (needs `--prob-explain`):
+
+```bash
+jq -r '.rows[] | select(.gate and .gate.verdict != "pass")
+    | "\(.case): \(.gate.verdict | ascii_upcase)\n\(.gate.explanation)\n"' report.json
 ```
 
 Pull the flaky rows with `jq`:

@@ -34,6 +34,17 @@
   and `exit_status` includes gate failures. Ungated suites are
   unchanged. Known limitation: a failed gate has no failing item, so
   JUnit XML and `--lf` don't see it.
+- **Explanations:** `--prob-explain` / `prob_explain = true` adds a
+  `probability: explained` section that reads every gated case and
+  every ungated row that didn't pass all its runs in plain language —
+  what was measured, what the numbers mean, and a next step (for an
+  UNDECIDED gate, about how many runs would settle it) — plus a short
+  "Methods used" glossary naming the interval method and level in
+  effect. Text wraps to the terminal width. With the flag, JSON rows
+  and gates gain an `explanation` string. Without it, a session with a
+  FAIL or UNDECIDED gate ends with a one-line hint,
+  `Run with --prob-explain for a plain-language reading.`; nothing
+  else changes.
 - **Internal:** new `pytest_probability.stats` module — the
   standard-library-only building blocks for the statistical-testing
   work: exact binomial tails, the regularized incomplete beta function
