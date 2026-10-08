@@ -132,6 +132,15 @@ All options live in the `probability` group of `pytest --help`.
   without `--prob-baseline`.
   **Default:** none — the baseline comparison only reports.
 
+`--prob-latency`
+: Add a `probability: latency` block: every case's latency quantile
+  (`prob_latency_quantile`, or the mark's `latency_quantile`) with its
+  interval, and the verdict of a [latency gate](#latency). A flag, not
+  `--prob-latency=0.99`, so it can't swallow a path that follows it;
+  choose the quantile with `prob_latency_quantile` or the mark. Latency
+  gates are judged, and listed in the gates block, without it.
+  **Default:** the `prob_latency` ini value, else off.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -208,6 +217,14 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
   spaces or new lines (`prob_metric = pass^3, pass@5`). Empty means
   none.
 
+`prob_latency` *(bool, default `false`)*
+: Default for `--prob-latency`.
+
+`prob_latency_quantile` *(string, default `"0.95"`)*
+: The latency quantile reported for cases whose mark sets no
+  `latency_quantile`, strictly between 0 and 1 — `0.99`, not `99`.
+  Ini only; use `-o prob_latency_quantile=0.99` for a one-off.
+
 Invalid values for the statistical, bootstrap and gate options are
 reported as pytest usage errors before anything runs.
 
@@ -221,6 +238,8 @@ reported as pytest usage errors before anything runs.
 @pytest.mark.probability(compare="style", baseline="terse")          # compare the arms of an axis
 @pytest.mark.probability(compare="style", margin=0.02)               # non-inferiority gate
 @pytest.mark.probability(compare="style", margin=0.02, equivalence=True)
+@pytest.mark.probability(max_latency=2.0)                            # p95 of run time under 2s
+@pytest.mark.probability(latency_quantile=0.99, max_latency=5.0)     # p99 under 5s
 ```
 
 | Argument | Meaning |
@@ -235,6 +254,8 @@ reported as pytest usage errors before anything runs.
 | `baseline` | The arm the others are compared with, by its id. Default: the first value in the parametrize list. |
 | `margin` | Make the comparison a gate: the arm may be at most `margin` worse than the baseline (non-inferiority). Strictly between 0 and 1: `0.02` is 2 percentage points. |
 | `equivalence` | With `margin`: the arm must be within ±`margin` of the baseline instead. `True` or `False`. |
+| `latency_quantile` | The quantile of the case's run times that is reported (and gated, with `max_latency`), instead of `prob_latency_quantile`. Strictly between 0 and 1: `0.95` is the 95th percentile. |
+| `max_latency` | Gate on [latency](#latency): the interval for that quantile must lie below this many seconds. A positive number. |
 
 - **Where it applies:** on a `bench_*` function, every case of it; on
   one case with `pytest.param(..., marks=pytest.mark.probability(...))`.
@@ -247,7 +268,10 @@ reported as pytest usage errors before anything runs.
   the `prob_runs` ini value.
 - **Gated or not:** a case is gated when its mark sets `min_rate` or
   `min_passes`, or a global min rate is set. `runs=`, `confidence=`,
-  `method=` and `prior=` alone don't create a gate.
+  `method=` and `prior=` alone don't create a gate. `max_latency` adds
+  a separate latency gate; `latency_quantile` alone only chooses the
+  quantile reported. `confidence=` sets the level of both gates'
+  intervals; `method=` and `prior=` don't apply to latency.
 - **Comparison arguments are per function:** `compare`, `baseline`,
   `margin` and `equivalence` go on the bench function's mark, together
   (`baseline=` without `compare=` is an error), and are rejected on a
@@ -662,6 +686,97 @@ interval as for an axis comparison's `margin=`:
   {doc}`json-report` for the `baseline` block and a GitHub Actions
   recipe that caches main's report.
 
+## Latency
+
+Every run is timed: its `elapsed` is the wall-clock time of the bench
+body (`time.perf_counter`), not the delay between runs. `--prob-latency`
+shows a quantile of each case's run times with an interval, and
+`max_latency=` gates a case on it:
+
+```python
+@pytest.mark.probability(max_latency=2.0)            # p95 under 2 seconds
+@pytest.mark.parametrize("case", ["search", "summarize", "translate"])
+def bench_api(case):
+    call_service(case)
+```
+
+```text
+$ pytest benchmarks/ --prob-runs=100 --prob-latency
+============================= probability: latency =============================
+  api::search     100 runs  p95  769ms  [600ms, 933ms]  ≤2s  PASS
+  api::summarize  100 runs  p95  2.00s  [1.71s, 4.84s]  ≤2s  UNDECIDED
+  api::translate  100 runs  p95  3.00s  [2.60s, 3.25s]  ≤2s  FAIL
+```
+
+**The quantile** is `latency_quantile=` on the mark, else
+`prob_latency_quantile` (0.95). `p95` is the run time 95% of runs
+finish within; the estimate is the observed one — the ⌈0.95·n⌉-th
+fastest of n runs.
+
+**The interval** makes no assumption about the shape of the run-time
+distribution — skewed, long-tailed or lumpy, it only needs the runs to
+be independent draws. Its ends are two of the observed run times, the
+r-th and s-th fastest, with ranks from the binomial distribution: the
+number of runs faster than the true quantile is Binomial(n, q), so
+r is the largest rank that is too high with probability at most
+(1 − level)/2, and s the smallest that is too low with at most that.
+Each end is wrong at most 2.5% of the time at 95%, so the interval
+covers the true quantile at least 95% of the time — exactly
+P(r ≤ B ≤ s − 1) for continuous run times, slightly more than 95%
+because ranks are whole numbers (the JSON report's `coverage`), and at
+least that with ties. It uses `prob_confidence`, or the mark's
+`confidence=` for a latency gate, like a rate gate.
+
+**Too few runs.** An upper end exists only once qⁿ ≤ (1 − level)/2,
+and a lower end once (1 − q)ⁿ is: until then that side is open and
+prints `—`. Both ends need at least:
+
+| Quantile | p50 | p90 | p95 | p99 |
+|---|---|---|---|---|
+| Runs at 95% | 6 | 36 | 72 | 368 |
+
+(the same numbers as a rate gate's bars, for the same reason.) With
+fewer, `[600ms, —]` still says the quantile is probably at least
+600ms, at the same confidence.
+
+**Which runs count.** Every recorded run: passed, failed and errored,
+because a wrong answer took as long as a right one. Under
+`prob_errors = exclude` a gated case (a rate or a latency gate) leaves
+its errored runs out, as its rate gate does — `(2 errored, excluded)`
+on the line — since a run that crashed early or hit a broken service
+says little about the code's speed. Skipped runs are never recorded.
+
+**The gate** is the [gate rule](#gates) with lower being better,
+on unrounded bounds:
+
+| Interval vs `max_latency` | Verdict |
+|---|---|
+| Entirely below | PASS |
+| Entirely above | FAIL |
+| Straddles it, or has no upper end yet | UNDECIDED |
+
+- A missing upper end can't PASS, but a lower end above the limit
+  FAILs: with 20 runs, `[2.50s, —]` against `≤1s` is already too
+  slow. A case with every run excluded is UNDECIDED.
+- The verdicts set the exit status like a rate gate's: FAIL fails the
+  session, and UNDECIDED does unless `--prob-undecided=pass`. They are
+  counted on the `Gates:` line and non-PASS ones are listed in the
+  gates block, with or without `--prob-latency`.
+- **A latency gate judges speed, not answers.** It doesn't turn failing
+  runs into xfails: a failing `assert` still fails the session, as in
+  an ungated case, unless the case also has a rate gate (`min_rate=` or
+  `min_passes=`) or a margin, which judges the answers. So
+  `max_latency=2.0` alone means "every run right, and p95 under 2s";
+  with `min_rate=0.9` it means "90% right, and p95 under 2s".
+- At collection, a latency gate with fewer runs than the table above
+  gets an `InfeasibleGateWarning`: `api (3 cases): max_latency=2 (p95)
+  at 95% needs ≥72 runs; each has 20`.
+- Under pytest-xdist the run times travel in the run records and the
+  controller sorts them before computing anything, so the lines and
+  verdicts are the same as a serial run.
+- Durations print to three significant figures in s, ms or µs; the JSON
+  report keeps the unrounded seconds, and the verdict uses those.
+
 ## Python API
 
 Everything importable lives in the top-level package:
@@ -805,7 +920,8 @@ The section renders only when at least one benchmark item ran. With
 it. When a function is [compared](#comparisons), a `probability:
 comparisons` section comes next, then with `--prob-baseline` a
 [`probability: baseline`](#baseline) section, both before the gates
-block.
+block. With `--prob-latency`, a [`probability: latency`](#latency)
+section comes right after the metrics.
 
 ### The gates block
 
@@ -828,6 +944,10 @@ with the interval and bar each verdict came from:
   the verdict depends on them.
 - PASS cases are only counted, on the `Gates:` line. `(allowed)` marks
   UNDECIDED cases that `--prob-undecided=pass` lets through.
+- [Latency gates](#latency) that did not PASS follow the rate gates, in
+  their own columns: `api::slow  100 runs  p95  3.00s  [2.60s, 3.25s]
+  ≤2s  FAIL`. A case with both gates can appear twice, and the `Gates:`
+  line counts every verdict.
 
 ### The explain section
 
@@ -882,6 +1002,12 @@ interval method and level actually in effect:
   so instead.
 - Count gates (`min_passes`) are explained in counts; errored runs
   left out under `prob_errors = exclude` are called out.
+- Each [latency gate](#latency) gets a reading: the quantile in words
+  ("the time 95% of its runs finish within"), its range, the verdict
+  against the limit and a next step — for a range with no upper end
+  yet, how many runs it needs. With `--prob-latency`, an ungated
+  latency line is read too when its range is missing an end, and the
+  glossary explains the latency columns.
 - Each [function-level line](#function-level-intervals) gets a reading
   too: the average, its range, the "inputs treated as a sample"
   caveat, and a next step. When the line shows a
@@ -1041,7 +1167,9 @@ otherwise have exited 0.
 | A gate FAIL, or UNDECIDED under the default `fail` | 1 |
 | A comparison's margin FAIL, or UNDECIDED under the default `fail` | 1 |
 | A function's `--prob-margin` FAIL against the baseline, or UNDECIDED under the default `fail` | 1 |
+| A latency gate FAIL, or UNDECIDED under the default `fail` | 1 |
 | An ungated run failed or errored (whatever the gates) | 1 |
+| A failing run in a case with only a latency gate | 1 |
 | An errored run in a gated case, `prob_errors = count` | 1 |
 | Interrupted, usage error, no tests… | pytest's own code, unchanged |
 

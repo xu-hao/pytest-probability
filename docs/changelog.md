@@ -174,6 +174,27 @@
   each line in plain words. The `jq` recipe for diffing two reports
   is replaced by `--prob-baseline` and a GitHub Actions example that
   caches main's report.
+- **Latency:** `@pytest.mark.probability(max_latency=2.0)` gates a case
+  on a quantile of its run times (`elapsed`, the bench body only): the
+  95th percentile by default, `latency_quantile=0.99` for another, or
+  `prob_latency_quantile` for every case. The interval is
+  distribution-free — two of the observed run times, with ranks from
+  the binomial distribution, so each end is wrong at most 2.5% of the
+  time at 95% whatever the shape of the distribution — at
+  `prob_confidence` (or the mark's `confidence=`). PASS when it lies
+  below the limit, FAIL when above, UNDECIDED otherwise; below 72 runs
+  (for p95 at 95%) it has no upper end yet (`[600ms, —]`), so the gate
+  can't pass, and an `InfeasibleGateWarning` says so at collection.
+  Every run counts, failed and errored too, except errored runs of a
+  gated case under `prob_errors = exclude`. Verdicts set the exit
+  status, join the `Gates:` tally and the gates block; failing asserts
+  in a case with only a latency gate still fail the session (a latency
+  gate judges speed, not answers). `--prob-latency` / `prob_latency`
+  adds a `probability: latency` block with every case's quantile and
+  interval. **JSON:** rows gain `latency` (quantile, total, excluded,
+  estimate, `ci` with ranks and coverage, min_runs, max_latency,
+  verdict). `--prob-explain` reads latency gates in plain words.
+  Without these options nothing changes.
 
 ## 0.2.0 (2026-07-08)
 

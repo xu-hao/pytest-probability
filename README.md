@@ -238,6 +238,36 @@ estimate from its runs, and cases with fewer than k runs are left out.
 Quote `^` in shells that treat it specially (zsh with `extendedglob`,
 Windows `cmd`).
 
+### Latency: a quantile with an interval, and a gate on it
+
+Every run is timed. `max_latency=` gates a case on a quantile of its
+run times (the 95th percentile unless `latency_quantile=` says
+otherwise), and `--prob-latency` shows each case's quantile with a
+distribution-free interval:
+
+```python
+@pytest.mark.probability(max_latency=2.0)            # p95 must be under 2s
+@pytest.mark.parametrize("case", ["search", "summarize", "translate"])
+def bench_api(case):
+    call_service(case)
+```
+
+```
+$ pytest benchmarks/ --prob-runs=100 --prob-latency
+...
+============================= probability: latency =============================
+  api::search     100 runs  p95  769ms  [600ms, 933ms]  ≤2s  PASS
+  api::summarize  100 runs  p95  2.00s  [1.71s, 4.84s]  ≤2s  UNDECIDED
+  api::translate  100 runs  p95  3.00s  [2.60s, 3.25s]  ≤2s  FAIL
+```
+
+The verdict follows the same rule as a rate gate, with lower being
+better: PASS when the whole interval is below the limit, FAIL when it
+is entirely above. The interval needs enough runs to have an upper end
+(72 for p95 at 95%; fewer leave it open, `[600ms, —]`, and the gate
+can't pass yet). A latency gate judges speed only: failing asserts
+still fail the session unless the case also has a rate gate.
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -263,6 +293,7 @@ Windows `cmd`).
 | `--prob-plan-report=PATH` | CLI | — | previous JSON report to read cost per run from, for `--prob-plan` |
 | `--prob-baseline=PATH` | CLI | none | compare every function with an earlier `--prob-json` report, pairing cases by id |
 | `--prob-margin=MARGIN` | CLI | none (report only) | with `--prob-baseline`: fail a function whose pass rate may have dropped by more than MARGIN |
+| `--prob-latency` | CLI | ini or off | show each case's latency quantile and its interval |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -281,7 +312,9 @@ Windows `cmd`).
 | `prob_compare` | ini | — | default for `--prob-compare` |
 | `prob_adjust` | ini | `none` | default for `--prob-adjust` |
 | `prob_metric` | ini | — | default for `--prob-metric` (comma- or space-separated) |
-| `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`) |
+| `prob_latency` | ini | false | default for `--prob-latency` |
+| `prob_latency_quantile` | ini | 0.95 | latency quantile for cases whose mark sets none |
+| `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`); latency (`latency_quantile`, `max_latency`) |
 
 ## JSON report
 

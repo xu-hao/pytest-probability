@@ -1925,3 +1925,155 @@ def test_baseline_explained_end_to_end(pytester, columns):
         "Over the 12 cases of pair in both reports, this run passed 33.3 points"
         " fewer"
     )
+
+
+# ---------------------------------------------------------------------------
+# Latency
+# ---------------------------------------------------------------------------
+
+
+def _latency(times, errors=(), q=0.95, max_latency=1.0, errmode="count",
+             undecided_fails=True):
+    from pytest_probability.plugin import LatencySpec
+
+    spec = LatencySpec(
+        quantile=q, level=0.95, max_latency=max_latency, errors=errmode
+    )
+    s = CaseStats(
+        "api::x", passes=len(times), errors=len(errors), times=list(times),
+        error_times=list(errors),
+    )
+    return explain.latency_reading(
+        spec.evaluate(s), undecided_fails=undecided_fails
+    )
+
+
+P95 = (
+    "The 95th percentile of this case's run time, the time 95% of its runs"
+    " finish within, was {} over {} runs."
+)
+
+
+def test_latency_pass():
+    r = _latency([0.25, 0.5] * 40)
+    assert r.heading == "api::x  80 runs  p95  500ms  [500ms, 500ms]  ≤1s  PASS"
+    assert r.text() == (
+        P95.format("500ms", 80) + " The true 95th percentile is probably 500ms"
+        " (95% confidence). Your limit is 1s, and that whole range is below it,"
+        " so this case is fast enough."
+    )
+    assert r.tone == "pass"
+    assert r.terms == (("latency", 0.95), ("latency-limit", None))
+
+
+def test_latency_fail():
+    r = _latency([1.5] * 40 + [2.0] * 40)
+    assert r.heading == "api::x  80 runs  p95  2.00s  [2.00s, 2.00s]  ≤1s  FAIL"
+    assert r.paragraphs[1] == (
+        "Next: find out what makes the slow runs slow: the JSON report"
+        " (--prob-json) has every run's elapsed time in records[]. If a slower"
+        " p95 is acceptable for this case, raise max_latency."
+    )
+
+
+def test_latency_undecided():
+    r = _latency([0.5] * 72 + [1.5] * 8, undecided_fails=False)
+    assert r.paragraphs == (
+        P95.format("1.50s", 80) + " The true 95th percentile is probably between"
+        " 500ms and 1.50s (95% confidence). Your limit is 1s, and that range has"
+        " values both below and above it, so there isn't enough data yet to tell"
+        " whether this case is fast enough. This session lets undecided cases"
+        " through (--prob-undecided=pass), so it doesn't fail the test session.",
+        "Next: run more: more runs narrow the range.",
+    )
+
+
+def test_latency_too_few_runs_for_an_upper_bound():
+    r = _latency([0.5] * 20)
+    assert r.heading == "api::x  20 runs  p95  500ms  [500ms, —]  ≤1s  UNDECIDED"
+    assert r.paragraphs == (
+        P95.format("500ms", 20) + " The true 95th percentile is probably at least"
+        " 500ms (95% confidence), but 20 runs are too few to put an upper limit"
+        " on it: that takes at least 72 runs. Your limit is 1s. Without an upper"
+        " limit on the range, the data can't show yet that this case is fast"
+        f" enough. {UNDECIDED_FAILS}",
+        "Next: run it at least 72 times (runs=72 on the mark, or --prob-runs) to"
+        " get a full range.",
+    )
+
+
+def test_latency_too_few_runs_can_still_fail():
+    r = _latency([1.5] * 20)
+    assert r.tone == "fail"
+    assert "so this case is too slow." in r.paragraphs[0]
+
+
+def test_latency_ungated_and_no_bounds():
+    r = _latency([0.5] * 3, q=0.5, max_latency=None)
+    assert r.heading == "api::x  3 runs  p50  500ms  [—, —]"
+    assert r.tone is None
+    assert r.paragraphs == (
+        "The 50th percentile (the median) of this case's run time, the time 50%"
+        " of its runs finish within, was 500ms over 3 runs. 3 runs are too few"
+        " to put any limit on it at 95% confidence: that takes at least 6 runs.",
+        "Next: run it at least 6 times (runs=6 on the mark, or --prob-runs) to"
+        " get a full range.",
+    )
+    assert r.terms == (("latency", 0.95),)
+    # ungated with a full range: nothing to do next
+    assert len(_latency([0.5] * 80, max_latency=None).paragraphs) == 1
+
+
+def test_latency_errors_excluded():
+    r = _latency([0.5] * 78, errors=[9.0, 9.0], errmode="exclude")
+    assert r.heading.endswith("≤1s  PASS  (2 errored, excluded)")
+    assert "over 78 runs, not counting 2 errored runs (prob_errors = exclude)." in (
+        r.paragraphs[0]
+    )
+    assert ("excluded", None) in r.terms
+    r = _latency([], errors=[1.0, 1.0], errmode="exclude")
+    assert r.tone == UNDECIDED
+    assert r.paragraphs[0].startswith("All 2 runs errored")
+
+
+@pytest.mark.parametrize(
+    "q, text",
+    [(0.95, "95th percentile"), (0.5, "50th percentile (the median)"),
+     (0.99, "99th percentile"), (0.999, "99.9th percentile"),
+     (0.01, "1st percentile"), (0.02, "2nd percentile"),
+     (0.03, "3rd percentile"), (0.11, "11th percentile")],
+)
+def test_percentile_words(q, text):
+    assert explain.percentile(q) == text
+
+
+def test_glossary_latency_entries():
+    entries = dict(
+        explain.glossary(
+            [("latency", 0.95), ("latency", 0.8), ("latency-limit", None)]
+        )
+    )
+    text = entries["pN [low, high]"]
+    assert text.startswith("A latency quantile: p95 is the run time that 95% of")
+    assert (
+        "(Distribution-free, from the ordered run times, 95% confidence: each"
+        " end is wrong at most 2.5% of the time.)"
+    ) in text
+    assert "80% confidence: each end is wrong at most 10% of the time." in text
+    assert entries["≤Ns"].startswith("A latency limit (max_latency): PASS when")
+
+
+def test_latency_avoids_jargon():
+    texts = [
+        _latency(t, **kw).text()
+        for t, kw in [
+            ([0.5] * 80, {}),
+            ([1.5] * 80, {}),
+            ([0.5] * 20, {}),
+            ([0.5] * 3, {"q": 0.5, "max_latency": None}),
+        ]
+    ]
+    banned = ("null hypothesis", "reject", "significant", "alpha", "order statistic")
+    for text in texts:
+        for word in banned:
+            assert word not in text.lower()

@@ -35,6 +35,10 @@ Contents:
 - **Planning** — ``detection_chance`` (the chance n runs show at least
   one failure) and ``runs_to_see_failure`` (the runs that make that
   chance reach a level), for ``--prob-plan``.
+- **Quantiles** — ``quantile_interval``, a distribution-free interval
+  for a quantile from two order statistics whose ranks come from
+  Binomial(n, q) (``quantile_ranks``, ``quantile_coverage``,
+  ``quantile_min_n``), and ``sample_quantile`` for the estimate.
 
 Conventions:
 
@@ -43,7 +47,8 @@ Conventions:
   tail. One level drives both a printed interval and any verdict built
   on it, so the two can never disagree.
 - Intervals are ``(low, high)`` tuples of floats in [0, 1] (or
-  [-1, 1] for a difference).
+  [-1, 1] for a difference); a quantile interval is in the data's own
+  units, with ``None`` for a bound that doesn't exist yet.
 - Bad input raises ``ValueError`` with a message naming the argument;
   nothing is silently clamped.
 """
@@ -900,3 +905,158 @@ def runs_to_see_failure(rate: float, level: float = 0.95) -> int:
     while detection_chance(rate, n) < level:
         n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Quantiles: distribution-free order-statistic intervals
+# ---------------------------------------------------------------------------
+
+
+def sample_quantile(values: Sequence[float], q: float) -> float:
+    """The sample q-quantile: the smallest value with at least a share
+    q of the values at or below it — the ⌈n·q⌉-th smallest of n
+    (Hyndman & Fan type 1, the inverse of the empirical distribution).
+
+    Always one of the observed values, and always inside the
+    ``quantile_interval`` of the same data at any level.
+    """
+    q = _check_open_unit("q", q)
+    if len(values) == 0:
+        raise ValueError("values must not be empty")
+    ordered = sorted(values)
+    return ordered[_ceil_rank(len(ordered), q) - 1]
+
+
+def _check_open_unit(name: str, value: float) -> float:
+    value = float(value)
+    if not 0.0 < value < 1.0:
+        raise ValueError(f"{name} must be strictly between 0 and 1, got {value}")
+    return value
+
+
+def _ceil_rank(n: int, q: float) -> int:
+    # ⌈n·q⌉, with n·q that is an integer up to rounding (0.95 · 20 is
+    # 19.000000000000004 in floating point) taken as that integer.
+    nq = n * q
+    rank = math.ceil(nq)
+    if rank - nq > 1.0 - 1e-9:
+        rank -= 1
+    return max(1, min(n, rank))
+
+
+# Relative slack when a tail probability is compared with α/2, so a tie
+# — (1 − q)ⁿ exactly α/2, as for q = 0.1 at 80% and n = 1 — counts as
+# within it whatever the last bit of rounding says (exact arithmetic
+# agrees). It loosens the guarantee by a factor of 1 + 1e-12 at most.
+_TAIL_SLACK = 1e-12
+
+
+def _quantile_tail(level: float) -> float:
+    return (1.0 - _check_level(level)) / 2.0 * (1.0 + _TAIL_SLACK)
+
+
+def quantile_ranks(
+    n: int, q: float, level: float = 0.95
+) -> tuple[int | None, int | None]:
+    """1-based ranks ``(r, s)`` of the order statistics X₍ᵣ₎ ≤ X₍ₛ₎ that
+    bound the q-quantile of n independent draws at ``level``.
+
+    The number B of draws at or below the true q-quantile ξ is
+    Binomial(n, q) for a continuous distribution, so X₍ᵣ₎ > ξ exactly
+    when B ≤ r − 1, and X₍ₛ₎ < ξ when B ≥ s. Each tail gets
+    α/2 = (1 − level)/2:
+
+    - r is the largest rank with P(B ≤ r − 1) ≤ α/2;
+    - s is the smallest rank with P(B ≥ s) ≤ α/2.
+
+    A bound that needs a rank outside 1..n does not exist at this level
+    and is ``None``: the interval is open on that side. The lower bound
+    exists once (1 − q)ⁿ ≤ α/2 and the upper once qⁿ ≤ α/2;
+    ``quantile_min_n`` is the n from which both do. When both exist,
+    r ≤ ⌈n·q⌉ ≤ s and r < s.
+    """
+    n = _check_int("n", n)
+    if n < 1:
+        raise ValueError(f"n must be at least 1, got {n}")
+    q = _check_open_unit("q", q)
+    tail = _quantile_tail(level)
+
+    # P(B ≤ k) grows with k: bisect for the largest k = r − 1 with
+    # P(B ≤ k) ≤ tail, if even k = 0 qualifies.
+    r: int | None = None
+    if binom_cdf(0, n, q) <= tail:
+        low, high = 0, n  # invariant: cdf(low) ≤ tail < cdf(high) = 1
+        while high - low > 1:
+            mid = (low + high) // 2
+            if binom_cdf(mid, n, q) <= tail:
+                low = mid
+            else:
+                high = mid
+        r = low + 1
+    # P(B ≥ s) = P(B > s − 1) shrinks as s grows: bisect for the
+    # smallest s with binom_sf(s − 1) ≤ tail, if even s = n qualifies.
+    s: int | None = None
+    if binom_sf(n - 1, n, q) <= tail:
+        low, high = 0, n  # invariant: sf(low - 1) > tail ≥ sf(high - 1)
+        while high - low > 1:
+            mid = (low + high) // 2
+            if binom_sf(mid - 1, n, q) <= tail:
+                high = mid
+            else:
+                low = mid
+        s = high
+    return r, s
+
+
+def quantile_coverage(n: int, q: float, r: int | None, s: int | None) -> float:
+    """The probability that [X₍ᵣ₎, X₍ₛ₎] covers the q-quantile of a
+    continuous distribution: P(r ≤ B ≤ s − 1) for B ~ Binomial(n, q),
+    with a ``None`` rank leaving that side open. For any other
+    distribution (ties, discrete values) the coverage is at least this.
+    """
+    miss_low = binom_cdf(r - 1, n, q) if r is not None else 0.0
+    miss_high = binom_sf(s - 1, n, q) if s is not None else 0.0
+    return max(0.0, 1.0 - miss_low - miss_high)
+
+
+def quantile_min_n(q: float, level: float = 0.95) -> int:
+    """The fewest draws for which both bounds of ``quantile_interval``
+    exist at ``level``: the smallest n with (1 − q)ⁿ ≤ α/2 and
+    qⁿ ≤ α/2. 72 for the 95th percentile at 95%, 6 for the median."""
+    q = _check_open_unit("q", q)
+    tail = _quantile_tail(level)
+    n = max(1, math.ceil(math.log(tail) / math.log(max(q, 1.0 - q))))
+    # Settle floating-point rounding on the same terms quantile_ranks
+    # uses, so the two always agree.
+    while n > 1 and None not in quantile_ranks(n - 1, q, level):
+        n -= 1
+    while None in quantile_ranks(n, q, level):
+        n += 1
+    return n
+
+
+def quantile_interval(
+    values: Sequence[float], q: float, level: float = 0.95
+) -> tuple[float | None, float | None]:
+    """Distribution-free confidence interval for the q-quantile of the
+    distribution ``values`` were drawn from: ``(X₍ᵣ₎, X₍ₛ₎)`` at the
+    ranks of ``quantile_ranks``.
+
+    The guarantee needs only that the values are independent draws from
+    one distribution, of any shape. Each bound misses on its side with
+    probability at most (1 − level)/2, so the interval covers the true
+    quantile with probability at least ``level`` — exactly
+    ``quantile_coverage`` for a continuous distribution, which is a
+    little more than ``level`` because ranks are whole numbers. A bound
+    that doesn't exist yet (fewer than ``quantile_min_n`` values) is
+    ``None``: the interval is open on that side, and still covers with
+    at least ``level``.
+    """
+    if len(values) == 0:
+        raise ValueError("values must not be empty")
+    ordered = sorted(values)
+    r, s = quantile_ranks(len(ordered), q, level)
+    return (
+        ordered[r - 1] if r is not None else None,
+        ordered[s - 1] if s is not None else None,
+    )
