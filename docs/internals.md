@@ -15,14 +15,23 @@ pytest_collect_file            (file name matches prob_pattern)
   └─ BenchFile.collect()
        ├─ import the module under a path-unique name
        ├─ read setup / teardown
-       └─ yield BenchFunction per module-level bench_* callable
-            └─ BenchFunction.collect()
-                 ├─ expand parametrize marks into case variants
-                 ├─ resolve the function's comparison (_compare_plan)
-                 ├─ resolve each case's runs and gate (_case_plan)
-                 ├─ warn about gates that can't pass (InfeasibleGateWarning)
-                 └─ yield BenchItem per (case, run)
-                                          (--prob-transpose reorders)
+       ├─ yield BenchFunction per module-level bench_* callable
+       │    └─ BenchFunction.collect()
+       │         ├─ expand parametrize marks into case variants
+       │         ├─ resolve the function's comparison (_compare_plan)
+       │         ├─ resolve each case's runs and gate (_case_plan)
+       │         ├─ warn about gates that can't pass (InfeasibleGateWarning)
+       │         └─ yield BenchItem per (case, run), and a GateItem
+       │            after a gated case's last run
+       │                                  (--prob-transpose reorders)
+       └─ then its MarginItems (_margin_plan): [compare:ARM], [baseline]
+
+VerdictItems                   (registered unless --prob-no-gate-items)
+  ├─ pytest_collection_modifyitems (wrapper): bring back the runs of a
+  │                            verdict item selected without them, keep
+  │                            each after its runs, and under --lf/--ff
+  │                            mark a failed one's runs as failed too
+  └─ pytest_runtest_logreport: note the items finished in this process
 
 BenchItem.runtest()            (one (case, run) execution)
   ├─ optional inter-run delay
@@ -42,11 +51,16 @@ Curtailer                      (--prob-stop=curtail; registered in
                                Gate.settled() names a verdict, skip
                                the rest (skip mark + probability_stop)
 
+VerdictItem.runtest()          (GateItem, MarginItem)
+  └─ judge from the aggregator's runs so far, or skip if this process
+     can't have seen them all: pass, or pytest.fail(the verdict's line)
+
 ProbabilityAggregator          (registered in pytest_configure)
   ├─ pytest_runtest_logreport: rebuild stats from user_properties
   ├─ pytest_sessionfinish:     decide gates (rate and latency) and
   │                            margins (axis and baseline) → exit
-  │                            status, then write the
+  │                            status (the safety net where no verdict
+  │                            item failed), then write the
   │                            JSON report (controller only)
   └─ pytest_terminal_summary:  render the fraction table, function-level
                                lines, metrics block, latency block,
@@ -324,6 +338,81 @@ The summary adds a `Gates:` tally to the footer and a `probability:
 gates` section listing every non-PASS result with the gate's own
 fraction, interval and bar. The main table keeps the session's interval
 over every run, so its column means the same thing on every row.
+
+The session-end decision is a safety net: normally a failed verdict is
+also a failed [verdict item](#verdict-items), which already makes the
+status `TESTS_FAILED`, so the net only acts where no item failed for it
+(`--prob-no-gate-items`, skipped or deselected verdict items).
+
+## Verdict items
+
+A verdict has no item of its own — its runs passed or were xfailed — so
+without help JUnit XML and `--lf` never see a failed gate. Verdict
+items are synthetic items that pass or fail with one:
+
+- **Kinds.** `GateItem` (`…::<case-id>[gate]`, or `…::gate` for an
+  unparametrized function), a child of the `BenchFunction`, for a case
+  with a rate or count gate and/or a latency gate. `MarginItem`
+  (`…::bench_fn[compare:ARM]` per arm a comparison margin judges,
+  `…::bench_fn[baseline]` when `--prob-margin` judges one of the
+  function's cases), a child of the `BenchFile`, so its id reads like a
+  parametrized function and `pytest file::bench_fn` selects it.
+  `BenchFile.collect()` works out a function's margin items with
+  `_margin_plan()` (the same `_compare_plan()` and `Baseline.judges()`)
+  before collecting it, and yields them after the `BenchFunction`, so
+  pytest's `genitems` puts them after all its items. Each carries its
+  case's (or function's) marks, so `-m` selects it with its runs.
+  `VerdictItem.key` — `("case", id)` or `("function", short)` — names
+  the bench items it needs (`_run_keys()`).
+- **Judging.** `runtest()` asks the aggregator in its own process for
+  the verdicts on the runs recorded so far — `case_verdicts()`,
+  `compare_verdicts()`, `baseline_verdicts()`. Each verdict depends on
+  its own case's or function's runs only (a comparison's interval and
+  margin verdict don't depend on the session's p-value family), so these
+  compute it afresh over that subset, through `Gate.evaluate()`,
+  `LatencySpec.evaluate()`, `comparisons_of()` and
+  `compare_with_baseline()`, without touching the aggregator's caches —
+  which a mid-session call would fill with partial results. The line is
+  the reading's heading (`explain.gate_reading`/`latency_reading`), or
+  `_comparison_lines()` without its p-value (adjusted over a smaller
+  family it would differ from the block's) plus
+  `explain.margin_paragraph()`. A failing verdict calls
+  `pytest.fail(..., pytrace=False)`; `repr_failure()` sets the crash
+  message to the first line, which is what the short summary and
+  JUnit's `message` show. Each verdict's line is also a
+  `("probability_verdict", line)` user property. No recorded run: skip.
+- **When it may judge.** `VerdictItemsConfig.judge` is true in-process
+  and on an xdist worker under `--dist loadgroup`, false on other
+  workers, whose verdict items skip (`_XDIST_SKIP`): a worker under
+  `--dist load` sees only its share of a case's runs. Under loadgroup,
+  collection gives every bench item of a gated case and its gate item
+  the case's `xdist_group` (`_stop_group(case)`, the same as
+  curtailment's), or, in a function with a margin item, the function's
+  (`_stop_group(short)`); an `xdist_group` of the author's is kept. As
+  a check, `VerdictItems.unjudged()` also skips an item when any bench
+  item it needs in `session.items` hasn't finished in this process
+  (teardown reports seen by `pytest_runtest_logreport`) — a duplicate
+  case id in another file, say, or an author's group that splits a
+  case.
+- **Collection.** `VerdictItems.pytest_collection_modifyitems` is an
+  old-style hookwrapper. Before the yield it copies the collected list;
+  after it — after `-k`/`-m`/`--deselect`, xdist's `@group` suffixes
+  and any plugin that reorders items, and before `LFPlugin`'s
+  `tryfirst` wrapper applies `--lf`/`--ff` — it (1) brings back every
+  needed bench item of a verdict item selected with none of them,
+  before it, removing them from the terminal reporter's `deselected`
+  stats so the header counts stay right; (2) moves each verdict item
+  after the last item it needs in its own file (`_place_verdict_items`,
+  never earlier, never into another file, which would set that file up
+  again); (3) when `--lf`/`--ff` is active, adds the needed items of
+  every verdict item in `lfplugin.lastfailed` to it, so `LFPlugin`
+  selects (or puts first) them with it. Their entries leave
+  `lastfailed` as they pass, as any rerun item's do.
+  `pytest_report_collectionfinish` says when (1) or (3) happened.
+- **Elsewhere.** Verdict items aren't `BenchItem`s, so the makereport
+  wrapper, the `Curtailer`, `plan_rows()` and the aggregator's
+  records ignore them; `--prob-plan` collects none. A stopped case's
+  gate item judges the runs that ran, like the gates block.
 
 ## Function-level intervals
 
@@ -709,8 +798,12 @@ down and users rely on:
    (xdist serialization).
 2. Item ids are stable and predictable
    (`file::bench_fn::case-id[runN]`) — people script against them with
-   `-k` and `--deselect`. (Under `--dist loadgroup`, xdist appends
-   `@group` — with `--prob-stop=curtail`, the case's own group.)
+   `-k` and `--deselect`. Verdict items are just as stable:
+   `file::bench_fn::case-id[gate]` (`file::bench_fn::gate`
+   unparametrized), `file::bench_fn[compare:ARM]` and
+   `file::bench_fn[baseline]`. (Under `--dist loadgroup`, xdist appends
+   `@group` — with gate items or `--prob-stop=curtail`, the case's own
+   group, or with a margin item the function's.)
 3. Parametrize ids and ordering match real pytest for the same
    decorators.
 4. Outcome classes are exception-derived and exact: `AssertionError` →
@@ -726,9 +819,10 @@ down and users rely on:
    records, no xfail conversion, and the same terminal output and exit
    status as without the gate options.
 9. Gate verdicts come only from aggregated counts and the gate spec in
-   the records, on the process that has every result, so they are the
-   same with and without xdist. Gates only ever change the exit status
-   from `OK` to `TESTS_FAILED`.
+   the records, on a process that has every result they need — the
+   aggregating one, or the worker that ran a case's runs and its gate
+   item — so they are the same with and without xdist. Gates only ever
+   change the exit status from `OK` to `TESTS_FAILED`.
 10. A printed verdict always sits next to the interval it was computed
     from: `Gate.judge()` is the only place a gate's interval is made,
     and the gates block prints that interval.
@@ -792,3 +886,13 @@ down and users rely on:
     every frame it called, as a failing `test_*`'s does; `--fulltrace`
     shows the whole traceback. Trimming never changes an outcome, a
     record or the JSON report's failure message.
+19. A verdict item never disagrees with the summary: it runs after
+    every run it needs (whatever the order or a reordering plugin), and
+    judges only when its process has seen all of them — otherwise it
+    skips, and the verdict is judged at session end. Its verdict is the
+    gates or comparisons block's, from the same code over the same runs,
+    so a session has one failed verdict item per failing verdict and
+    the exit status is the same as without verdict items. Selected
+    without any of its runs it brings them back, never judging nothing.
+    Ungated suites, `--prob-plan` and `--prob-no-gate-items` collect
+    none, so their output is unchanged.

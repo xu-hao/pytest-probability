@@ -301,7 +301,8 @@ def test_each_verdict_stops_with_its_runs(pytester):
     pytester.makepyfile(bench_s=_bench(CLASSIFY, SMOKE))
     result = _run(pytester, "--prob-stop=curtail", "-rs")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
-    result.assert_outcomes(passed=125, skipped=23, xfailed=12)
+    # solid's and steady's [gate] items pass; close's, weak's, broken's fail
+    result.assert_outcomes(passed=127, failed=3, skipped=23, xfailed=12)
     # broken (PPFF) FAILs once 2 fails leave at most 18 of 19 passes
     assert _section(result, "probability") == [
         "  classify::solid  40/40  [91%, 100%]  $0.0400",
@@ -373,7 +374,7 @@ def test_errors_count_or_leave_the_sample(pytester):
     assert rows["rate::down"]["gate"]["total"] == 0
     assert rows["count::down"]["stopped"]["after"] == 4
     assert rows["count::down"]["gate"]["verdict"] == FAIL
-    excluded.assert_outcomes(xfailed=9, skipped=7)
+    excluded.assert_outcomes(xfailed=9, skipped=7, failed=2)  # the [gate]s
 
 
 def test_user_skips_are_not_samples(pytester):
@@ -397,21 +398,29 @@ def test_nothing_recorded_never_stops(pytester):
         bench_s=_bench(_function("smoke", [("gone", "S")], "min_passes=3, runs=4"))
     )
     result = _run(pytester, "--prob-stop=curtail", "-rs")
-    result.assert_outcomes(skipped=4)
-    result.stdout.fnmatch_lines(["SKIPPED [[]4[]] *not today"])
+    result.assert_outcomes(skipped=5)  # the [gate] item has nothing to judge
+    result.stdout.fnmatch_lines([
+        "SKIPPED [[]4[]] *not today",
+        "SKIPPED [[]1[]] bench_s.py:1: probability: no runs of smoke::gone were"
+        " recorded",
+    ])
     assert "= probability =" not in result.stdout.str()
 
 
 def test_transpose_interleaves_the_skips(pytester):
     pytester.makepyfile(bench_s=_bench(SMOKE))
     result = _run(pytester, "--prob-stop=curtail", "--prob-transpose", "-v")
-    lines = [ln for ln in result.stdout.lines if "bench_smoke::" in ln]
+    lines = [ln for ln in result.stdout.lines if ln.startswith("bench_s.py::")]
     # run-major: steady and broken alternate; broken settles after its
     # 4th run and steady after its 19th
     assert "broken[run4] XFAIL" in lines[7]
     assert "steady[run5] PASSED" in lines[8] and "broken[run5] SKIPPED" in lines[9]
-    assert "steady[run20] SKIPPED" in lines[-2]
-    assert "broken[run20] SKIPPED" in lines[-1]
+    # each [gate] item follows its case's last run, and judges from the
+    # runs recorded before the skips
+    assert "steady[run20] SKIPPED" in lines[-4]
+    assert "steady[gate] PASSED" in lines[-3]
+    assert "broken[run20] SKIPPED" in lines[-2]
+    assert "broken[gate] FAILED" in lines[-1]
 
 
 def test_only_cases_no_other_verdict_needs_stop(pytester):

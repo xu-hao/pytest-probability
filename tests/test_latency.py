@@ -140,7 +140,8 @@ def _rows(data):
 def test_latency_block_gates_and_json(pytester):
     _suite(pytester)
     result = _run(pytester, "--prob-runs=80", "--prob-latency", "--prob-json=r.json")
-    result.assert_outcomes(passed=320)
+    # fast's [gate] item passes; slow's and edge's fail
+    result.assert_outcomes(passed=321, failed=2)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert _section(result, "probability: latency") == [
         "  api::fast  80 runs  p95   750ms  [ 750ms,  750ms]  ≤1s  PASS",
@@ -240,14 +241,14 @@ def test_latency_gate_does_not_xfail_failing_runs(pytester):
     body = "assert _calls[case] % 4 != 0, 'wrong'"
     _suite(pytester, cases=("fast",), body=body)
     result = _run(pytester, "--prob-runs=80")
-    result.assert_outcomes(passed=60 + 80, failed=20)  # ping: 80 passes
+    result.assert_outcomes(passed=60 + 80 + 1, failed=20)  # ping: 80; [gate]
     assert _tally(result) == "  Gates:   1 passed"
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     # with a rate gate too, the rate gate's verdict judges the answers
     _suite(pytester, marker="max_latency=1.0, min_rate=0.5", cases=("fast",),
            body=body)
     result = _run(pytester, "--prob-runs=80")
-    result.assert_outcomes(passed=60 + 80, xfailed=20)
+    result.assert_outcomes(passed=60 + 80 + 1, xfailed=20)
     assert _tally(result) == "  Gates:   2 passed"
     assert result.ret == pytest.ExitCode.OK
 
@@ -273,8 +274,8 @@ def test_errored_runs(pytester):
         "(2 errored, excluded)"
     )
     # errors still fail the session: only a rate gate xfails them (ping
-    # adds 8 passes)
-    result.assert_outcomes(passed=14, failed=2)
+    # adds 8 passes, the [gate] item one)
+    result.assert_outcomes(passed=15, failed=2)
 
 
 def test_case_mark_overrides_and_quantile_settings(pytester):

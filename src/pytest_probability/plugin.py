@@ -30,6 +30,11 @@ Design notes:
   its interval instead. Its failing runs are reported as xfailed, the
   aggregator decides the verdict from the counts, and
   ``pytest_sessionfinish`` turns a failed gate into a failed session.
+- A gated case also gets a ``[gate]`` item after its last run (and a
+  function with a margin ``[compare:ARM]``/``[baseline]`` items) that
+  passes or fails with the verdict, so ``-v``, JUnit XML and ``--lf``
+  see it (``VerdictItem``); it judges only in a process that ran every
+  run it needs, else it skips and session end decides as before.
 - A function with enough cases also gets a function-level line: the
   mean of its per-case fractions, with a seeded cluster-bootstrap
   interval over its cases (``aggregate()``), and so does the session.
@@ -351,6 +356,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         " no longer change; the verdicts are the same as running every run"
         " (default: prob_stop ini or off)",
     )
+    group.addoption(
+        "--prob-no-gate-items",
+        dest="prob_no_gate_items",
+        action="store_true",
+        default=None,
+        help="Don't add a [gate] item after each gated case's runs (and a"
+        " [compare:ARM] or [baseline] item after a function with a margin),"
+        " which carries the verdict into -v, JUnit XML and --lf"
+        " (default: prob_gate_items ini or added)",
+    )
     parser.addini("prob_runs", "Default number of runs per case", default="1")
     parser.addini(
         "prob_delay", "Default seconds between case executions", default="0"
@@ -439,6 +454,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "prob_latency_quantile",
         "The latency quantile reported for cases whose mark sets none",
         default="0.95",
+    )
+    parser.addini(
+        "prob_gate_items",
+        "Add a [gate] item carrying each gated case's verdict (and one per"
+        " margin verdict), for -v, JUnit XML and --lf",
+        type="bool",
+        default=True,
     )
     parser.addini(
         "prob_stop",
@@ -651,6 +673,8 @@ def pytest_configure(config: pytest.Config) -> None:
     latency_config(config)
     if stop_config(config).curtails:
         config.pluginmanager.register(Curtailer(), "probability-curtailer")
+    if verdict_items_config(config).enabled:
+        config.pluginmanager.register(VerdictItems(config), VERDICT_ITEMS_PLUGIN)
     config.pluginmanager.register(
         ProbabilityAggregator(config), "probability-aggregator"
     )
@@ -983,6 +1007,53 @@ def stop_config(config: pytest.Config) -> StopConfig:
     cfg = config.stash.get(_STOP_CONFIG, None)
     if cfg is None:
         cfg = config.stash[_STOP_CONFIG] = _resolve_stop_config(config)
+    return cfg
+
+
+@dataclass(frozen=True)
+class VerdictItemsConfig:
+    """Verdict items (``[gate]``, ``[compare:ARM]``, ``[baseline]``), from
+    ``--prob-no-gate-items``/``prob_gate_items``.
+
+    ``enabled`` says whether they are collected at all. ``judge`` says
+    whether this process can judge them: in-process, or an xdist worker
+    under ``--dist loadgroup``, where every item a verdict needs shares
+    one ``xdist_group`` and so one worker — ``group`` says this process
+    must add those groups. Elsewhere under xdist a worker sees only its
+    share of a case's runs, so its verdict items skip and the verdicts
+    are judged at session end, as without them.
+    """
+
+    enabled: bool = True
+    judge: bool = True
+    group: bool = False
+
+
+_VERDICT_ITEMS_CONFIG = pytest.StashKey[VerdictItemsConfig]()
+
+
+def _resolve_verdict_items_config(config: pytest.Config) -> VerdictItemsConfig:
+    off = config.getoption("prob_no_gate_items")
+    enabled = not off if off is not None else bool(config.getini("prob_gate_items"))
+    if not enabled or config.getoption("prob_plan"):
+        # A plan runs nothing, so it has no verdicts to carry.
+        return VerdictItemsConfig(enabled=False, judge=False)
+    if hasattr(config, "workerinput"):
+        grouped = bool(getattr(config.option, "loadgroup", False))
+        return VerdictItemsConfig(judge=grouped, group=grouped)
+    if config.getoption("dist", "no") != "no" and config.getoption("tx", None):
+        # The xdist controller collects and runs nothing.
+        return VerdictItemsConfig(judge=False)
+    return VerdictItemsConfig()
+
+
+def verdict_items_config(config: pytest.Config) -> VerdictItemsConfig:
+    """The session's resolved ``VerdictItemsConfig`` (at configure)."""
+    cfg = config.stash.get(_VERDICT_ITEMS_CONFIG, None)
+    if cfg is None:
+        cfg = config.stash[_VERDICT_ITEMS_CONFIG] = _resolve_verdict_items_config(
+            config
+        )
     return cfg
 
 
@@ -1903,6 +1974,56 @@ def _import_bench_module(path: Path, config: pytest.Config):
     return mod
 
 
+def _attach_marks(item: pytest.Item, marks: Iterable) -> None:
+    for mark in marks:
+        # add_marker() only accepts MarkDecorator; these are raw Mark
+        # objects, so attach the way it does internally (skip/xfail/-m
+        # all read these).
+        item.own_markers.append(mark)
+        item.keywords[mark.name] = mark
+
+
+def _add_group(item: pytest.Item, group: str) -> None:
+    # An xdist_group of the author's own also keeps its items on one
+    # worker, so it is left alone.
+    if next(item.iter_markers("xdist_group"), None) is None:
+        item.add_marker(pytest.mark.xdist_group(group))
+
+
+def _margin_plan(
+    config: pytest.Config, bench_fn: Callable, short: str
+) -> tuple[tuple[str, str | None], ...]:
+    """A bench function's margin items, as ``(kind, arm)``: one
+    ``("compare", arm)`` per arm its comparison's margin judges, in
+    parametrize order, and ``("baseline", None)`` when ``--prob-margin``
+    judges one of its cases against the baseline.
+
+    A function whose marks are invalid gets none here: collecting it
+    reports the error.
+    """
+    marks = list(getattr(bench_fn, "pytestmark", []))
+    param_marks = [m for m in marks if m.name == "parametrize"]
+    fn_prob = [m for m in marks if m.name == "probability"]
+    try:
+        variants = _parametrize_variants(param_marks)
+        planned = _compare_plan(config, fn_prob, param_marks, variants)
+    except Exception:
+        return ()
+    out: list[tuple[str, str | None]] = []
+    if planned is not None and planned[0].margin is not None:
+        spec, records = planned
+        arms = {r["arm_index"]: r["arm"] for r in records}
+        out += [
+            ("compare", arms[i]) for i in sorted(arms) if arms[i] != spec.baseline
+        ]
+    baseline = baseline_of(config)
+    if baseline is not None and any(
+        baseline.judges(f"{short}::{v.id}" if v.id else short) for v in variants
+    ):
+        out.append(("baseline", None))
+    return tuple(out)
+
+
 class BenchFile(pytest.File):
     """A collected benchmark file."""
 
@@ -1920,9 +2041,26 @@ class BenchFile(pytest.File):
         # Every module-level bench_* callable is a benchmark, in
         # definition order — the same convention pytest applies to
         # test_* functions.
+        verdict_items = verdict_items_config(self.config).enabled
         for name, obj in vars(mod).items():
             if name.startswith("bench_") and callable(obj):
-                yield BenchFunction.from_parent(self, name=name, bench_fn=obj)
+                fn = BenchFunction.from_parent(self, name=name, bench_fn=obj)
+                if verdict_items:
+                    fn.margins = _margin_plan(self.config, obj, fn.short)
+                yield fn
+                # A function's margin items follow all of its items.
+                for kind, arm in fn.margins:
+                    item = MarginItem.from_parent(
+                        self,
+                        name=f"{name}[{kind}:{arm}]" if arm else f"{name}[{kind}]",
+                        short=fn.short,
+                        kind=kind,
+                        arm=arm,
+                    )
+                    _attach_marks(item, fn.other_marks())
+                    if verdict_items_config(self.config).group:
+                        _add_group(item, _stop_group(fn.short))
+                    yield item
 
     # pytest's SetupState calls collector setup() before the first item
     # under this file and teardown() after the last — once-per-module
@@ -1951,6 +2089,12 @@ class _CasePlan(NamedTuple):
     latency: LatencySpec | None = None
 
 
+def _has_gate_item(plan: _CasePlan) -> bool:
+    """Whether a case gets a ``[gate]`` item: it has a rate or count
+    gate, or a latency gate."""
+    return plan.gate is not None or (plan.latency is not None and plan.latency.gated)
+
+
 class BenchFunction(pytest.Collector):
     """One ``bench_*`` function: an ordinary parametrized generator.
 
@@ -1961,16 +2105,33 @@ class BenchFunction(pytest.Collector):
     marks is a single case named after the function.
     """
 
+    # The function's margin items, ``(kind, arm)`` as ``_margin_plan()``
+    # returns them; set by the file that collects it.
+    margins: tuple[tuple[str, str | None], ...] = ()
+
     def __init__(self, *, bench_fn: Callable, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.bench_fn = bench_fn
+
+    @property
+    def short(self) -> str:
+        """``classify`` for ``bench_classify``: what its rows start with."""
+        return self.name.removeprefix("bench_") or self.name
+
+    def other_marks(self) -> list:
+        """The function's marks other than ``parametrize``."""
+        return [
+            m
+            for m in getattr(self.bench_fn, "pytestmark", [])
+            if m.name != "parametrize"
+        ]
 
     def collect(self) -> Iterator[pytest.Item]:
         all_marks = list(getattr(self.bench_fn, "pytestmark", []))
         param_marks = [m for m in all_marks if m.name == "parametrize"]
         other_marks = [m for m in all_marks if m.name != "parametrize"]
         fn_prob = [m for m in other_marks if m.name == "probability"]
-        short = self.name.removeprefix("bench_") or self.name
+        short = self.short
 
         variants = _parametrize_variants(param_marks)
         try:
@@ -2019,7 +2180,12 @@ class BenchFunction(pytest.Collector):
             pairs = [
                 (plan, run_id) for plan in plans for run_id in range(1, plan.runs + 1)
             ]
-        group = stop_config(self.config).group
+        stop_group = stop_config(self.config).group
+        vcfg = verdict_items_config(self.config)
+        # Under --dist loadgroup, everything a verdict item needs goes to
+        # one worker: the whole function when it has a margin item, else
+        # each case with a gate item, and each case curtailment may stop.
+        fn_group = _stop_group(short) if vcfg.group and self.margins else None
         for plan, run_id in pairs:
             if plan.variant_id:
                 name = (
@@ -2040,23 +2206,30 @@ class BenchFunction(pytest.Collector):
                 compare=plan.compare,
                 latency=plan.latency,
             )
-            for mark in (*other_marks, *plan.marks):
-                # add_marker() only accepts MarkDecorator; these are raw
-                # Mark objects, so attach the way it does internally
-                # (skip/xfail/-m all read these).
-                item.own_markers.append(mark)
-                item.keywords[mark.name] = mark
-            if (
-                group
-                and item.curtailable
-                and next(item.iter_markers("xdist_group"), None) is None
+            _attach_marks(item, (*other_marks, *plan.marks))
+            gate_item = vcfg.enabled and _has_gate_item(plan)
+            group = fn_group
+            if group is None and (
+                (vcfg.group and gate_item) or (stop_group and item.curtailable)
             ):
+                group = _stop_group(plan.case)
+            if group is not None:
                 # --dist loadgroup sends a group to one worker: then that
-                # worker runs every run of the case and can tell when its
-                # verdict is settled. A group of the author's own also
-                # keeps a case's runs together, so it is left alone.
-                item.add_marker(pytest.mark.xdist_group(_stop_group(plan.case)))
+                # worker runs every run of the case, so it can tell when
+                # its verdict is settled and judge it.
+                _add_group(item, group)
             yield item
+            if gate_item and run_id == plan.runs:
+                # The case's last run, in either order: its verdict next.
+                gate = GateItem.from_parent(
+                    self,
+                    name=f"{plan.variant_id}[gate]" if plan.variant_id else "gate",
+                    case=plan.case,
+                )
+                _attach_marks(gate, (*other_marks, *plan.marks))
+                if group is not None:
+                    _add_group(gate, group)
+                yield gate
 
     def _warn_infeasible(self, short: str, plans: list[_CasePlan]) -> None:
         """Warn about gates that cannot pass even if every run passes —
@@ -2515,6 +2688,319 @@ class Stop:
     def label(self) -> str:
         """``decided after 12/40``: the note on its rows."""
         return f"decided after {self.after}/{self.planned}"
+
+
+# ---------------------------------------------------------------------------
+# Verdict items: [gate], [compare:ARM], [baseline]
+# ---------------------------------------------------------------------------
+
+VERDICT_ITEMS_PLUGIN = "probability-verdict-items"
+
+# The user property a verdict item's report carries, once per verdict:
+# the verdict's line, as the gates or comparisons block prints it.
+VERDICT_KEY = "probability_verdict"
+
+_XDIST_SKIP = (
+    "probability: judged at session end; under pytest-xdist a verdict"
+    " item needs --dist loadgroup to run on the worker that ran its runs"
+)
+
+
+class _Verdict(NamedTuple):
+    """One verdict a verdict item reports: the line it was read off,
+    the verdict and the plain-language reading of it."""
+
+    line: str
+    verdict: str
+    paragraphs: tuple[str, ...] = ()
+
+
+class VerdictItem(pytest.Item):
+    """An item that runs after the bench items a verdict needs and
+    passes or fails with that verdict, so ``-v``, JUnit XML and ``--lf``
+    see it like any test.
+
+    It judges from the runs recorded in this process — in-process, or
+    on the xdist worker that ran all of them under ``--dist loadgroup``
+    — with the same code as the summary's blocks, so it can't disagree
+    with them. When this process can't have seen every run it needs, it
+    skips with the reason and the verdict is judged at session end, as
+    without verdict items.
+    """
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """The runs it needs: ``("case", id)`` or ``("function", name)``,
+        matched against ``_run_keys()``."""
+        raise NotImplementedError
+
+    def verdicts(self, agg: ProbabilityAggregator) -> list[_Verdict]:
+        """The verdicts on the runs recorded so far; ``[]`` when there
+        is nothing to judge (no run of it was recorded)."""
+        raise NotImplementedError
+
+    def runtest(self) -> None:
+        plugin = self.config.pluginmanager.get_plugin(VERDICT_ITEMS_PLUGIN)
+        reason = plugin.unjudged(self)
+        if reason is None:
+            agg = self.config.pluginmanager.get_plugin("probability-aggregator")
+            verdicts = self.verdicts(agg)
+            if not verdicts:
+                reason = f"probability: no runs of {self.key[1]} were recorded"
+        if reason is not None:
+            try:
+                # Reported at the item, like a skip mark, not here.
+                skip = pytest.skip.Exception(reason, _use_item_location=True)
+            except TypeError:  # pragma: no cover - pytest without it
+                skip = pytest.skip.Exception(reason)
+            raise skip
+        for v in verdicts:
+            self.user_properties.append((VERDICT_KEY, v.line))
+        fails = gate_config(self.config).fails
+        failing = [v for v in verdicts if fails(v.verdict)]
+        if failing:
+            # Failing verdicts first: the first line is the short
+            # summary's and JUnit's message.
+            lines = [line for v in failing for line in (v.line, *v.paragraphs)]
+            lines += [v.line for v in verdicts if not fails(v.verdict)]
+            pytest.fail("\n".join(lines), pytrace=False)
+
+    @property
+    def label(self) -> str:
+        """The failure header: ``gate: classify::never``."""
+        raise NotImplementedError
+
+    def repr_failure(self, excinfo, style=None):
+        rep = super().repr_failure(excinfo, style)
+        crash = getattr(rep, "reprcrash", None)
+        if isinstance(excinfo.value, pytest.fail.Exception) and crash is not None:
+            # The short summary and JUnit's message attribute: the
+            # verdict's line, not pytest.fail's "Failed: " and the rest.
+            crash.message = str(excinfo.value.msg).split("\n", 1)[0]
+        return rep
+
+    def reportinfo(self):
+        return self.path, 0, self.label
+
+
+def _run_keys(item: BenchItem) -> tuple[tuple[str, str], tuple[str, str]]:
+    # The verdict item keys a run counts for: its case's, its function's.
+    return ("case", item.case), ("function", function_of(item.case))
+
+
+class GateItem(VerdictItem):
+    """``…::<case-id>[gate]`` (``…::gate`` for an unparametrized
+    function): one case's rate or count gate and latency gate."""
+
+    def __init__(self, *, case: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.case = case
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return ("case", self.case)
+
+    @property
+    def label(self) -> str:
+        return f"gate: {self.case}"
+
+    def verdicts(self, agg: ProbabilityAggregator) -> list[_Verdict]:
+        return agg.case_verdicts(self.case)
+
+
+class MarginItem(VerdictItem):
+    """``…::bench_fn[compare:ARM]``, one arm's comparison margin, or
+    ``…::bench_fn[baseline]``, the function's ``--prob-margin`` against
+    the baseline. Both judge the whole function's runs."""
+
+    def __init__(
+        self, *, short: str, kind: str, arm: str | None = None, **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self.short = short
+        self.kind = kind
+        self.arm = arm
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return ("function", self.short)
+
+    @property
+    def label(self) -> str:
+        if self.kind == "compare":
+            return f"compare: {self.short} {self.arm}"
+        return f"baseline: {self.short}"
+
+    def verdicts(self, agg: ProbabilityAggregator) -> list[_Verdict]:
+        if self.kind == "compare":
+            return agg.compare_verdicts(self.short, self.arm)
+        return agg.baseline_verdicts(self.short)
+
+
+class VerdictItems:
+    """Keeps every verdict item after the runs it needs, and knows when
+    it may judge.
+
+    At collection (a ``pytest_collection_modifyitems`` wrapper, so after
+    ``-k``/``-m``, ``--deselect`` and plugins that reorder items, and
+    before ``--lf``/``--ff``):
+
+    - a verdict item selected without any of its runs brings them back
+      (``-k gate``, say): it can't judge nothing;
+    - each verdict item moves after the last of its runs in its file, if
+      something put it before them;
+    - under ``--lf``/``--ff``, a verdict item that failed last time
+      marks its runs as failed too, so they are rerun with it.
+
+    While running, it notes every item that finished in this process, so
+    a verdict item can tell whether all its runs ran here.
+    """
+
+    def __init__(self, config: pytest.Config) -> None:
+        self._config = config
+        self._judge = verdict_items_config(config).judge
+        self._finished: set[str] = set()
+        self._needed: dict[tuple[str, str], list[BenchItem]] | None = None
+        self._reselected = (0, 0)
+        self._rerun = (0, 0)
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_collection_modifyitems(self, session, config, items):
+        collected = list(items)
+        yield
+        verdict_items = [i for i in items if isinstance(i, VerdictItem)]
+        if not verdict_items:
+            return
+        self._reselect(collected, items, verdict_items)
+        items[:] = _place_verdict_items(items)
+        self._rerun_with_failed(items, verdict_items)
+
+    def _reselect(
+        self,
+        collected: list[pytest.Item],
+        items: list[pytest.Item],
+        verdict_items: list[VerdictItem],
+    ) -> None:
+        runs = _runs_by_key(collected)
+        selected = _runs_by_key(items)
+        back: dict[int, list[BenchItem]] = {}
+        for v in verdict_items:
+            if v.key not in selected and v.key in runs:
+                back[id(v)] = runs[v.key]
+                selected[v.key] = runs[v.key]
+        if not back:
+            return
+        out: list[pytest.Item] = []
+        for item in items:
+            out.extend(back.get(id(item), ()))
+            out.append(item)
+        # Two verdict items may bring back the same runs (a case's gate
+        # and its function's margin): keep each item once.
+        seen: set[int] = set()
+        items[:] = [i for i in out if not (id(i) in seen or seen.add(id(i)))]
+        added = {id(r) for rs in back.values() for r in rs}
+        self._reselected = (len(added), len(back))
+        # They were reported as deselected; they aren't any more.
+        reporter = self._config.pluginmanager.get_plugin("terminalreporter")
+        deselected = getattr(reporter, "stats", {}).get("deselected")
+        if deselected:
+            deselected[:] = [i for i in deselected if id(i) not in added]
+
+    def _rerun_with_failed(
+        self, items: list[pytest.Item], verdict_items: list[VerdictItem]
+    ) -> None:
+        lf = self._config.pluginmanager.get_plugin("lfplugin")
+        lastfailed = getattr(lf, "lastfailed", None)
+        if not getattr(lf, "active", False) or not lastfailed:
+            return
+        failed = {v.key for v in verdict_items if v.nodeid in lastfailed}
+        if not failed:
+            return
+        added: set[str] = set()
+        for key, runs in _runs_by_key(items).items():
+            if key in failed:
+                added.update(r.nodeid for r in runs if r.nodeid not in lastfailed)
+        lastfailed.update(dict.fromkeys(added, True))
+        self._rerun = (len(added), len(failed))
+
+    def pytest_report_collectionfinish(self) -> list[str]:
+        lines = []
+        runs, items = self._reselected
+        if runs:
+            lines.append(
+                f"probability: selected {_plural(runs, 'run')} for"
+                f" {_plural(items, 'verdict item')} selected without them"
+            )
+        runs, items = self._rerun
+        if runs:
+            need = "needs" if items == 1 else "need"
+            lines.append(
+                f"probability: rerunning {_plural(runs, 'run')} with the"
+                f" {_plural(items, 'failed verdict item')} that {need} them"
+            )
+        return lines
+
+    def pytest_runtest_logreport(self, report) -> None:
+        if self._judge and report.when == "teardown":
+            self._finished.add(report.nodeid)
+
+    def unjudged(self, item: VerdictItem) -> str | None:
+        """Why ``item`` can't judge in this process, or ``None``: not
+        every run it needs (of those selected) has finished here."""
+        if not self._judge:
+            return _XDIST_SKIP
+        if self._needed is None:
+            # session.items is fixed by now: index it once.
+            self._needed = _runs_by_key(item.session.items)
+        missing = sum(
+            r.nodeid not in self._finished for r in self._needed.get(item.key, ())
+        )
+        if missing:
+            return (
+                f"probability: judged at session end; {missing} of the runs"
+                f" of {item.key[1]} had not run here before this item"
+            )
+        return None
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _runs_by_key(items: Iterable[pytest.Item]) -> dict[tuple[str, str], list]:
+    """The bench items in ``items`` under each verdict item key, in order."""
+    out: dict[tuple[str, str], list] = {}
+    for item in items:
+        if isinstance(item, BenchItem):
+            for key in _run_keys(item):
+                out.setdefault(key, []).append(item)
+    return out
+
+
+def _place_verdict_items(items: list[pytest.Item]) -> list[pytest.Item]:
+    """``items`` with every verdict item after the last of the runs it
+    needs from its own file (moving it into another file would set that
+    file up again). Collection already puts them there; this undoes a
+    plugin that reordered the items. Never moves one earlier."""
+    base = [i for i in items if not isinstance(i, VerdictItem)]
+    last: dict[tuple[Path, tuple[str, str]], int] = {}
+    for n, item in enumerate(base):
+        if isinstance(item, BenchItem):
+            for key in _run_keys(item):
+                last[(item.path, key)] = n
+    anchored: dict[int, list[pytest.Item]] = {}
+    seen = -1  # the index in base of the item before this one
+    for item in items:
+        if isinstance(item, VerdictItem):
+            at = max(seen, last.get((item.path, item.key), -1))
+            anchored.setdefault(at, []).append(item)
+        else:
+            seen += 1
+    out = list(anchored.get(-1, ()))
+    for n, item in enumerate(base):
+        out.append(item)
+        out.extend(anchored.get(n, ()))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4233,6 +4719,64 @@ class ProbabilityAggregator:
             for s in self._stats.values()
             if s.gate is not None
         }
+
+    # The verdicts a verdict item reports, on the runs recorded so far.
+    # They may run mid-session, so they compute afresh and leave every
+    # cache alone; each verdict depends only on its own case's or
+    # function's runs, so on all of them it is the summary's verdict.
+
+    def case_verdicts(self, case: str) -> list[_Verdict]:
+        """A case's rate or count gate and latency gate."""
+        s = self._stats.get(case)
+        if s is None:
+            return []
+        out = []
+        if s.gate is not None:
+            reading = self._gate_reading(s, s.gate.evaluate(s))
+            out.append(_Verdict(reading.heading, reading.tone, reading.paragraphs))
+        if s.latency is not None and s.latency.gated:
+            reading = self._latency_reading(s.latency.evaluate(s))
+            out.append(_Verdict(reading.heading, reading.tone, reading.paragraphs))
+        return out
+
+    def _function_stats(self, function: str) -> list[CaseStats]:
+        return [s for s in self._stats.values() if function_of(s.case) == function]
+
+    def compare_verdicts(self, function: str, arm: str) -> list[_Verdict]:
+        """One arm's comparison margin."""
+        cfg = stats_config(self._config)
+        for cmp in comparisons_of(self._function_stats(function), cfg):
+            if cmp.arm == arm and cmp.verdict is not None:
+                return [self._margin_verdict(cmp, baseline=False)]
+        return []
+
+    def baseline_verdicts(self, function: str) -> list[_Verdict]:
+        """A function's ``--prob-margin`` against the baseline."""
+        baseline = baseline_of(self._config)
+        result = compare_with_baseline(
+            self._function_stats(function), baseline, stats_config(self._config)
+        )
+        return [
+            self._margin_verdict(cmp, baseline=True)
+            for cmp in result.comparisons
+            if cmp.function == function and cmp.verdict is not None
+        ]
+
+    def _margin_verdict(self, cmp: Comparison, baseline: bool) -> _Verdict:
+        from . import explain
+
+        # Its p-value would be adjusted over a smaller family than the
+        # session's, so the line leaves it out: the verdict reads the
+        # interval alone.
+        shown = dataclasses.replace(cmp, p=None, p_adjusted=None, family=1)
+        label = (lambda c: c.function) if baseline else None
+        lines = [line for line, _ in _comparison_lines([shown], label=label)]
+        text = explain.margin_paragraph(
+            cmp,
+            baseline=baseline,
+            undecided_fails=gate_config(self._config).fails(UNDECIDED),
+        )
+        return _Verdict(lines[0].strip(), cmp.verdict, (*lines[1:], text))
 
     def latency_results(self) -> dict[str, LatencyResult]:
         """Every row's latency quantile, interval and (when gated)
