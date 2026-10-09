@@ -32,8 +32,8 @@
   collection-time `InfeasibleGateWarning` flags gates that can't pass
   with their run count. JSON rows gain `gate` (`null` when ungated),
   and `exit_status` includes gate failures. Ungated suites are
-  unchanged. Known limitation: a failed gate has no failing item, so
-  JUnit XML and `--lf` don't see it.
+  unchanged. Gate items (below) carry each verdict into JUnit XML
+  and `--lf`.
 - **Explanations:** `--prob-explain` / `prob_explain = true` adds a
   `probability: explained` section that reads every gated case and
   every ungated row that didn't pass all its runs in plain language —
@@ -247,6 +247,25 @@
   50 failing runs took 4.7 s before and 0.18 s now, about the same as
   50 failing `test_*`s. Outcomes, records and the JSON report's failure
   messages are unchanged.
+- **Gate items:** each gated case (rate, count or latency gate) gets
+  one more item after its last run, `…::<case-id>[gate]` (`…::gate`
+  for an unparametrized function), which passes or fails with its
+  verdict — so a failed gate shows in `-v`, is a failed testcase in
+  JUnit XML (the gates block's line as the message, the plain-language
+  reading as the text, a `probability_verdict` property) and is rerun
+  by `--lf` with its case's runs. A function with a comparison margin
+  gets `…::bench_fn[compare:ARM]` per judged arm, and one judged by
+  `--prob-margin` gets `…::bench_fn[baseline]`. They run after their
+  runs in either order, even when a plugin reorders items; one
+  selected without any of its runs (`-k gate`) brings them back; a
+  stopped case's item judges the runs that ran. Under pytest-xdist
+  they judge with `--dist loadgroup`, which now also groups each gated
+  case (or margin function) on one worker; with any other `--dist`
+  they skip with the reason and the verdicts are judged at session end
+  as before. pytest's last line now counts them (`2 failed, 81 passed,
+  40 xfailed`), and `-x` stops at the first failed gate.
+  `--prob-no-gate-items` / `prob_gate_items = false` leaves them out.
+  Ungated suites and `--prob-plan` are unchanged.
 
 ## 0.2.0 (2026-07-08)
 

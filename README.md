@@ -187,6 +187,12 @@ $ pytest benchmarks/ --prob-runs=40
   classify::never          3/40  [ 2%, 20%]  ≥90%  FAIL
 ```
 
+Each gated case also gets a gate item after its last run,
+`bench_classify.py::bench_classify::never[gate]`, which passes or fails
+with the verdict: a failed gate shows in `-v`, is a failed testcase in
+JUnit XML, and `--lf` reruns it with its runs. (Under pytest-xdist it
+needs `--dist loadgroup`; `--prob-no-gate-items` leaves them out.)
+
 `min_passes=19, runs=20` gates on a count instead; `confidence=`,
 `method=` and `prior=` override the session's settings for one gate;
 `pytest.param(..., marks=pytest.mark.probability(...))` gates one case.
@@ -320,6 +326,7 @@ needs `--dist loadgroup`, so that one worker runs all of a case's runs.
 | `--prob-margin=MARGIN` | CLI | none (report only) | with `--prob-baseline`: fail a function whose pass rate may have dropped by more than MARGIN |
 | `--prob-latency` | CLI | ini or off | show each case's latency quantile and its interval |
 | `--prob-stop={off,curtail}` | CLI | ini or `off` | `curtail`: skip a gated case's remaining runs once its verdict can no longer change (same verdicts; under xdist needs `--dist loadgroup`) |
+| `--prob-no-gate-items` | CLI | ini or added | don't add a `[gate]` item per gated case (and `[compare:ARM]`/`[baseline]` per margin) carrying its verdict into `-v`, JUnit XML and `--lf` |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |
 | `prob_runs` | ini | 1 | default for `--prob-runs` |
@@ -341,6 +348,7 @@ needs `--dist loadgroup`, so that one worker runs all of a case's runs.
 | `prob_latency` | ini | false | default for `--prob-latency` |
 | `prob_latency_quantile` | ini | 0.95 | latency quantile for cases whose mark sets none |
 | `prob_stop` | ini | `off` | default for `--prob-stop` |
+| `prob_gate_items` | ini | true | add gate items; `false` is `--prob-no-gate-items` |
 | `@pytest.mark.probability(...)` | marker | — | per-function/case gate (`min_rate` or `min_passes`), `runs`, `confidence`, `method`, `prior`; per-function comparison (`compare`, `baseline`, `margin`, `equivalence`); latency (`latency_quantile`, `max_latency`) |
 
 ## JSON report
@@ -378,7 +386,8 @@ set; workers never write partial reports.
 
 - One pytest item per **(function, case, run)** —
   `bench_x.py::bench_classify::identify_pii[run3]`. `-k`, `-x`, `--lf`,
-  JUnit XML, and xdist all operate per run.
+  JUnit XML, and xdist all operate per run. A gated case adds one
+  `…::identify_pii[gate]` item carrying its verdict.
 - A failing step fails that run's item with a compact message (no traceback
   noise); an exception in a bench function is a normal pytest failure *and*
   counts as an `error` step in the aggregate.

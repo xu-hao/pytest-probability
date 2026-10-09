@@ -152,6 +152,14 @@ All options live in the `probability` group of `pytest --help`.
   needs `--dist loadgroup`; otherwise it warns and every run runs.
   **Default:** the `prob_stop` ini value, else `off`.
 
+`--prob-no-gate-items`
+: Don't collect [gate items](#gate-items): the `…::<case-id>[gate]`
+  item after each gated case's runs, and the `[compare:ARM]` and
+  `[baseline]` items after a function with a margin. Verdicts are then
+  judged at session end only, as in the gates block and the exit
+  status.
+  **Default:** the `prob_gate_items` ini value, else collected.
+
 Case selection has no plugin-specific options: use pytest's `-k`
 (ids), `-m` (marks), and node ids.
 
@@ -238,6 +246,10 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
 
 `prob_stop` *(string, default `"off"`)*
 : Default for `--prob-stop`: `off` or `curtail`.
+
+`prob_gate_items` *(bool, default `true`)*
+: Collect [gate items](#gate-items); `false` (or `--prob-no-gate-items`)
+  leaves them out.
 
 Invalid values for the statistical, bootstrap and gate options are
 reported as pytest usage errors before anything runs.
@@ -367,12 +379,80 @@ warning: filter it with
 `-W ignore::pytest_probability.InfeasibleGateWarning`, or make it an
 error with `-W error::…`.
 
-### Known limitation
+### Gate items
 
-A failed gate has no failing item: the runs passed or were xfailed. So
-JUnit XML (`--junitxml`) records no failure for it, and `--lf` has no
-failed items to rerun. The exit status and the JSON report do carry
-the verdict. Gate items for JUnit XML and `--lf` are planned.
+Each gated case also gets one more item, after its last run: its *gate
+item*, which passes or fails with the case's verdict. So the verdict
+shows in `-v`, in JUnit XML (`--junitxml`) as a failed testcase, and to
+`--lf` as a failure to rerun:
+
+```text
+bench_classify.py::bench_classify::is_question[gate] PASSED
+bench_classify.py::bench_classify::identify_pii[gate] FAILED
+bench_classify.py::bench_classify::never[gate] FAILED
+```
+
+- **Ids:** `<file>::<bench-function>::<case-id>[gate]`, and
+  `<file>::<bench-function>::gate` for an unparametrized function (see
+  [Item ids](#item-ids)). A case with a rate or count gate, a latency
+  gate (`max_latency`), or both, gets one; ungated cases get none.
+- **Order:** right after the case's last run, case-major or
+  `--prob-transpose`. A plugin that reorders items (shuffling, say)
+  can't put it before its runs: it is moved back after them, within
+  its file.
+- **Verdict:** judged when it runs, from the case's recorded runs, with
+  the code that makes the gates block, so the two agree. UNDECIDED
+  fails it unless `--prob-undecided=pass`. Its failure message is the
+  gates block's line and the plain-language reading:
+
+  ```text
+  ____________________________ gate: classify::never _____________________________
+  classify::never  3/40  [2%, 20%]  ≥90%  FAIL
+  3 of 40 runs passed. The true pass rate is probably between 2% and 20% (95% confidence). Your bar is 90%, and that whole range is below it, so this case falls short of the bar.
+  Next: look at the failing runs: -rx lists them with their assert messages, and --xfail-tb shows their tracebacks. If a lower pass rate is acceptable for this case, lower the bar.
+  ```
+
+  The first line is the short summary's message and JUnit's `message`
+  attribute; each verdict's line is also a `probability_verdict`
+  property of the testcase. A case with two gates puts the failing one
+  first.
+- **Margins:** a function whose [comparison](#margins) has a margin
+  gets `<file>::<bench-function>[compare:<arm>]`, one per arm judged
+  against the baseline arm, and a function `--prob-margin` judges
+  against a [baseline](#baseline) gets `<file>::<bench-function>[baseline]`.
+  They follow all of the function's items and judge all its runs.
+- **Selection:** a gate item carries its case's marks, so `-m` selects
+  it with its runs, and `-k gate` / `-k "not gate"` select gate items
+  alone or leave them out. One selected without any of its runs brings
+  them back — `-k "never and gate"` runs `never`'s runs too, and the
+  header says `probability: selected 40 runs for 1 verdict item selected
+  without them`. Selected with only some of its runs, it judges those,
+  as the gates block does.
+- **`--lf` and `--ff`:** a failed gate item is a failure to rerun, and
+  it brings its case's runs with it (`probability: rerunning 80 runs
+  with the 2 failed verdict items that need them`): a verdict needs its
+  runs. pytest's own `rerun previous N failures` counts them.
+- **`-x` / `--maxfail`:** a failed gate item is a failure, so `-x` stops
+  after the first gate that fails; the gated runs themselves still
+  don't stop it.
+- **pytest-xdist:** a gate item needs every run of its case on its own
+  worker, so it judges only under `--dist loadgroup`, where the plugin
+  puts each gated case (runs and gate item) in an `xdist_group` of its
+  own, `…::never[gate]@classify::never` (a function with a margin item
+  is one group, `…::bench_triage[compare:few_shot]@triage`; an
+  `xdist_group` of your own is kept). Under any other `--dist`, gate
+  items skip with `probability: judged at session end; under
+  pytest-xdist a verdict item needs --dist loadgroup to run on the
+  worker that ran its runs`, and the verdicts are judged at session end
+  as without them.
+- **Early stopping:** a stopped case's gate item runs after its skipped
+  runs and judges the runs that ran, like the gates block.
+- **Nothing to judge:** when none of the case's runs recorded a result
+  (all skipped, or a skip mark on the case), its gate item skips.
+- **Off:** `--prob-no-gate-items` or `prob_gate_items = false`. Then a
+  failed gate has no failing item: JUnit XML records no failure for it
+  and `--lf` has nothing to rerun; the exit status and the JSON report
+  still carry the verdict. `--prob-plan` collects no gate items.
 
 ## Comparisons
 
@@ -990,6 +1070,19 @@ loadgroup`: no case can stop early then. See
   item is named `run<N>` directly.
 - `[run<N>]` — appended when `--prob-runs` > 1; 1-based.
 
+[Gate items](#gate-items) follow the same scheme:
+
+```text
+<file>::<bench-function>::<case-id>[gate]       a gated case's verdict
+<file>::<bench-function>::gate                  … of an unparametrized function
+<file>::<bench-function>[compare:<arm>]         an arm's comparison margin
+<file>::<bench-function>[baseline]              a function's --prob-margin verdict
+```
+
+Under pytest-xdist's `--dist loadgroup`, xdist appends the item's
+group: `@<case>` for a gated case's items, `@<function-short>` for a
+function with a margin item.
+
 Summary rows and JSON use the function-qualified case id:
 `<function-short>::<case-id>`, where the short name strips the
 `bench_` prefix (`classify::identify_pii`); an unparametrized
@@ -1312,10 +1405,14 @@ Without gates, standard pytest semantics: any failed or errored run
 makes the session exit nonzero.
 
 With gates, a gated case's failing runs are xfailed, so they never fail
-the session themselves; the gate's verdict does. After every run,
-`pytest_sessionfinish` sets exit code 1 (`TESTS_FAILED`) when any gate
-is FAIL, or UNDECIDED under `prob_undecided = fail`, and pytest would
-otherwise have exited 0.
+the session themselves; the gate's verdict does. Its [gate
+item](#gate-items) fails, which makes pytest exit 1 like any failed
+test. Where there is no gate item to fail — `--prob-no-gate-items`, a
+gate item skipped under pytest-xdist without `--dist loadgroup`, or one
+deselected — `pytest_sessionfinish` sets exit code 1 (`TESTS_FAILED`)
+when any gate is FAIL, or UNDECIDED under `prob_undecided = fail`, and
+pytest would otherwise have exited 0. A verdict is never counted twice:
+it fails one item, and the exit code is 1 either way.
 
 | Session | Exit code |
 |---|---|
@@ -1330,9 +1427,12 @@ otherwise have exited 0.
 | An errored run in a gated case, `prob_errors = count` | 1 |
 | Interrupted, usage error, no tests… | pytest's own code, unchanged |
 
-pytest's last line counts runs, not gates, so a session can end
-`137 passed, 43 xfailed` and still exit 1: the `Gates:` line and the
-gates block (or the verdicts in the comparisons block) say why.
+pytest's last line counts runs and gate items: a session ends `2
+failed, 81 passed, 40 xfailed` when two gates fail — one failed gate
+item per verdict in the gates block. Without gate items it counts runs
+alone and can end `80 passed, 40 xfailed` and still exit 1: the
+`Gates:` line and the gates block (or the verdicts in the comparisons
+block) say why.
 Comparisons without a margin, and a baseline without
 `--prob-margin`, never change the exit status. The JSON report's `exit_status` is the final code,
 gates included. `--prob-stop=curtail` never changes it either: every

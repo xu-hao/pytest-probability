@@ -509,7 +509,7 @@ def test_xfail_tb_traceback_is_trimmed(pytester):
     # one of the 40 runs fails; the gate (min_rate=0.9) makes it an xfail
     pytester.makepyfile(bench_g=_gated(cases=(("close", 39),)))
     result = pytester.runpytest("--prob-runs=40", "--xfail-tb")
-    result.assert_outcomes(passed=39, xfailed=1)
+    result.assert_outcomes(passed=39, failed=1, xfailed=1)  # failed: the [gate] item
     result.stdout.fnmatch_lines(
         [
             "*= XFAILURES =*",
@@ -1166,7 +1166,7 @@ def _gates(data):
 def test_marker_is_registered(pytester):
     pytester.makepyfile(bench_g=BENCH_GATED)
     result = _run(pytester, "--strict-markers", "--prob-runs=40")
-    result.assert_outcomes(passed=80, xfailed=40)
+    result.assert_outcomes(passed=81, failed=2, xfailed=40)
     result = pytester.runpytest("--markers")
     result.stdout.fnmatch_lines(["@pytest.mark.probability(min_rate=None, *"])
 
@@ -1174,8 +1174,9 @@ def test_marker_is_registered(pytester):
 def test_each_verdict(pytester):
     pytester.makepyfile(bench_g=BENCH_GATED)
     result = _run(pytester, "--prob-runs=40", "--prob-json=r.json")
-    # failing runs of a gated case are samples: xfailed, not failed
-    result.assert_outcomes(passed=80, xfailed=40)
+    # failing runs of a gated case are samples: xfailed, not failed; the
+    # [gate] items carry the verdicts (solid's passes; close, weak fail)
+    result.assert_outcomes(passed=81, failed=2, xfailed=40)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     # the main table is unchanged: fractions, row intervals, statuses
     assert _summary_rows(result) == [
@@ -1207,7 +1208,7 @@ def test_all_gates_pass_exits_zero(pytester):
         bench_g=_gated("min_rate=0.6", (("solid", 40), ("close", 37)))
     )
     result = _run(pytester, "--prob-runs=40")
-    result.assert_outcomes(passed=77, xfailed=3)
+    result.assert_outcomes(passed=79, xfailed=3)  # 2 of them [gate] items
     assert result.ret == pytest.ExitCode.OK
     assert _tally(result) == "  Gates:   2 passed"
     assert "probability: gates" not in result.stdout.str()
@@ -1290,7 +1291,7 @@ def test_count_rule(pytester):
         )
     )
     result = _run(pytester, "--prob-json=r.json")
-    result.assert_outcomes(passed=37, xfailed=3)
+    result.assert_outcomes(passed=38, failed=1, xfailed=3)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert _tally(result) == "  Gates:   1 passed, 1 failed"
     assert _gate_rows(result) == [
@@ -1331,7 +1332,7 @@ def test_global_min_rate(pytester):
     # BENCH_COUNTS carries no marks: 10/10, 7/10 and 0/10
     pytester.makepyfile(bench_cls=BENCH_COUNTS)
     result = _run(pytester, "--prob-runs=10", "--prob-min-rate=0.3")
-    result.assert_outcomes(passed=17, xfailed=13)
+    result.assert_outcomes(passed=19, failed=1, xfailed=13)
     assert _tally(result) == "  Gates:   2 passed, 1 undecided"
     assert _gate_rows(result) == [
         "  classify::never  0/10  [0%, 31%]  ≥30%  UNDECIDED"
@@ -1372,7 +1373,7 @@ def bench_classify(case, k):
 """
     )
     result = _run(pytester, "--prob-json=r.json")
-    result.assert_outcomes(passed=56, xfailed=4)
+    result.assert_outcomes(passed=58, failed=1, xfailed=4)
     gates = _gates(_json(pytester))
     # the case's min_passes replaces the function's min_rate outright
     assert gates["classify::count"]["rule"] == "count"
@@ -1568,15 +1569,17 @@ def test_min_runs_matches_brute_force():
 def test_failing_runs_are_xfailed_with_reason(pytester):
     pytester.makepyfile(bench_g=_gated(cases=(("close", 37),)))
     result = pytester.runpytest("--prob-runs=40", "-rx")
-    result.assert_outcomes(passed=37, xfailed=3)
+    result.assert_outcomes(passed=37, failed=1, xfailed=3)
     result.stdout.fnmatch_lines(
         [
             "XFAIL bench_g.py::bench_classify::close?run38? -"
             " probability gate: wrong answer for close*"
         ]
     )
-    # no FAILURES section: the runs did not fail
-    assert "= FAILURES =" not in result.stdout.str()
+    # the runs did not fail: only the [gate] item is in FAILURES
+    out = result.stdout.str()
+    assert "_ gate: classify::close _" in out
+    assert "_ case: classify::close _" not in out
 
 
 def test_xfailed_runs_keep_their_traceback(pytester):
@@ -1595,11 +1598,15 @@ def test_xfailed_runs_keep_their_traceback(pytester):
 def test_x_does_not_stop_on_gated_failures(pytester):
     pytester.makepyfile(bench_g=BENCH_GATED)
     result = _run(pytester, "--prob-runs=40", "-x")
-    # every run executed; the gates still fail the session
-    result.assert_outcomes(passed=80, xfailed=40)
+    # every run of close executed; its failed [gate] item is what stops
+    result.assert_outcomes(passed=78, failed=1, xfailed=3)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result = _run(pytester, "--prob-runs=40", "--maxfail=1")
+    result.assert_outcomes(passed=78, failed=1, xfailed=3)
+    # without gate items every run executes; the gates still fail it
+    result = _run(pytester, "--prob-runs=40", "-x", "--prob-no-gate-items")
     result.assert_outcomes(passed=80, xfailed=40)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
 
 
 def test_x_still_stops_on_ungated_failures_and_counted_errors(pytester):
@@ -1623,7 +1630,7 @@ def bench_crash():
 def test_runxfail_reports_gated_failures_as_failures(pytester):
     pytester.makepyfile(bench_g=_gated(cases=(("close", 37),)))
     result = _run(pytester, "--prob-runs=40", "--runxfail")
-    result.assert_outcomes(passed=37, failed=3)
+    result.assert_outcomes(passed=37, failed=4)  # 3 runs and the [gate]
     # the gate is still judged and reported
     assert _gate_rows(result) == [
         "  classify::close  37/40  [80%, 98%]  ≥90%  UNDECIDED"
@@ -1652,8 +1659,9 @@ def bench_down():
 def test_errors_count_as_non_passes_by_default(pytester):
     pytester.makepyfile(bench_e=BENCH_GATED_ERRORS)
     result = _run(pytester, "--prob-runs=12", "--prob-json=r.json")
-    # errors fail the session as always; the assert failure is xfailed
-    result.assert_outcomes(passed=7, failed=16, xfailed=1)
+    # errors fail the session as always; the assert failure is xfailed;
+    # both [gate] items fail
+    result.assert_outcomes(passed=7, failed=18, xfailed=1)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert _summary_rows(result) == [
         "  shaky  7/12  [28%, 85%]  FLAKY (4 errored)",
@@ -1672,8 +1680,9 @@ def test_errors_excluded(pytester):
     pytester.makeini("[pytest]\nprob_errors = exclude\n")
     pytester.makepyfile(bench_e=BENCH_GATED_ERRORS)
     result = _run(pytester, "--prob-runs=12", "--prob-json=r.json", "-rx")
-    # errors leave the sample and no longer fail the session
-    result.assert_outcomes(passed=7, xfailed=17)
+    # errors leave the sample and no longer fail the session; the
+    # UNDECIDED verdicts do, as the two failed [gate] items
+    result.assert_outcomes(passed=7, failed=2, xfailed=17)
     result.stdout.fnmatch_lines(
         [
             "XFAIL bench_e.py::bench_shaky::run3 - probability gate, error"
@@ -1713,7 +1722,7 @@ def bench_shaky():
 """
     )
     result = _run(pytester, "--prob-runs=12")
-    result.assert_outcomes(passed=9, xfailed=3)
+    result.assert_outcomes(passed=10, xfailed=3)  # and the [gate] item
     assert _summary_rows(result) == ["  shaky  9/12  [43%, 95%]  (3 errored, excluded)"]
     assert result.ret == pytest.ExitCode.OK
 
@@ -1756,11 +1765,12 @@ TEST_PLAIN = "def test_ok():\n    assert True\n"
 @pytest.mark.parametrize(
     "files, outcomes, ret",
     [
-        (("gate_ok", "plain"), {"passed": 11}, 0),
-        (("gate_ok", "ungated_fail"), {"passed": 10, "failed": 10}, 1),
-        (("gate_bad", "plain"), {"passed": 4, "xfailed": 7}, 1),
-        (("gate_bad", "ungated_fail"), {"passed": 3, "failed": 10, "xfailed": 7}, 1),
-        (("gate_ok", "gate_bad"), {"passed": 13, "xfailed": 7}, 1),
+        # each gated case adds its [gate] item, passed or failed
+        (("gate_ok", "plain"), {"passed": 12}, 0),
+        (("gate_ok", "ungated_fail"), {"passed": 11, "failed": 10}, 1),
+        (("gate_bad", "plain"), {"passed": 4, "failed": 1, "xfailed": 7}, 1),
+        (("gate_bad", "ungated_fail"), {"passed": 3, "failed": 11, "xfailed": 7}, 1),
+        (("gate_ok", "gate_bad"), {"passed": 14, "failed": 1, "xfailed": 7}, 1),
     ],
 )
 def test_exit_status_in_mixed_sessions(pytester, files, outcomes, ret):
@@ -1787,8 +1797,9 @@ def test_interrupted_session_keeps_its_status(pytester):
     assert result.ret == pytest.ExitCode.INTERRUPTED
 
 
-def test_gate_failures_are_invisible_to_lf_and_junit(pytester):
-    # the documented limitation: a failed gate has no failing item
+def test_without_gate_items_gate_failures_are_invisible_to_lf_and_junit(pytester):
+    # --prob-no-gate-items: a failed gate has no failing item
+    pytester.makeini("[pytest]\nprob_gate_items = false\n")
     pytester.makepyfile(bench_gate_bad=BENCH_GATE_BAD)
     result = _run(pytester, "--prob-runs=10", "--junitxml=j.xml")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -1853,7 +1864,8 @@ def test_xdist_gate_parity(pytester):
         ).replace("bench_classify", "bench_counted"),
         bench_cls=BENCH_COUNTS,
     )
-    pytester.makeini("[pytest]\nprob_errors = exclude\n")
+    # Verdicts at session end; test_gate_items_xdist_* cover gate items.
+    pytester.makeini("[pytest]\nprob_errors = exclude\nprob_gate_items = false\n")
     serial = _run(pytester, "--prob-runs=40", "--prob-json=serial.json")
     dist = _run(
         pytester,
@@ -2719,7 +2731,7 @@ def test_margin_gates_the_function(pytester):
         bench_pair=_paired_bench('compare="arm", margin=0.05', ("alpha", "beta"))
     )
     result = _run(pytester, "-rx")
-    result.assert_outcomes(passed=42, xfailed=6)
+    result.assert_outcomes(passed=43, xfailed=6)  # and bench_pair[compare:beta]
     assert result.ret == pytest.ExitCode.OK
     assert _comparison_block(result)[0].endswith("≥−5 pp  PASS")
     result.stdout.fnmatch_lines(["XFAIL *::0-alpha?run1? - probability comparison: *"])
@@ -2759,7 +2771,7 @@ def test_margin_does_not_hide_ungated_errors(pytester):
     )
     result = _run(pytester)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
-    result.assert_outcomes(passed=16, xfailed=6, failed=2)
+    result.assert_outcomes(passed=17, xfailed=6, failed=2)  # 17: the margin item
 
 
 def test_more_arms_and_adjustments(pytester):
@@ -3428,7 +3440,7 @@ def test_baseline_regression_fails_the_session(pytester):
         "  ≥−2 pp  FAIL",
     ]
     # the failing runs of paired cases are samples: xfailed, the verdict fails
-    result.assert_outcomes(passed=8, xfailed=4)
+    result.assert_outcomes(passed=8, failed=1, xfailed=4)  # failed: [baseline]
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result = pytester.runpytest(
         "--prob-baseline=main.json", "--prob-margin=0.02", "-rx", "--tb=no"
@@ -3533,7 +3545,7 @@ def test_baseline_unmatched_failing_runs_still_fail(pytester):
     pytester.makepyfile(bench_pair=_bench_b(n=11, fail=(10,)))
     _baseline_file(pytester, _all_pass(n=10))
     result = _run(pytester, "--prob-baseline=main.json", "--prob-margin=0.02")
-    result.assert_outcomes(passed=10, failed=1)
+    result.assert_outcomes(passed=11, failed=1)  # 11: the [baseline] item
     assert result.ret == pytest.ExitCode.TESTS_FAILED
 
 
@@ -3735,8 +3747,9 @@ def test_xdist_baseline_parity(pytester):
     assert _baseline_block(serial) == _baseline_block(dist)
     assert len(_baseline_block(serial)) == 9
     assert serial.ret == dist.ret == pytest.ExitCode.TESTS_FAILED
-    # the workers xfail the paired failing runs, as in-process
-    serial.assert_outcomes(passed=11, xfailed=4)
-    dist.assert_outcomes(passed=11, xfailed=4)
+    # the workers xfail the paired failing runs, as in-process; the two
+    # [baseline] items fail in-process, and skip under --dist load
+    serial.assert_outcomes(passed=11, failed=2, xfailed=4)
+    dist.assert_outcomes(passed=11, skipped=2, xfailed=4)
     s = _json(pytester, "serial.json")["baseline"]
     assert s == _json(pytester, "dist.json")["baseline"]

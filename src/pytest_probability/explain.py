@@ -854,6 +854,17 @@ def _margin_paragraph(cmp: Any, undecided_fails: bool) -> str:
     return body
 
 
+def margin_paragraph(
+    cmp: Any, *, baseline: bool = False, undecided_fails: bool = True
+) -> str:
+    """The paragraph on a margin's verdict alone — an axis comparison's,
+    or with ``baseline`` a ``--prob-margin`` one — for a margin item's
+    failure message."""
+    if baseline:
+        return _baseline_margin_paragraph(cmp, undecided_fails)
+    return _margin_paragraph(cmp, undecided_fails)
+
+
 def comparison_reading(
     cmp: Any, *, undecided_fails: bool = True, min_inputs: int = 10
 ) -> Reading:

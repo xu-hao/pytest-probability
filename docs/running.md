@@ -99,8 +99,10 @@ Two flags deserve a caveat in fraction-land:
 - `--lf` reruns only previously-failed runs; the resulting fractions
   cover just those items. Both are occasionally useful for debugging a
   specific failing run — just don't read the summary of a partial
-  session as a probability estimate. A failed gate leaves no failed
-  item behind, so `--lf` doesn't see it.
+  session as a probability estimate. A failed gate is the exception:
+  its [gate item](#gate-items) failed, and `--lf`
+  reruns it with all of its case's runs, so the verdict is judged on
+  a full sample again.
 
 ## Parallelism with pytest-xdist
 
@@ -131,6 +133,16 @@ The plugin was built xdist-aware:
   raised by every worker, so they show up once per worker.
 - `--prob-plan` runs nothing, so it turns `-n` off and plans in one
   process; its output is the same with and without `-n`.
+- Gate items judge under `--dist loadgroup` only: the plugin puts each
+  gated case's runs and its gate item in an `xdist_group` of their own
+  (`…::never[gate]@classify::never`), so the worker that ran the runs
+  judges them. With another `--dist` a worker may hold only some of a
+  case's runs, so gate items skip (`-rs` says why) and the verdicts are
+  judged at session end, as without them; the exit status is the same.
+
+  ```bash
+  pytest benchmarks/ --prob-runs=40 -n 8 --dist loadgroup
+  ```
 - `--prob-stop=curtail` needs `--dist loadgroup`: a case can only stop
   early in the process that runs all of its runs, so the plugin puts
   each stoppable case in an `xdist_group` of its own (xdist appends it
@@ -183,7 +195,7 @@ verdict decides the exit status:
 ============================== probability: gates ==============================
   classify::identify_pii  37/40  [80%, 98%]  ≥90%  UNDECIDED
   classify::never          3/40  [ 2%, 20%]  ≥90%  FAIL
-======================== 80 passed, 40 xfailed in 2.91s ========================
+=================== 2 failed, 81 passed, 40 xfailed in 2.91s ===================
 ```
 
 That session exits 1: `never` failed its gate, and `identify_pii`
@@ -205,6 +217,39 @@ margin=0.02)`) works the same way for a whole function: its failing
 runs are xfailed, and the margin's verdict on each arm decides — see
 Comparisons in {doc}`reference`. Without a margin a comparison only
 reports.
+
+### Gate items
+
+The `2 failed` above are the two failing verdicts. Each gated case gets
+one more item after its last run, its *gate item*, which passes or
+fails with the verdict:
+
+```text
+$ pytest benchmarks/ --prob-runs=40 -v
+...
+bench_classify.py::bench_classify::never[run40] XFAIL (probability gate: wrong...)
+bench_classify.py::bench_classify::never[gate] FAILED
+...
+____________________________ gate: classify::never _____________________________
+classify::never  3/40  [2%, 20%]  ≥90%  FAIL
+3 of 40 runs passed. The true pass rate is probably between 2% and 20% (95% confidence). Your bar is 90%, and that whole range is below it, so this case falls short of the bar.
+Next: look at the failing runs: -rx lists them with their assert messages, and --xfail-tb shows their tracebacks. If a lower pass rate is acceptable for this case, lower the bar.
+```
+
+- **JUnit XML** (`--junitxml`) records it as a failed testcase,
+  `never[gate]`, with the gates block's line as its message.
+- **`--lf`** reruns a failed gate item together with its case's runs,
+  so the verdict is judged again on all of them; once it passes, there
+  is nothing left to rerun.
+- **`-k gate`** runs only the gated cases (a gate item brings its runs
+  with it); `-k "not gate"` leaves gate items out, and the verdicts
+  still decide the exit status at session end.
+- A comparison or baseline margin gets the same, per function:
+  `bench_triage[compare:few_shot]`, `bench_triage[baseline]`.
+- `--prob-no-gate-items` (or `prob_gate_items = false`) leaves them
+  out; then a failed gate fails only the exit status.
+
+See Gate items in {doc}`reference` for the id format and details.
 
 ## Stopping early
 
@@ -232,7 +277,7 @@ pytest benchmarks/ --prob-runs=40 --prob-stop=curtail
   classify::never          3/12  [ 5%, 57%]  ≥90%  FAIL  decided after 12/40
 
   Run with --prob-explain for a plain-language reading.
-================== 80 passed, 30 skipped, 10 xfailed in 0.88s ==================
+============= 2 failed, 81 passed, 30 skipped, 10 xfailed in 0.88s =============
 ```
 
 - **The verdicts are exact:** the same as running every run, so the
