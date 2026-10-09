@@ -143,11 +143,13 @@ The plugin was built xdist-aware:
   ```bash
   pytest benchmarks/ --prob-runs=40 -n 8 --dist loadgroup
   ```
-- `--prob-stop=curtail` needs `--dist loadgroup`: a case can only stop
-  early in the process that runs all of its runs, so the plugin puts
-  each stoppable case in an `xdist_group` of its own (xdist appends it
-  to the node id: `…::never[run3]@classify::never`). With another
-  `--dist` it warns (`CurtailmentWarning`) and every run runs. The
+- `--prob-stop` (`curtail` or `sequential`) needs `--dist loadgroup`:
+  a case can only stop early in the process that runs all of its runs,
+  so the plugin puts each stoppable case in an `xdist_group` of its
+  own (xdist appends it to the node id:
+  `…::never[run3]@classify::never`). With another `--dist` it warns
+  (`CurtailmentWarning`) and every run runs — under `sequential`,
+  judged by the usual fixed-run intervals, since nothing stopped. The
   controller rebuilds the stops from the reports, so the output
   matches a serial run.
 
@@ -295,7 +297,60 @@ pytest benchmarks/ --prob-runs=40 --prob-stop=curtail
   against a baseline, or a latency gate.
 - Under pytest-xdist it needs `--dist loadgroup` (below).
 
-See Early stopping in {doc}`reference` for the details.
+### Stopping as soon as a case is clear
+
+Curtailment waits until no remaining run could change the verdict,
+which for a case that always passes is close to its last run.
+`--prob-stop=sequential` (or `prob_stop = sequential`) stops a
+pass-rate gate as soon as the case is clearly above or below its bar,
+judged on an interval built for exactly that: one that stays valid
+however often it is checked. The run count becomes the most a case may
+use, so give it room:
+
+```bash
+pytest benchmarks/ --prob-stop=sequential     # classify: min_rate=0.9, runs=100
+```
+
+```text
+================================= probability ==================================
+  classify::solid  53/53  [90%, 100%] seq  $0.0530  decided after 53/100
+  classify::close  79/83  [83%,  99%] seq  $0.0830  FLAKY  decided after 83/100
+  classify::weak   45/60  [55%,  90%] seq  $0.0600  FLAKY  decided after 60/100
+  smoke::steady    19/19  [82%, 100%]      $0.0190  decided after 19/20
+  smoke::broken      2/4  [ 7%,  93%]      $0.0040  FLAKY  decided after 4/20
+
+  Overall: 198/219 passed (90%)
+  Gates:   2 passed, 2 failed, 1 undecided
+  Stopped: 5 cases early, saving 121 of 340 runs (36%) and about $0.1210
+  Cost:    $0.2190
+============================== probability: gates ==============================
+  classify::close  79/83  [83%, 99%] seq  ≥90%        UNDECIDED  decided after 83/100
+  classify::weak   45/60  [55%, 90%] seq  ≥90%        FAIL  decided after 60/100
+  smoke::broken      2/4  [ 7%, 93%]      ≥19 passes  FAIL  decided after 4/20
+
+  Run with --prob-explain for a plain-language reading.
+============ 3 failed, 200 passed, 121 skipped, 21 xfailed in 0.18s ============
+```
+
+- `seq` marks the interval a case was judged on: a *confidence
+  sequence*. An ordinary interval checked after every run would be
+  fooled by luck far more often than its level says (a 95% one leaves
+  out the true rate at some point in 2,000 runs nearly half the time);
+  this one, at most 5% of the time, however often it is checked.
+- It is wider than an ordinary interval (1.6 times at 100 runs), so a
+  90% bar takes 53 straight passes instead of 36. Cases far from their
+  bar stop much sooner — `solid` above, 53 runs against 96 under
+  curtailment — and cases near it take longer, or end UNDECIDED.
+  `--prob-plan --prob-stop=sequential` shows the chance of passing
+  within the budget and the runs a case would use on average.
+- A case that reaches its budget is judged on `seq` too: UNDECIDED if it
+  still straddles the bar.
+- Count gates (`min_passes`) are curtailed, as above. Everything else
+  — skips, hidden averages, cases that never stop, xdist — works as for
+  curtailment.
+
+See Early stopping and Sequential stopping in {doc}`reference` for the
+details, and {doc}`statistics` for what `seq` promises.
 
 ## Budgeting runs before running them
 

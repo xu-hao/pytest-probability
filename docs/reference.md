@@ -145,11 +145,15 @@ All options live in the `probability` group of `pytest --help`.
   gates are judged, and listed in the gates block, without it.
   **Default:** the `prob_latency` ini value, else off.
 
-`--prob-stop={off,curtail}`
+`--prob-stop={off,curtail,sequential}`
 : `curtail` skips a gated case's remaining runs as soon as its verdict
-  can no longer change: see [Early stopping](#early-stopping). The
-  verdicts are the same as running every run. Under pytest-xdist it
-  needs `--dist loadgroup`; otherwise it warns and every run runs.
+  can no longer change; the verdicts are the same as running every run.
+  `sequential` judges each rate gate that can stop on an anytime-valid
+  interval instead, and stops the case as soon as that interval is
+  clear of the bar, so `runs` becomes the most a case may use: see
+  [Early stopping](#early-stopping) and
+  [Sequential stopping](#sequential-stopping). Under pytest-xdist both
+  need `--dist loadgroup`; otherwise it warns and every run runs.
   **Default:** the `prob_stop` ini value, else `off`.
 
 `--prob-no-gate-items`
@@ -245,7 +249,7 @@ Set these in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`),
   Ini only; use `-o prob_latency_quantile=0.99` for a one-off.
 
 `prob_stop` *(string, default `"off"`)*
-: Default for `--prob-stop`: `off` or `curtail`.
+: Default for `--prob-stop`: `off`, `curtail` or `sequential`.
 
 `prob_gate_items` *(bool, default `true`)*
 : Collect [gate items](#gate-items); `false` (or `--prob-no-gate-items`)
@@ -298,6 +302,9 @@ reported as pytest usage errors before anything runs.
   a separate latency gate; `latency_quantile` alone only chooses the
   quantile reported. `confidence=` sets the level of both gates'
   intervals; `method=` and `prior=` don't apply to latency.
+- **Under `--prob-stop=sequential`** a rate gate whose case can stop is
+  judged by the [confidence sequence](#sequential-stopping) at its
+  `confidence=`; `method=` and `prior=` don't apply to it.
 - **Comparison arguments are per function:** `compare`, `baseline`,
   `margin` and `equivalence` go on the bench function's mark, together
   (`baseline=` without `compare=` is an error), and are rejected on a
@@ -446,7 +453,9 @@ bench_classify.py::bench_classify::never[gate] FAILED
   worker that ran its runs`, and the verdicts are judged at session end
   as without them.
 - **Early stopping:** a stopped case's gate item runs after its skipped
-  runs and judges the runs that ran, like the gates block.
+  runs and judges the runs that ran, like the gates block — under
+  `--prob-stop=sequential`, on the case's confidence sequence, its line
+  tagged `seq`.
 - **Nothing to judge:** when none of the case's runs recorded a result
   (all skipped, or a skip mark on the case), its gate item skips.
 - **Off:** `--prob-no-gate-items` or `prob_gate_items = false`. Then a
@@ -708,6 +717,30 @@ Here `classify` is gated at `min_rate=0.9`, `smoke` at
   latency gate's (72), so the row is red; `both_p50` uses
   `latency_quantile=0.5`, whose minimum is 6. A suite without latency
   gates prints exactly what it did before.
+- Under `--prob-stop=sequential` a [sequential](#sequential-stopping)
+  gate's columns are for its stopping rule: `min runs` is where its
+  sequence can first PASS (53 for `min_rate=0.9` at 95%), `chance now`
+  the chance it PASSes at some run within the planned ones, and `runs
+  for 80%` the budget that makes that chance 80% (it only grows with
+  the budget, so the first that gets there is the answer). An
+  `expected runs` column gives the runs each gated case would use on
+  average at the assumed rate — its planned runs when it can't stop,
+  and for a count gate the runs curtailment leaves. All are exact
+  forward passes over the pass counts, through the same stopping rule
+  a session uses:
+
+  ```text
+  $ pytest benchmarks/ --prob-stop=sequential --prob-plan
+    case             runs  min runs  runs for 80%  chance now  expected runs  catch 10%  catch 1%
+    classify::solid   100        53           197         33%             76        99%       63%
+    smoke::steady      20        19            20         88%             19        88%       18%
+  ```
+
+  Here a case that really passes 97% of its runs has only a 33% chance
+  to clear a 90% bar within 100 runs (82% with a fixed count of 100):
+  the sequence is wider. A planned 200 runs would make it 81%, at about
+  124 runs used on average. Without `--prob-stop=sequential` the plan is
+  unchanged.
 - `prob_errors` doesn't enter the plan: the assumed rate is the chance
   a run passes.
 - The 80% target and the 10,000-run cap are fixed. A rate gate barely
@@ -982,7 +1015,7 @@ no interval. The row's own interval stays: it describes the runs that
 ran. A latency quantile of a stopped case comes from the runs that ran.
 
 **Under pytest-xdist**, a case can only be stopped by the process that
-runs all of its runs, so `--prob-stop=curtail` needs `--dist
+runs all of its runs, so `--prob-stop` needs `--dist
 loadgroup`: the plugin puts each stoppable case's items in an
 `xdist_group` of its own (named after the case, which xdist appends to
 the node id: `…::weak[run3]@classify::weak`), so one worker runs them
@@ -994,6 +1027,131 @@ runs' reports, so the summary and JSON report match a serial run.
 `--prob-explain` says, for each stopped case, why it could stop and
 what that means for its numbers, and for each hidden line why it is
 hidden.
+
+### Sequential stopping
+
+Curtailment stops a case only once its verdict can't change, which
+for a clearly good case is near the end: `solid` above ran all 40.
+`--prob-stop=sequential` asks a different question after every run —
+is the case already clearly above or below its bar? — and stops as
+soon as the answer is yes. The run count (`--prob-runs`, `runs=`)
+becomes the most a case may use:
+
+```text
+$ pytest benchmarks/ --prob-stop=sequential     # classify: min_rate=0.9, runs=100
+================================= probability ==================================
+  classify::solid  53/53  [90%, 100%] seq  $0.0530  decided after 53/100
+  classify::close  79/83  [83%,  99%] seq  $0.0830  FLAKY  decided after 83/100
+  classify::weak   45/60  [55%,  90%] seq  $0.0600  FLAKY  decided after 60/100
+  smoke::steady    19/19  [82%, 100%]      $0.0190  decided after 19/20
+  smoke::broken      2/4  [ 7%,  93%]      $0.0040  FLAKY  decided after 4/20
+
+  Overall: 198/219 passed (90%)
+  Gates:   2 passed, 2 failed, 1 undecided
+  Stopped: 5 cases early, saving 121 of 340 runs (36%) and about $0.1210
+  Cost:    $0.2190
+============================== probability: gates ==============================
+  classify::close  79/83  [83%, 99%] seq  ≥90%        UNDECIDED  decided after 83/100
+  classify::weak   45/60  [55%, 90%] seq  ≥90%        FAIL  decided after 60/100
+  smoke::broken      2/4  [ 7%, 93%]      ≥19 passes  FAIL  decided after 4/20
+```
+
+The same suite under `curtail` saves 53 of the 340 runs: `solid` needs
+96 of its 100 there, against 53 here. The verdicts happen to agree.
+
+**Why a different interval.** A fixed-run interval (Clopper-Pearson,
+Wilson, Bayesian) is valid for a run count chosen in advance. Looked
+at after every run, and acted on, it is not: the chance that a 95%
+Clopper-Pearson interval leaves out the true rate at some point in 300
+runs is about 32% (for a rate of 50%), and in 2,000 runs about 46%.
+Stopping the moment it cleared the bar would pass cases that don't
+meet it. The interval tagged `seq` is a *confidence sequence*: the
+chance that it ever leaves out the true rate, checked after every run
+for as long as the case runs, is at most 1 − `prob_confidence`. Worked
+out exactly over every path of 2,000 runs, it is at most 3.7% at 95%.
+
+**How it is built.** After x passes in n runs, the interval holds
+every rate p whose evidence against it is still below 1/α
+(α = 1 − level, so 20 at 95%):
+
+```text
+Mₙ(p) = B(½ + x, ½ + n − x) / (B(½, ½) · pˣ · (1 − p)ⁿ⁻ˣ)
+```
+
+— the probability the runs got under a Beta(½, ½) mixture of pass
+rates, over their probability under p (a beta-binomial mixture, in the
+style of Robbins' method of mixtures). If the runs really pass with
+probability p, Mₙ(p) is a fair bet that starts at 1 (a nonnegative
+martingale), so by Ville's inequality the chance it ever reaches 1/α is
+at most α. The bounds are found by Newton's method on log Mₙ, with
+`math.lgamma`; they depend only on the counts, not on the order of the
+runs. The guarantee holds for any mixture, so the choice is about
+width: Jeffreys' Beta(½, ½) has the smallest worst-case penalty (about
+½·log n) and keeps it small at n of n and 0 of n passes, where
+pass-rate gates live — 53 runs clear a 90% bar, where a uniform
+Beta(1, 1) mixture would need 69. It is symmetric and fixed, so there
+is nothing to tune after looking. One level drives both ends: the
+interval is two-sided, as the printed range must be.
+
+**The price is width.** At the same level the sequence is never
+narrower than Clopper-Pearson (checked for every count up to 333
+runs): about 1.2 times as wide at 10 runs, 1.6 times at 100 and 1.8
+times at 1,000. A gate needs more runs to PASS at all — 53 of 53 for a
+90% bar at 95% (36 with a fixed count), 116 for 95%, 680 for 99% — and
+the [feasibility warning](#feasibility-warning) counts those. So it
+pays off for cases clearly on one side of their bar and costs runs for
+cases near it: with 100 runs, a case that really passes 97% of its runs
+clears a 90% bar with a 33% chance sequentially and 82% with a fixed
+count. `--prob-plan` shows the trade ([Planning](#planning)).
+
+**When a case stops:**
+
+| Stops as | when |
+|---|---|
+| PASS | its sequence's interval is entirely above the bar |
+| FAIL | it is entirely below the bar |
+| UNDECIDED | neither can happen within its planned runs, however they go |
+
+A PASS or FAIL is the verdict at the run the case stopped at; unlike
+curtailment, it is not "what all the runs would give", and the
+guarantee is what makes it trustworthy anyway. A case that reaches its
+budget is judged on the sequence there: UNDECIDED if it still
+straddles the bar, even when a fixed-run interval over the same runs
+would decide — switching at the end would break the guarantee. The
+UNDECIDED stop uses curtailment's extremes argument: each pass moves
+both bounds up and each non-pass moves them down, so if every remaining
+run passing can't reach PASS at the last run, it can't at any run
+before. That holds from `confidence` 1 − e^(−½) ≈ 0.39 up (well below
+any level in use); below it, a case only stops on PASS or FAIL.
+
+- **What it applies to:** rate gates whose case can stop — the cases
+  curtailment would stop. Each is judged by the sequence at its
+  `confidence=`, in place of its `method=` and `prior=`. Count gates
+  (`min_passes`) have no interval to watch, since they pass on a count
+  over all their runs, so they are curtailed, exactly as under
+  `curtail`. Cases that can't stop — ungated, or with a comparison
+  `margin=`, `--prob-margin` or a latency gate — keep their fixed-run
+  interval and run every run.
+- **Errors** follow `prob_errors`: under `count` an errored run is a
+  non-pass of the sequence, under `exclude` it is not one of its runs.
+  Runs that skip themselves are not runs of it either.
+- **Output:** a row judged by a sequence shows the sequence's interval
+  — in the main table, the gates block and `--prob-explain` — tagged
+  `seq`, so it isn't read as a fixed-run one; in the JSON report its
+  `rows[].ci` and `rows[].gate` say `"method": "sequential"`. Skipped
+  runs read `probability gate: decided after 53/100 runs (PASS,
+  sequential)`. A stopped case's fraction leans toward its verdict as
+  under curtailment, so function-level, metric, comparison and
+  baseline intervals over it are hidden the same way; its own
+  sequence's interval allows for the stop.
+- **Under pytest-xdist** as above: `--dist loadgroup`, or a
+  `CurtailmentWarning` and every case runs every run, judged by its
+  fixed-run interval, since nothing stopped.
+
+`--prob-explain` says which side of the bar the range was on when a
+case stopped, that the range holds however early it stopped and is
+wider for it, and, for an UNDECIDED case, that `runs=` is the most it
+may use.
 
 ## Python API
 
@@ -1045,8 +1203,8 @@ cannot pass even if every run passes. See
 ### `CurtailmentWarning`
 
 A `pytest.PytestWarning` subclass, raised at startup when
-`--prob-stop=curtail` runs under pytest-xdist without `--dist
-loadgroup`: no case can stop early then. See
+`--prob-stop` (`curtail` or `sequential`) runs under pytest-xdist
+without `--dist loadgroup`: no case can stop early then. See
 [Early stopping](#early-stopping).
 
 ## Benchmark module contract
@@ -1148,7 +1306,7 @@ sample.
 
   Overall: 35/50 passed (70%), 3 errored   # errored count only when present
   Gates:   3 passed, 1 failed, 1 undecided     # only when a case is gated
-  Stopped: 2 cases early, saving 30 of 80 runs (38%) and about $0.0030   # --prob-stop=curtail
+  Stopped: 2 cases early, saving 30 of 80 runs (38%) and about $0.0030   # --prob-stop
   Cost:    $0.0110                                 # only when cost was recorded
   Tokens:  m-small  1,200 in / 80 out / 640 cached  $0.0010   # per model,
            m-large  4,800 in / 900 out              $0.0040   # only with usage
@@ -1182,6 +1340,8 @@ with the interval and bar each verdict came from:
   was read from, even when the gate overrides the session settings.
 - Intervals are shown even with `--prob-no-intervals` or a single run:
   the verdict depends on them.
+- A gate judged by a [confidence sequence](#sequential-stopping)
+  (`--prob-stop=sequential`) has `seq` after its interval.
 - PASS cases are only counted, on the `Gates:` line. `(allowed)` marks
   UNDECIDED cases that `--prob-undecided=pass` lets through.
 - [Latency gates](#latency) that did not PASS follow the rate gates, in
@@ -1273,7 +1433,11 @@ interval method and level actually in effect:
   function-level, metrics, comparison or baseline line hidden by a
   stopped case says why it is hidden and that running without
   `--prob-stop=curtail` shows it. The glossary explains "decided
-  after".
+  after". Under `--prob-stop=sequential` a case its sequence stopped
+  is read instead as stopped "as soon as its range was entirely above
+  the bar" (or below it, or "could no longer get clear of the bar
+  within its planned runs"), with a range that holds however early it
+  stopped; the glossary's `[low, high]` entry explains `seq`.
 - Under pytest-xdist the controller writes the section from the
   aggregated counts, so it reads the same as a serial run.
 
@@ -1293,6 +1457,11 @@ in the fraction, so errors count as non-passes.
 - A row with a single run gets a blank cell; when no row has more than
   one run the column is omitted, so `--prob-runs=1` output looks as it
   did before intervals existed.
+- A row judged by a [confidence sequence](#sequential-stopping)
+  (`--prob-stop=sequential`) shows that sequence's interval over every
+  run, at its gate's level, tagged `seq`: for a case that may stop as
+  soon as it looks clear, a fixed-run interval would claim more than
+  the runs support.
 - `--prob-no-intervals` / `prob_intervals = false` hide the column.
 
 ### Function-level intervals
@@ -1437,4 +1606,5 @@ Comparisons without a margin, and a baseline without
 `--prob-margin`, never change the exit status. The JSON report's `exit_status` is the final code,
 gates included. `--prob-stop=curtail` never changes it either: every
 verdict is the one all the runs would give, and the skipped runs are
-skips.
+skips. `--prob-stop=sequential` can: its rate gates are judged by a
+different, wider interval, at whatever run they stopped.

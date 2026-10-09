@@ -39,6 +39,9 @@ Contents:
   for a quantile from two order statistics whose ranks come from
   Binomial(n, q) (``quantile_ranks``, ``quantile_coverage``,
   ``quantile_min_n``), and ``sample_quantile`` for the estimate.
+- **Sequential** — ``confidence_sequence``, an anytime-valid interval
+  for a pass rate that stays valid however often it is checked, from
+  the beta-binomial mixture ``mixture_log_wealth``.
 
 Conventions:
 
@@ -63,9 +66,16 @@ from typing import Callable, Sequence, TypeVar
 
 T = TypeVar("T")
 
-# Interval methods understood by ``proportion_interval``. "exact" is the
-# default everywhere: Clopper-Pearson never under-covers.
+# Interval methods a user can choose (--prob-method, method=). "exact"
+# is the default everywhere: Clopper-Pearson never under-covers.
 METHODS = ("exact", "wilson", "bayes")
+
+# The anytime-valid confidence sequence: not a method a user picks, but
+# what a gate is judged by under --prob-stop=sequential.
+SEQUENTIAL = "sequential"
+
+# Everything ``proportion_interval`` understands.
+INTERVALS = (*METHODS, SEQUENTIAL)
 
 # Relative accuracy targets. Double precision is ~2.2e-16; the
 # continued fraction stops a little above that so rounding noise cannot
@@ -423,11 +433,12 @@ def proportion_interval(
 ) -> tuple[float, float]:
     """Interval for x successes in n trials by method name.
 
-    ``method`` is one of ``METHODS``: ``"exact"`` (Clopper-Pearson),
-    ``"wilson"``, or ``"bayes"`` (``beta_credible`` with ``prior``;
-    ignored otherwise). The single entry point option values map onto,
-    so rows, gates and the feasibility check all agree on what a
-    method name means.
+    ``method`` is one of ``INTERVALS``: ``"exact"`` (Clopper-Pearson),
+    ``"wilson"``, ``"bayes"`` (``beta_credible`` with ``prior``), or
+    ``"sequential"`` (``confidence_sequence`` with ``prior`` as its
+    mixing prior); ``prior`` is ignored by the first two. The single
+    entry point option values map onto, so rows, gates and the
+    feasibility check all agree on what a method name means.
     """
     if method == "exact":
         return clopper_pearson(x, n, level)
@@ -435,7 +446,9 @@ def proportion_interval(
         return wilson(x, n, level)
     if method == "bayes":
         return beta_credible(x, n, level, prior)
-    raise ValueError(f"method must be one of {', '.join(METHODS)}; got {method!r}")
+    if method == SEQUENTIAL:
+        return confidence_sequence(x, n, level, prior)
+    raise ValueError(f"method must be one of {', '.join(INTERVALS)}; got {method!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1060,3 +1073,184 @@ def quantile_interval(
         ordered[r - 1] if r is not None else None,
         ordered[s - 1] if s is not None else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sequential: an anytime-valid confidence sequence
+# ---------------------------------------------------------------------------
+
+#: The mixing prior of ``confidence_sequence``: Jeffreys' Beta(½, ½).
+SEQUENCE_PRIOR = (0.5, 0.5)
+
+#: The level from which the default sequence's bounds move one way per
+#: run, 1 − e^(−1/2) ≈ 0.39 (see ``confidence_sequence``).
+SEQUENCE_MONOTONE_LEVEL = -math.expm1(-0.5)
+
+
+def _check_sequence_counts(x: object, n: object) -> tuple[int, int]:
+    x, n = _check_int("x", x), _check_int("n", n)
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+    if not 0 <= x <= n:
+        raise ValueError(f"x must be between 0 and n={n}, got {x}")
+    return x, n
+
+
+def _check_prior(prior: tuple[float, float]) -> tuple[float, float]:
+    if len(prior) != 2:
+        raise ValueError(f"prior must be a pair (a, b), got {prior!r}")
+    return _check_positive("prior a", prior[0]), _check_positive("prior b", prior[1])
+
+
+def _log_mixture(x: int, n: int, a: float, b: float) -> float:
+    # log of the mixture's probability of one particular sequence with x
+    # passes in n runs: B(a + x, b + n − x) / B(a, b). Never above 0.
+    return _log_beta(a + x, b + n - x) - _log_beta(a, b)
+
+
+def mixture_log_wealth(
+    x: int, n: int, p: float, prior: tuple[float, float] = SEQUENCE_PRIOR
+) -> float:
+    """log Mₙ(p): the beta-binomial mixture's evidence against a pass
+    rate p after x passes in n runs.
+
+    Mₙ(p) = B(a + x, b + n − x) / (B(a, b) · pˣ (1 − p)ⁿ⁻ˣ) with
+    ``prior`` (a, b): the probability the runs so far get under a
+    Beta(a, b) mixture of pass rates, over their probability under p. It
+    is the product of one-step factors q̂ᵢ/p for a pass and
+    (1 − q̂ᵢ)/(1 − p) for a non-pass, where q̂ᵢ = (a + passes so far)/
+    (a + b + runs so far) is the mixture's prediction for run i — which
+    is why, when the runs really pass with probability p, the factors
+    average 1 and Mₙ(p) is a nonnegative martingale starting at M₀ = 1.
+
+    ``+inf`` when p is ruled out outright (p = 0 with a pass, p = 1 with
+    a non-pass). Computed from ``lgamma``, so it neither over- nor
+    underflows at any n.
+    """
+    x, n = _check_sequence_counts(x, n)
+    a, b = _check_prior(prior)
+    p = _check_unit("p", p)
+    if (p == 0.0 and x) or (p == 1.0 and n - x):
+        return math.inf
+    log_wealth = _log_mixture(x, n, a, b)
+    if x:
+        log_wealth -= x * math.log(p)
+    if n - x:
+        log_wealth -= (n - x) * math.log1p(-p)
+    return log_wealth
+
+
+def _softplus(u: float) -> float:
+    # log(1 + eᵘ) without overflow.
+    if u > 0.0:
+        return u + math.log1p(math.exp(-u))
+    return math.log1p(math.exp(u))
+
+
+def _expit(u: float) -> float:
+    # 1 / (1 + e⁻ᵘ), accurate on both sides.
+    if u >= 0.0:
+        return 1.0 / (1.0 + math.exp(-u))
+    e = math.exp(u)
+    return e / (1.0 + e)
+
+
+def _sequence_low(x: int, n: int, threshold: float, a: float, b: float) -> float:
+    """The lower bound of the sequence: the p below x/n where the log
+    wealth reaches ``threshold`` = log(1/α).
+
+    In the log-odds u = log(p/(1 − p)) the log wealth is
+    g(u) = log B(a + x, b + n − x)/B(a, b) + x·log(1 + e⁻ᵘ)
+    + (n − x)·log(1 + eᵘ), with g'(u) = n·p − x and g'' = n·p(1 − p) > 0:
+    convex, falling to its minimum (at most 0) at the observed rate.
+    Newton's method from the left of the root of a convex falling
+    function never overshoots, so after a doubling search brackets the
+    root it converges from that side, quadratically; a bisection guard
+    covers rounding.
+    """
+    if x == 0:
+        return 0.0
+    log_mix = _log_mixture(x, n, a, b)
+    if x == n:
+        # g(u) = log_mix + n·log(1 + e⁻ᵘ): solved in closed form.
+        return math.exp(-(threshold - log_mix) / n)
+
+    def g(u: float) -> float:
+        return log_mix + x * _softplus(-u) + (n - x) * _softplus(u) - threshold
+
+    centre = math.log(x / (n - x))
+    inside, step = centre, 1.0  # g(inside) < 0: the observed rate
+    outside = centre - step
+    while g(outside) < 0.0:
+        inside, step = outside, 2.0 * step
+        outside = centre - step
+    u = outside  # g(u) ≥ 0, left of the root
+    for _ in range(200):
+        dg = n * _expit(u) - x  # negative left of the observed rate
+        nxt = u - g(u) / dg if dg < 0.0 else math.nan
+        if not u < nxt < inside:
+            nxt = 0.5 * (u + inside)
+        if g(nxt) < 0.0:
+            # Rounding put it past the root: tighten from the right.
+            inside = nxt
+            nxt = 0.5 * (u + inside)
+            if g(nxt) < 0.0:
+                inside = nxt
+                continue
+        if nxt - u <= 1e-15 * max(1.0, abs(u)):
+            u = nxt
+            break
+        u = nxt
+    return _expit(u)
+
+
+def confidence_sequence(
+    x: int, n: int, level: float = 0.95, prior: tuple[float, float] = SEQUENCE_PRIOR
+) -> tuple[float, float]:
+    """Anytime-valid confidence sequence for a pass rate: the p whose
+    mixture wealth after x passes in n runs is still below 1/α,
+    α = 1 − ``level``.
+
+    The guarantee is over the whole sequence of runs, not one run
+    count: for independent runs that pass with probability p, the chance
+    that the interval *ever* leaves p out — checked after every run,
+    for as long as you like — is at most α. That is what lets a gate
+    stop the moment its interval clears the bar, and judge the case on
+    the interval it stopped at. The argument: under p,
+    ``mixture_log_wealth`` exponentiated, Mₙ(p), is a nonnegative
+    martingale with M₀ = 1, so by Ville's inequality
+    P(Mₙ(p) ≥ 1/α for some n) ≤ α, and p leaves the interval exactly
+    when Mₙ(p) ≥ 1/α. It is two-sided — the mixture spreads its bets
+    over rates on both sides of p — and the one level covers both ends.
+
+    The price is width: compared with the Clopper-Pearson interval at the
+    same level it is about 1.2 times as wide at n = 10, 1.6 times at 100
+    and 1.8 times at 1,000 (the gap grows like √log n), and a gate needs
+    more runs to PASS (53 of 53 for a 90% bar at 95%, against 36).
+
+    The default ``prior`` is the mixing distribution, not a belief, and
+    the guarantee holds for any: Jeffreys' Beta(½, ½) (the
+    Krichevsky-Trofimov mixture) is the one whose penalty is smallest in
+    the worst case, about ½·log n, and stays that small at 0 and n
+    passes, where pass-rate gates live; the uniform Beta(1, 1) pays
+    log(n + 1) there. It is symmetric and has nothing to tune.
+
+    The bounds depend only on (x, n), not on the order of the runs, and
+    are found by Newton's method on the log wealth (``_sequence_low``;
+    the upper bound is the lower bound of the mirrored count). n = 0
+    gives (0, 1). With the default prior and ``level`` of at least
+    ``SEQUENCE_MONOTONE_LEVEL`` (≈ 0.39), a pass never lowers either
+    bound and a non-pass never raises one — the property early
+    stopping relies on — because the bounds then lie between the
+    observed rate's mixture prediction (a + x)/(a + b + n) and 0 or 1.
+    """
+    x, n = _check_sequence_counts(x, n)
+    level = _check_level(level)
+    a, b = _check_prior(prior)
+    if n == 0:
+        return 0.0, 1.0
+    threshold = -math.log1p(-level)  # log(1/α)
+    low = _sequence_low(x, n, threshold, a, b)
+    # The mirrored lower bound: better accuracy than a root a hair below 1.
+    high = 1.0 - _sequence_low(n - x, n, threshold, b, a)
+    return low, high

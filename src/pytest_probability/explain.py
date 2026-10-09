@@ -125,9 +125,19 @@ def _range(interval: tuple[float, float]) -> str:
 
 
 def _level(stats: Any) -> str:
-    # "95% confidence", or "95% probability" for a Bayesian range.
+    # "95% confidence", or "95% probability" for a Bayesian range; a
+    # confidence sequence says what sets it apart.
+    if stats.method == "sequential":
+        return f"{_pct_bar(stats.level)} confidence, however early the case stops"
     word = "probability" if stats.method == "bayes" else "confidence"
     return f"{_pct_bar(stats.level)} {word}"
+
+
+def _cell(interval: tuple[float, float], stats: Any) -> str:
+    # An interval as the summary prints it, tagged when it is a
+    # confidence sequence.
+    text = f"[{_pct(interval[0])}, {_pct(interval[1])}]"
+    return f"{text} seq" if stats.method == "sequential" else text
 
 
 def stats_key(stats: Any) -> tuple:
@@ -176,6 +186,15 @@ _STOP_WHY = {
     UNDECIDED: "it would stay UNDECIDED however the remaining runs went",
 }
 
+# The same for a case its confidence sequence stopped
+# (--prob-stop=sequential).
+_SEQUENCE_WHY = {
+    PASS: ", as soon as its range was entirely above the bar",
+    FAIL: ", as soon as its range was entirely below the bar",
+    UNDECIDED: " because by then its range could no longer get clear of the bar"
+    " within its planned runs, however they went",
+}
+
 # Why a stopped case's fraction is not a fair estimate, for the lines
 # that hide what is computed from it.
 _STOP_LEANS = (
@@ -189,13 +208,44 @@ def _were(n: int) -> str:
     return "was" if n == 1 else "were"
 
 
+def _decided(mode: str) -> str:
+    # How a stopped case's verdict was reached, for the lines it hides:
+    # certain under curtailment, decided by its range under a sequence.
+    return "certain" if mode == "curtail" else "decided"
+
+
+def _leans(mode: str) -> str:
+    return _STOP_LEANS.replace("certain", _decided(mode))
+
+
+def stop_term(mode: str) -> tuple[str, Hashable]:
+    """The glossary term for a stop under ``--prob-stop=<mode>``."""
+    return ("stopped", None if mode == "curtail" else mode)
+
+
 def stop_paragraph(stop: Any, verdict: str, numbers: bool = True) -> str:
     """Why a gated case stopped early and, when ``numbers`` (it has a
     fraction to read), what that means for them. ``stop`` is the
     plugin's ``Stop``."""
+    option = f"--prob-stop={stop.mode}"
+    if stop.sequential:
+        text = (
+            f"It stopped after {stop.after} of its {stop.planned} planned runs"
+            f" ({option}){_SEQUENCE_WHY[verdict]}; the other"
+            f" {_runs(stop.skipped)} {_were(stop.skipped)} skipped. That range"
+            " is built to hold however early a case stops, which is also why"
+            " it is wider than a fixed-run range."
+        )
+        if numbers:
+            text += (
+                f" The fraction comes from the {_runs(stop.after)} that ran and"
+                " can lean toward the verdict, since the case stopped as soon as"
+                " it was decided; the range allows for that."
+            )
+        return text
     text = (
         f"It stopped after {stop.after} of its {stop.planned} planned runs"
-        f" (--prob-stop=curtail) because by then {_STOP_WHY[verdict]}; the"
+        f" ({option}) because by then {_STOP_WHY[verdict]}; the"
         f" other {_runs(stop.skipped)} {_were(stop.skipped)} skipped. The"
         f" verdict is the one all {stop.planned} runs would give."
     )
@@ -235,11 +285,11 @@ def gate_reading(
     if excluded:
         terms.append(("excluded", None))
     if stop is not None:
-        terms.append(("stopped", None))
+        terms.append(stop_term(stop.mode))
 
     heading = f"{result.case}  {passes}/{total}"
     if interval is not None:
-        heading += f"  [{_pct(interval[0])}, {_pct(interval[1])}]"
+        heading += f"  {_cell(interval, gate.stats)}"
     heading += f"  {gate.bar()}  {verdict.upper()}"
     if excluded:
         heading += f"  ({excluded} errored, excluded)"
@@ -337,6 +387,13 @@ def gate_reading(
     observed = passes / total
     # The estimate is in judged runs: errored ones don't move it.
     in_total = " in total, not counting errored ones," if excluded else " in total"
+    # A sequential gate's runs are a ceiling, not a count.
+    most = (
+        " Under --prob-stop=sequential runs= (or --prob-runs) is the most it may"
+        " use: it still stops as soon as its range is clear of the bar."
+        if gate.sequential
+        else ""
+    )
     if verdict == FAIL:
         step = f"Next: {_LOOK_AT_FAILURES}"
         if counted_errors:
@@ -355,13 +412,13 @@ def gate_reading(
             paras.append(
                 f"Next: run more. If it keeps passing at today's rate"
                 f" ({rate(observed)}), about {about(settle)} runs{in_total}"
-                " would settle it."
+                f" would settle it.{most}"
             )
         else:
             paras.append(
                 f"Next: today's rate ({rate(observed)}) is below the bar; if it"
                 f" holds, about {about(settle)} runs{in_total} would confirm"
-                f" that it falls short. Meanwhile, {_LOOK_AT_FAILURES}"
+                f" that it falls short.{most} Meanwhile, {_LOOK_AT_FAILURES}"
             )
     return Reading(heading, tuple(paras), verdict, tuple(terms))
 
@@ -393,10 +450,23 @@ _ROW_NEXT = {
 
 
 def _row_stop(stop: Any) -> str:
+    if stop.sequential:
+        when = (
+            "once its gate's range could no longer get clear of the bar"
+            if stop.verdict == UNDECIDED
+            else "as soon as its gate's range was clear of the bar"
+        )
+        return (
+            f" It stopped after {stop.after} of its {stop.planned} planned runs,"
+            f" {when} (--prob-stop={stop.mode}), so this fraction comes from"
+            " those runs only and can lean toward the verdict; the range allows"
+            " for that."
+        )
     return (
         f" It stopped after {stop.after} of its {stop.planned} planned runs,"
-        " once its gate's verdict was certain (--prob-stop=curtail), so this"
-        " fraction comes from those runs only and can lean toward the verdict."
+        f" once its gate's verdict was certain (--prob-stop={stop.mode}), so"
+        " this fraction comes from those runs only and can lean toward the"
+        " verdict."
     )
 
 
@@ -419,12 +489,12 @@ def row_reading(
     heading = f"{s.case}  {s.passes}/{s.total}"
     terms: list[tuple[str, Hashable]] = []
     if s.total > 1 and interval is not None:
-        heading += f"  [{_pct(interval[0])}, {_pct(interval[1])}]"
+        heading += f"  {_cell(interval, stats)}"
     if status != "pass":
         heading += f"  {status.upper()}"
     if stop is not None:
         heading += f"  {stop.label()}"
-        terms.append(("stopped", None))
+        terms.append(stop_term(stop.mode))
 
     paras: list[str] = []
     if s.total == 1:
@@ -465,14 +535,17 @@ def row_reading(
     return Reading(heading, tuple(paras), status, tuple(terms))
 
 
-def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
+def aggregate_reading(
+    agg: Any, min_inputs: int, *, mode: str = "curtail"
+) -> Reading:
     """A function-level (or Overall) line explained.
 
     ``agg`` is an ``Aggregate``; ``min_inputs`` the session's
     ``prob_min_inputs``. An aggregate without an interval (too few
     inputs) only reaches the JSON report, and its reading says why; one
     whose interval is hidden because cases stopped early is a note in
-    the summary, and its reading says why too.
+    the summary, and its reading says why too. ``mode`` is the session's
+    ``--prob-stop``.
     """
     n, est = agg.inputs, _pct1(agg.estimate)
     if agg.stopped and agg.ci is None and n >= min_inputs:
@@ -487,14 +560,14 @@ def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
         who += f" {where}" if where else ""
         paras = (
             f"No average or range is shown: {who} stopped"
-            " early, once their gates' verdicts were certain"
-            f" (--prob-stop=curtail). {_STOP_LEANS}, so an average over these"
+            f" early, once their gates' verdicts were {_decided(mode)}"
+            f" (--prob-stop={mode}). {_leans(mode)}, so an average over these"
             " inputs, and a range around it, would mislead. The gates' verdicts"
             " are not affected.",
-            "Next: to see this line, run without --prob-stop=curtail.",
+            f"Next: to see this line, run without --prob-stop={mode}.",
         )
         heading = f"{agg.name}  {agg.size()}  interval hidden: {agg.suppressed}"
-        return Reading(heading, paras, None, (("stopped", None),))
+        return Reading(heading, paras, None, (stop_term(mode),))
     heading = f"{agg.name}  {agg.size()}  {est}"
     if agg.ci is not None:
         heading += f"  [{_pct1(agg.ci[0])}, {_pct1(agg.ci[1])}]"
@@ -516,7 +589,7 @@ def aggregate_reading(agg: Any, min_inputs: int) -> Reading:
         if agg.stopped:
             first += (
                 f" {_cases(agg.stopped).capitalize()} among them stopped early"
-                " (--prob-stop=curtail), so that average can lean toward their"
+                f" (--prob-stop={mode}), so that average can lean toward their"
                 " gates' verdicts."
             )
         paras = (
@@ -638,7 +711,12 @@ def _inputs(n: int) -> str:
 
 
 def metric_reading(
-    agg: Any, m: Any, min_inputs: int, *, intervals: bool = True
+    agg: Any,
+    m: Any,
+    min_inputs: int,
+    *,
+    intervals: bool = True,
+    mode: str = "curtail",
 ) -> Reading:
     """A line of the metrics block explained: what the metric means, its
     average over inputs and range, how many inputs were too short for
@@ -646,7 +724,8 @@ def metric_reading(
 
     ``agg`` is the ``Aggregate`` the line belongs to and ``m`` its
     ``MetricAggregate``; ``min_inputs`` the session's
-    ``prob_min_inputs``; ``intervals`` whether the block shows ranges.
+    ``prob_min_inputs``; ``intervals`` whether the block shows ranges;
+    ``mode`` the session's ``--prob-stop``.
     """
     from .plugin import _metric_lines
 
@@ -676,12 +755,12 @@ def metric_reading(
     if inner.stopped:
         paras = (
             f"{meaning} No value is shown: {inner.stopped} of {whose} stopped"
-            " early, once their gates' verdicts were certain"
-            f" (--prob-stop=curtail). {_STOP_LEANS}, so {metric.name} worked out"
+            f" early, once their gates' verdicts were {_decided(mode)}"
+            f" (--prob-stop={mode}). {_leans(mode)}, so {metric.name} worked out"
             " from such inputs would mislead.",
-            "Next: to see this line, run without --prob-stop=curtail.",
+            f"Next: to see this line, run without --prob-stop={mode}.",
         )
-        return Reading(heading, paras, None, (*terms, ("stopped", None)))
+        return Reading(heading, paras, None, (*terms, stop_term(mode)))
     est = _pct1(inner.estimate)
     body = (
         f"{meaning} Averaged over {whose}, each input counting equally, it is"
@@ -866,13 +945,18 @@ def margin_paragraph(
 
 
 def comparison_reading(
-    cmp: Any, *, undecided_fails: bool = True, min_inputs: int = 10
+    cmp: Any,
+    *,
+    undecided_fails: bool = True,
+    min_inputs: int = 10,
+    mode: str = "curtail",
 ) -> Reading:
     """A comparison explained: the difference, its range, the p-value
     and any margin verdict.
 
     ``cmp`` is a ``Comparison``; ``undecided_fails`` the session's
-    UNDECIDED policy and ``min_inputs`` its ``prob_min_inputs``.
+    UNDECIDED policy, ``min_inputs`` its ``prob_min_inputs`` and
+    ``mode`` its ``--prob-stop``.
     """
     from .plugin import _comparison_lines
 
@@ -908,12 +992,12 @@ def comparison_reading(
         paras = [
             f"No difference, range or p-value is shown: {_cases(cmp.stopped)}"
             f" behind this comparison of {arm} with {base} stopped early, once"
-            " their gates' verdicts were certain (--prob-stop=curtail)."
-            f" {_STOP_LEANS}, so a difference worked out from such cases would"
+            f" their gates' verdicts were {_decided(mode)} (--prob-stop={mode})."
+            f" {_leans(mode)}, so a difference worked out from such cases would"
             f" mislead.{unpaired}",
-            "Next: to compare the arms, run without --prob-stop=curtail.",
+            f"Next: to compare the arms, run without --prob-stop={mode}.",
         ]
-        return Reading(heading, tuple(paras), cmp.verdict, (("stopped", None),))
+        return Reading(heading, tuple(paras), cmp.verdict, (stop_term(mode),))
 
     if cmp.pairs == 1:
         only = cmp.inputs[0]
@@ -1116,13 +1200,19 @@ def _baseline_margin_paragraph(cmp: Any, undecided_fails: bool) -> str:
 
 
 def baseline_reading(
-    cmp: Any, *, path: str, undecided_fails: bool = True, min_inputs: int = 10
+    cmp: Any,
+    *,
+    path: str,
+    undecided_fails: bool = True,
+    min_inputs: int = 10,
+    mode: str = "curtail",
 ) -> Reading:
     """One function against the baseline explained: the change, its
     range, the p-value and the margin verdict, if any.
 
     ``cmp`` is the function's ``Comparison`` (arm ``current``, baseline
-    ``baseline``), ``path`` the baseline report's.
+    ``baseline``), ``path`` the baseline report's, ``mode`` the
+    session's ``--prob-stop``.
     """
     from .plugin import _comparison_lines
 
@@ -1135,12 +1225,13 @@ def baseline_reading(
         paras = [
             f"No change, range or p-value is shown: {_cases(cmp.stopped)} of"
             f" {fn} in both reports stopped early this run, once their gates'"
-            f" verdicts were certain (--prob-stop=curtail). {_STOP_LEANS}, so"
-            f" a change worked out from such cases would mislead.",
-            "Next: to compare with the baseline, run without --prob-stop=curtail.",
+            f" verdicts were {_decided(mode)} (--prob-stop={mode})."
+            f" {_leans(mode)}, so a change worked out from such cases would"
+            " mislead.",
+            f"Next: to compare with the baseline, run without --prob-stop={mode}.",
         ]
         return Reading(
-            heading, tuple(paras), cmp.verdict, (*terms, ("stopped", None))
+            heading, tuple(paras), cmp.verdict, (*terms, stop_term(mode))
         )
     if cmp.pairs == 1:
         only = cmp.inputs[0]
@@ -1427,6 +1518,15 @@ _METHOD_NOTES = {
 
 def _method_text(key: tuple) -> str:
     method, level, prior = key
+    if method == "sequential":
+        return (
+            f"(seq: an anytime-valid range, {_pct_bar(level)} confidence: the"
+            f" chance it ever leaves out the true rate, checked after every run"
+            f" for as long as the case runs, is at most {_pct_bar(1 - level)}."
+            " That is what lets a case stop as soon as its range is clear of"
+            " the bar, and it makes the range wider than a fixed-run one: about"
+            " 1.6 times as wide at 100 runs.)"
+        )
     if method == "bayes":
         a, b = prior
         if (a, b) == (1.0, 1.0):
@@ -1514,16 +1614,32 @@ def _latency_limit_entry(_: list) -> str:
 
 
 @glossary_entry("stopped", "decided after")
-def _stopped_entry(_: list) -> str:
-    return (
-        "With --prob-stop=curtail a gated case stops as soon as its verdict"
-        " can no longer change, whatever its remaining runs would do: \"decided"
-        " after 12/40\" means 12 of its 40 planned runs ran and the rest were"
-        " skipped (reported as skipped by pytest). The verdict is always the"
-        " one all 40 runs would give. The case's fraction comes from the runs"
-        " that ran and can lean toward its verdict, so averages, metrics and"
-        " comparisons over such cases are hidden (\"interval hidden\")."
+def _stopped_entry(modes: list) -> str:
+    # None: --prob-stop=curtail; "sequential": --prob-stop=sequential.
+    texts = []
+    if None in modes:
+        texts.append(
+            "With --prob-stop=curtail a gated case stops as soon as its verdict"
+            " can no longer change, whatever its remaining runs would do:"
+            " \"decided after 12/40\" means 12 of its 40 planned runs ran and"
+            " the rest were skipped (reported as skipped by pytest). The verdict"
+            " is always the one all 40 runs would give."
+        )
+    if "sequential" in modes:
+        texts.append(
+            "With --prob-stop=sequential a case with a pass-rate bar stops as"
+            " soon as its range (seq) is entirely above or below the bar, or can"
+            " no longer get clear of it within its planned runs; a case with a"
+            " count bar stops as soon as its verdict can no longer change."
+            " \"decided after 12/40\" means 12 of its 40 planned runs ran and"
+            " the rest were skipped (reported as skipped by pytest)."
+        )
+    texts.append(
+        "The case's fraction comes from the runs that ran and can lean toward"
+        " its verdict, so averages, metrics and comparisons over such cases"
+        " are hidden (\"interval hidden\")."
     )
+    return " ".join(texts)
 
 
 @glossary_entry("aggregate", "N inputs × k")
@@ -1807,6 +1923,7 @@ def plan_notes(
     latency: bool = False,
     both: bool = False,
     mark: str = "*",
+    expected: bool = False,
 ) -> list[tuple[str, str]]:
     """``(column, note)`` for every column of the ``--prob-plan`` table
     that is shown: what its numbers mean, in one sentence each.
@@ -1815,7 +1932,8 @@ def plan_notes(
     probability ``level``; ``report`` is the report costs came from
     (``None``: no cost column). ``gated``: some case has a pass-rate
     gate; ``latency``: some case has a latency gate; ``both``: some
-    case has both, so its power cells carry ``mark``.
+    case has both, so its power cells carry ``mark``; ``expected``: the
+    table has the ``expected runs`` column (``--prob-stop=sequential``).
     """
     sure = _pct_bar(power)
     rate = _pct_bar(assume)
@@ -1888,6 +2006,16 @@ def plan_notes(
                 " for a latency gate, for the same reason.",
             ),
         ]
+    if expected:
+        notes.append(
+            (
+                "expected runs",
+                "Runs the case would use on average with --prob-stop=sequential,"
+                f" if it really passes {rate} of its runs: it stops as soon as its"
+                " range is clear of the bar, so runs is the most it may use. The"
+                " gate columns above are for that stopping rule too.",
+            )
+        )
     if both:
         notes.append(
             (

@@ -266,6 +266,34 @@
   40 xfailed`), and `-x` stops at the first failed gate.
   `--prob-no-gate-items` / `prob_gate_items = false` leaves them out.
   Ungated suites and `--prob-plan` are unchanged.
+- **Sequential stopping:** `--prob-stop=sequential` (or `prob_stop =
+  sequential`) judges each rate gate that can stop on an anytime-valid
+  confidence sequence and stops the case as soon as it is entirely
+  above the bar (PASS) or below it (FAIL), or as UNDECIDED once neither
+  can happen within its planned runs; the run count becomes the most a
+  case may use. The sequence is the beta-binomial mixture boundary
+  with a Jeffreys Beta(½, ½) mixing prior (`stats.confidence_sequence`,
+  standard library only): the chance it ever leaves out the true rate,
+  checked after every run, is at most 1 − `prob_confidence` — 3.7% at
+  95% worked out exactly over every path of 2,000 runs, where a 95%
+  Clopper-Pearson interval checked the same way leaves it out 46% of
+  the time. A case that reaches its budget is judged on the sequence
+  there too, never on a fixed-run interval. The price is width (about
+  1.6 times Clopper-Pearson at 100 runs; 53 straight passes clear a
+  90% bar, against 36), so clear cases stop much sooner and borderline
+  ones take longer. Count gates are curtailed, as under `curtail`;
+  cases that can't stop (comparison margin, `--prob-margin`, latency
+  gate) and every case under xdist without `--dist loadgroup` keep
+  their fixed-run interval and run every run. A row judged by a
+  sequence shows its interval tagged `seq` (main table, gates block,
+  gate items, `--prob-explain`), skipped runs read `decided after
+  53/100 runs (PASS, sequential)`, and averages, metrics and
+  comparisons over stopped cases are hidden as under curtailment.
+  **JSON:** `stopping.mode` is `"sequential"`, and such a row's `ci` and
+  `gate` have `method` `"sequential"` (the gate's `prior` is the mixing
+  prior). `--prob-explain` explains the stop and the `seq` interval,
+  and `--prob-plan` plans sequential gates by their stopping rule, with
+  an `expected runs` column. Without the option nothing changes.
 
 ## 0.2.0 (2026-07-08)
 
