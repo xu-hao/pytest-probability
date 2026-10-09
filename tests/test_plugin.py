@@ -380,6 +380,170 @@ def bench_check(word):
     assert data["records"][0]["message"] is None
 
 
+# ---------------------------------------------------------------------------
+# Traceback trimming
+# ---------------------------------------------------------------------------
+
+BENCH_CHAIN = """
+import pytest
+
+def inner(x):
+    raise ValueError(f"bad {x}")
+
+def outer(x):
+    return inner(x)
+
+@pytest.mark.parametrize("word", ["deep"])
+def bench_chain(word):
+    outer(word)
+"""
+
+
+def _needs_xfail_tb():
+    # --xfail-tb arrived in pytest 8.3.
+    if tuple(int(p) for p in pytest.__version__.split(".")[:2]) < (8, 3):
+        pytest.skip("--xfail-tb needs pytest 8.3")
+
+
+def _no_internal_frames(result):
+    # Nothing from pytest, pluggy or the plugin between the failures
+    # header and the probability summary.
+    out = result.stdout.str()
+    shown = out.split("FAILURES =", 1)[1].split("= probability =", 1)[0]
+    for internal in ("_pytest", "pluggy", "pytest_probability"):
+        assert internal not in shown, internal
+
+
+def test_failing_run_traceback_starts_at_the_bench_function(pytester):
+    pytester.makepyfile(
+        bench_rw="""
+def bench_check():
+    answer = "other"
+    expected = "pii"
+    assert answer == expected
+"""
+    )
+    result = pytester.runpytest()
+    result.assert_outcomes(failed=1)
+    # like a failing test_*: the bench body, then the assert's details
+    result.stdout.fnmatch_lines(
+        [
+            "*_ case: check _*",
+            "",
+            "    def bench_check():",
+            '        answer = "other"',
+            '        expected = "pii"',
+            ">       assert answer == expected",
+            "E       AssertionError: assert 'other' == 'pii'",
+        ],
+        consecutive=True,
+    )
+    result.stdout.fnmatch_lines(["bench_rw.py:4: AssertionError"])
+    _no_internal_frames(result)
+
+
+def test_errored_run_keeps_helper_frames(pytester):
+    pytester.makepyfile(bench_chain=BENCH_CHAIN)
+    result = pytester.runpytest()
+    result.assert_outcomes(failed=1)
+    # starts at the bench function, keeps what it called; under
+    # --tb=auto the middle frame is one line, as for test_*
+    result.stdout.fnmatch_lines(
+        [
+            "    def bench_chain(word):",
+            ">       outer(word)",
+            "bench_chain.py:11: ",
+            "*_ _ _*",
+            "bench_chain.py:7: in outer",
+            "    return inner(x)",
+            "*",
+            "    def inner(x):",
+            '>       raise ValueError(f"bad {x}")',
+            "E       ValueError: bad deep",
+            "bench_chain.py:4: ValueError",
+        ]
+    )
+    _no_internal_frames(result)
+
+
+def test_tb_long_shows_middle_frames_in_full(pytester):
+    pytester.makepyfile(bench_chain=BENCH_CHAIN)
+    result = pytester.runpytest("--tb=long")
+    result.stdout.fnmatch_lines(["    def outer(x):", ">       return inner(x)"])
+    _no_internal_frames(result)
+
+
+def test_fulltrace_shows_the_whole_traceback(pytester):
+    pytester.makepyfile(bench_chain=BENCH_CHAIN)
+    result = pytester.runpytest("--fulltrace")
+    result.stdout.fnmatch_lines(
+        ["*_pytest*runner.py:*", "*plugin.py:*", "bench_chain.py:4: ValueError"]
+    )
+
+
+def test_wrapped_bench_function_drops_internal_frames(pytester):
+    # A decorator without functools.wraps hides the function: the
+    # wrapper's frame stays, pytest's and the plugin's go.
+    pytester.makepyfile(
+        bench_w="""
+def deco(f):
+    def wrapper():
+        return f()
+    return wrapper
+
+@deco
+def bench_wrapped():
+    assert 1 == 2
+"""
+    )
+    result = pytester.runpytest()
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(
+        ["    def wrapper():", "*", "    def bench_wrapped():", ">       assert 1 == 2"]
+    )
+    _no_internal_frames(result)
+
+
+def test_xfail_tb_traceback_is_trimmed(pytester):
+    _needs_xfail_tb()
+    # one of the 40 runs fails; the gate (min_rate=0.9) makes it an xfail
+    pytester.makepyfile(bench_g=_gated(cases=(("close", 39),)))
+    result = pytester.runpytest("--prob-runs=40", "--xfail-tb")
+    result.assert_outcomes(passed=39, xfailed=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*= XFAILURES =*",
+            "*",
+            "    def bench_classify(case, k):",
+            "*",
+            ">       assert _calls[case] <= k, f\"wrong answer for {case}\"",
+        ]
+    )
+    _no_internal_frames(result)
+
+
+def test_failing_runs_render_about_as_fast_as_failing_tests(pytester):
+    # Rendering every pytest and pluggy frame of a failing run made it
+    # ~25x slower than a failing test_*; trimmed, they're on par.
+    pytester.makepyfile(bench_t="def bench_t():\n    assert 1 == 2\n")
+    pytester.makepyfile(
+        test_t="import pytest\n"
+        "@pytest.mark.parametrize('i', range(50))\n"
+        "def test_t(i):\n    assert 1 == 2\n"
+    )
+
+    def timed(*args):
+        start = time.perf_counter()
+        result = pytester.runpytest(*args)
+        result.assert_outcomes(failed=50)
+        return time.perf_counter() - start
+
+    timed("test_t.py")  # warm up imports and caches
+    bench = min(timed("bench_t.py", "--prob-runs=50") for _ in range(2))
+    plain = min(timed("test_t.py") for _ in range(2))
+    assert bench < 4 * plain + 0.5, (bench, plain)
+
+
 def test_legacy_generator_bench_errors_loudly(pytester):
     pytester.makepyfile(bench_legacy=BENCH_OLD_GENERATOR)
     result = pytester.runpytest()
@@ -1416,8 +1580,7 @@ def test_failing_runs_are_xfailed_with_reason(pytester):
 
 
 def test_xfailed_runs_keep_their_traceback(pytester):
-    if int(pytest.__version__.split(".")[0]) < 8:
-        pytest.skip("--xfail-tb needs pytest 8")
+    _needs_xfail_tb()
     pytester.makepyfile(bench_g=_gated(cases=(("close", 39),)))
     result = pytester.runpytest("--prob-runs=40", "--xfail-tb")
     result.stdout.fnmatch_lines(
@@ -1749,8 +1912,7 @@ def test_regular_suite_unchanged_by_global_gate(pytester):
 # any process and xdist may spread them however it likes. classify's 12
 # cases fail when i % 3 == 0 (8 of 12 pass), small's 6 when i < 3: so
 # classify gets a line (12 ≥ 10 inputs), small doesn't (6), and Overall
-# (18) does. Few failing runs on purpose: rendering their tracebacks is
-# what makes a pytester run slow.
+# (18) does. Few failing runs on purpose: each renders a traceback.
 BENCH_AGG = """
 import pytest
 

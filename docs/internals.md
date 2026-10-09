@@ -183,6 +183,27 @@ around every item — including ours — so bare asserts report operands
 and diffs exactly as in `test_*.py`. `--assert=plain` and a
 `PYTEST_DONT_REWRITE` docstring opt out, matching pytest.
 
+**Traceback filtering** trims a failing run's traceback the way
+pytest's `Function` item trims a `test_*`'s. `Node._repr_failure_py`
+passes the item's `_traceback_filter` to `getrepr()`; the base
+`Node` returns the traceback unchanged, which used to show every
+runner, pluggy and `runtest()` frame above the bench body (and
+rendering them cost ~70 ms per failing run). `BenchItem` overrides it:
+the traceback starts at the first frame whose code object *is* the
+bench function's (`inspect.unwrap(bench_fn).__code__` — we compiled
+the module ourselves, so identity is exact and needs no path or line
+matching). When no frame matches (a decorator without
+`functools.wraps`), it drops pytest's frames with pytest's own
+`_pytest._code.code.filter_traceback` and drops `runtest()`'s frame.
+Then `__tracebackhide__` frames go, and under `--tb=auto` the middle
+frames are shown one line each. `--fulltrace` returns everything. The
+same filter serves failed and errored runs and gated xfails under
+`--xfail-tb`, since their longrepr is built before the makereport
+wrapper relabels them. `_traceback_filter` and `filter_traceback` are
+the second deliberate use of pytest internals (both since 7.4, our
+minimum): the import is guarded, and any exception while trimming
+falls back to the full traceback, the old output.
+
 The inter-run delay also lives at the top of `runtest()`. A
 `StashKey[bool]` on `config` marks "the first benchmark item already
 ran", so the sleep happens strictly *between* executions. Being
@@ -767,3 +788,7 @@ down and users rely on:
     Intervals and p-values over a stopped case are suppressed, never
     shown. Without `--prob-stop=curtail` nothing changes: no marks, no
     skips, `stopped` is `null` in rows and 0 elsewhere.
+18. A failing run's traceback starts at the bench function and keeps
+    every frame it called, as a failing `test_*`'s does; `--fulltrace`
+    shows the whole traceback. Trimming never changes an outcome, a
+    record or the JSON report's failure message.
