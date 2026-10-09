@@ -1,6 +1,6 @@
 [project]
 name = "pytest-probability"
-version = "0.2.0"
+version = "0.3.0"
 description = "pytest plugin for nondeterministic tests: run cases N times, report empirical pass fractions, flaky detection, and cost."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-09)
 
 - **Visible output change:** with more than one run, every summary row
   now shows a 95% interval for the case's pass probability between the

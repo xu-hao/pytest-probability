@@ -31,7 +31,7 @@ point — there is nothing to enable. Two quick checks:
 $ pytest --version -v
 ...
 registered plugins:
-  probability-0.2.0 at .../pytest_probability/plugin.py
+  probability-0.3.0 at .../pytest_probability/plugin.py
 ```
 
 ```text
@@ -43,7 +43,7 @@ $ pytest --help | grep -A2 prob-runs
 The header of every test session also lists it:
 
 ```text
-plugins: probability-0.2.0
+plugins: probability-0.3.0
 ```
 
 ## Disabling the plugin
