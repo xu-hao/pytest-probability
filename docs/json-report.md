@@ -196,13 +196,13 @@ Top level:
 | `total` | `int` | All three counts summed |
 | `pass_rate` | `float` | `passes / total * 100` |
 | `status` | `str` | `"pass"`, `"flaky"`, `"errored"`, `"fail"`, or `"error"` — see the status table in {doc}`reference` |
-| `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal. Always the session's method and level over every run, even for a gated row |
+| `ci` | object | Interval on the pass probability: `method`, `level`, and unrounded `low`/`high` in [0, 1]. Always present, even for single-run rows and under `--prob-no-intervals`, which only affect the terminal. Always the session's method and level over every run, even for a gated row — except a row judged by a confidence sequence (`--prob-stop=sequential`), whose `ci` is that sequence over every run: `method` `"sequential"`, at its gate's level |
 | `gate` | object \| `null` | The case's gate and its verdict (below); `null` for an ungated case |
 | `latency` | object | A quantile of the case's run times, its interval and, with `max_latency`, the latency gate's verdict (below). Always present, with or without `--prob-latency` |
 | `cost` | `float` | Summed run cost across runs |
 | `usage` | object | Per-model token aggregate: `{model: {input_tokens, output_tokens, cached_input_tokens, cost}}` |
 | `metrics` | object | One entry per `--prob-metric`, keyed by its name (`"pass^3"`, `"pass@5"`), in option order: the case's unbiased estimate in [0, 1], or `null` when the case has fewer than k runs. `{}` without `--prob-metric` |
-| `stopped` | object \| `null` | How the case stopped early under `--prob-stop=curtail` (below); `null` when it ran every run |
+| `stopped` | object \| `null` | How the case stopped early under `--prob-stop` (below); `null` when it ran every run |
 | `explanation` | `str` | Only with `--prob-explain`: a plain-language reading of the row (its fraction and the `ci` interval), paragraphs separated by `\n`. A gated row's next step is in `gate.explanation` instead |
 
 `rows[].gate` — present when the case is gated (see Gates in
@@ -212,7 +212,7 @@ Top level:
 |---|---|---|
 | `rule` | `str` | `"rate"` (judge the interval against `min_rate`) or `"count"` (passes ≥ `min_passes`) |
 | `min_rate` / `min_passes` | `float` / `int` | The bar; only the one for `rule` is present |
-| `confidence` / `method` / `prior` | | The settings of the gate's interval: the session's, or the marker's overrides |
+| `confidence` / `method` / `prior` | | The settings of the gate's interval: the session's, or the marker's overrides. Under `--prob-stop=sequential` a rate gate that can stop has `method` `"sequential"` — its interval is the anytime-valid confidence sequence at `confidence` — and `prior` the sequence's mixing prior, `[0.5, 0.5]` |
 | `errors` | `str` | `prob_errors`: `"count"` or `"exclude"` |
 | `runs` | `int` | The case's planned run count |
 | `passes` / `total` | `int` | The gate's sample: errored runs are left out of `total` under `exclude` |
@@ -245,11 +245,13 @@ worked out from the report itself.
 
 `rows[].stopped` — present when the case stopped early (see Early
 stopping in {doc}`reference`). The row's counts, `ci`, `gate` and
-`metrics` are those of the runs that ran:
+`metrics` are those of the runs that ran. A case whose `gate.method`
+is `"sequential"` was stopped by its confidence sequence; any other by
+curtailment:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `after` | `int` | The case's runs (including any that skipped themselves) when its verdict settled |
+| `after` | `int` | The case's runs (including any that skipped themselves) when its verdict was decided |
 | `planned` | `int` | The case's runs in the session, after `-k`/`-m` |
 | `skipped` | `int` | Runs skipped because of the stop: `planned − after` |
 | `verdict` | `str` | The verdict it settled on; always equal to `gate.verdict` |
@@ -272,11 +274,11 @@ Overall always is, even when the terminal leaves it out:
 | `resamples` / `seed` | `int` | The bootstrap's settings |
 | `resampling_unit` | `str` | Always `"input"`: whole cases are resampled, keeping all their runs |
 | `note` | `str` | Always `"inputs treated as a sample"`: the interval allows for a different set of inputs; for a hand-picked suite it measures the cases chosen, not a wider population |
-| `suppressed` | `str \| null` | Why there is no interval: `"fewer than 10 inputs"`, or `"3 cases stopped early"` (`--prob-stop=curtail`); `null` when there is one |
+| `suppressed` | `str \| null` | Why there is no interval: `"fewer than 10 inputs"`, or `"3 cases stopped early"` (`--prob-stop`); `null` when there is one |
 | `icc` | `float \| null` | ρ, the intraclass correlation of the runs' pass/fail outcomes (one-way ANOVA, adjusted for unequal run counts, clipped to [0, 1]): 0 when an input's runs vary as much as runs of different inputs, 1 when every run of an input gives the same result. `null` when every case ran once, or every run passed or every run failed. Computed even when `suppressed` |
 | `width_factor` | `float \| null` | √((1 + (k − 1)ρ)/k), with k the harmonic mean of the run counts: how much one input's runs pin down its pass rate compared with a single run (1/√k at ρ = 0, 1 at ρ = 1). The interval's width scales with `width_factor`/√N, so doubling the runs changes it by `width_factor(2k)/width_factor(k)` and doubling the inputs by 1/√2. `null` with `icc` |
 | `metrics` | object | One entry per `--prob-metric`, keyed by its name, in option order (below); `{}` without `--prob-metric` |
-| `stopped` | `int` | Cases that stopped early under `--prob-stop=curtail`: with any, `ci` and `normal_ci` are `null` (the estimate, `icc` and `width_factor` stay, as data, but lean toward those cases' verdicts) |
+| `stopped` | `int` | Cases that stopped early under `--prob-stop`: with any, `ci` and `normal_ci` are `null` (the estimate, `icc` and `width_factor` stay, as data, but lean toward those cases' verdicts) |
 | `explanation` | `str` | Only with `--prob-explain`: the line in plain language, ending with a `Next:` line |
 
 `aggregates[].metrics[name]` — a metric (see Metrics in {doc}`reference`) over
@@ -322,7 +324,7 @@ Comparisons in {doc}`reference`):
 | `resamples` / `seed` | `int` | The bootstrap's and the Monte Carlo sign-flip test's settings |
 | `cost_ratio` | `float \| null` | The arm's recorded cost per run over the baseline's, on the paired inputs; `null` unless both recorded cost |
 | `inputs` | array | One entry per paired input, sorted by id: `input`, `baseline` and `arm` as `{passes, total}`, `difference`, a Newcombe `ci`, a Fisher `p` (never adjusted) |
-| `stopped` | `int` | Paired cases of the arm or the baseline that stopped early under `--prob-stop=curtail`: with any, `ci`, `p`, `p_method`, `exact` and `p_adjusted` are `null` and the comparison leaves the adjustment's family; `difference` and `inputs` stay, as data |
+| `stopped` | `int` | Paired cases of the arm or the baseline that stopped early under `--prob-stop`: with any, `ci`, `p`, `p_method`, `exact` and `p_adjusted` are `null` and the comparison leaves the adjustment's family; `difference` and `inputs` stay, as data |
 | `explanation` | `str` | Only with `--prob-explain`: the comparison in plain language |
 
 Inputs are sorted by id and the bootstrap and sign-flip test are
@@ -405,7 +407,7 @@ without pytest-xdist.
 | `usage` | array | Raw `record_usage` entries, in call order |
 
 Cases deselected with `-k`/`-m`, and runs that never
-executed (e.g. after `-x`, or skipped by `--prob-stop=curtail`), are
+executed (e.g. after `-x`, or skipped by `--prob-stop`), are
 absent — the report describes what actually ran.
 
 `stopping` — early stopping (see Early stopping in {doc}`reference`),
@@ -413,7 +415,7 @@ always present:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `mode` | `str` | `--prob-stop`: `"off"` or `"curtail"` |
+| `mode` | `str` | `--prob-stop`: `"off"`, `"curtail"` or `"sequential"` |
 | `active` | `bool` | Whether cases could stop early in this session: `false` when off, and under pytest-xdist without `--dist loadgroup` |
 | `cases` | `int` | Cases that stopped early |
 | `runs_skipped` | `int` | Runs skipped because of a stop, summed over `rows[].stopped.skipped` |
@@ -483,12 +485,21 @@ jq '.comparisons[] | {function, arm, baseline, pairs, difference,
     low: .ci.low, high: .ci.high, p: .p_adjusted, verdict}' report.json
 ```
 
-See what `--prob-stop=curtail` saved, and where:
+See what `--prob-stop` saved, and where:
 
 ```bash
 jq '.stopping, [.rows[] | select(.stopped)
     | {case, verdict: .stopped.verdict, after: .stopped.after,
        planned: .stopped.planned}]' report.json
+```
+
+Under `--prob-stop=sequential`, list the cases judged by a confidence
+sequence, with the interval each verdict came from:
+
+```bash
+jq '.rows[] | select(.gate.method == "sequential")
+    | {case, passes, total, low: .gate.low, high: .gate.high,
+       verdict: .gate.verdict, after: .stopped.after}' report.json
 ```
 
 Pull the flaky rows with `jq`:

@@ -64,6 +64,18 @@ the rest were skipped. The verdict is the one all 40 runs would give.
 The case's fraction can lean toward its verdict, so averages and
 comparisons over such cases are hidden.
 
+**seq.** With `--prob-stop=sequential` a case stops as soon as its
+range is clear of the bar, and the range it is judged on is marked
+`seq`. An ordinary range is only trustworthy for a number of runs fixed
+in advance: check it after every run and stop when it looks good, and
+luck gets many chances to fool you. A `seq` range is built to hold
+however often it is checked, so stopping early is safe. The price is
+width: it is wider than an ordinary range from the same runs (about 1.6
+times at 100 runs), so a case near its bar needs more runs, while one
+far from it stops much sooner. `53/53 [90%, 100%] seq` against a 90%
+bar is a PASS after 53 runs; with an ordinary range 36 would do, but
+only if you had decided on 36 in advance.
+
 **p95 and the latency range.** A latency quantile: p95 is the run time
 that 95% of runs finish within. Every run counts, failed ones too. The
 range is where the true value probably falls; a dash marks an end that
@@ -282,6 +294,55 @@ are hidden, with a note. If you need those numbers, run without
 curtailment. Decide before the run: stopping early *because the
 result looks good* is a different thing, and this option doesn't do it.
 
+### Sequential stopping
+
+`--prob-stop=sequential` does stop early because the result looks
+good — with an interval made for it. Each pass-rate gate is judged on
+a *confidence sequence* (`seq`), and the case stops as soon as that is
+entirely above or below the bar; the run count becomes the most it may
+use.
+
+- **Why not an ordinary interval.** A 95% interval promises to miss
+  the truth 5% of the time for one look at a run count fixed in
+  advance. Look after every run and each look is another chance to
+  miss: over 300 runs a 95% Clopper-Pearson interval leaves out the
+  true rate at some point about a third of the time. Stopping at that
+  point is how a coin that is really 50/50 gets declared biased.
+- **What `seq` promises.** The chance that it *ever* leaves out the
+  true rate, however many runs you look at, is at most 1 −
+  `prob_confidence`. So the verdict is as trustworthy at run 23 as at
+  run 400, and a case can stop the moment it is clear. Worked out
+  exactly over every path of 2,000 runs, the chance stays under 3.7% at
+  95% (the bound is 5%); a fixed-run interval's is 46%.
+- **What it costs.** Width: about 1.2 times an ordinary interval at 10
+  runs, 1.6 times at 100, 1.8 times at 1,000. A case far from its bar
+  stops much sooner (a case that always passes clears 90% after 53
+  runs, where curtailment over 100 runs needs 96); a case near its bar
+  needs more runs than a fixed count would, or ends UNDECIDED. Plan
+  with `--prob-plan`, whose `expected runs` column shows the average.
+- **At the end of the budget** the verdict still comes from `seq`:
+  UNDECIDED if it straddles the bar, even if an ordinary interval over
+  the same runs would decide. Switching intervals at the end would undo
+  the promise.
+- **What it rests on:** the same assumption as every interval here —
+  runs of a case are independent and pass with one fixed probability.
+  Under `prob_errors = exclude`, an errored run is simply not counted,
+  which assumes errors don't depend on whether the run would have
+  passed.
+- A count bar (`min_passes`) is decided by a count over all its runs,
+  so it is curtailed as under `curtail`. As there, a stopped case's
+  fraction leans toward its verdict and averages over it are hidden;
+  `seq` itself allows for the stop.
+
+How it is built: after x passes in n runs, `seq` holds every rate p
+for which a fair bet against p, started at 1 and placed run by run on
+the outcomes a Beta(½, ½) mixture of rates predicts, has not yet grown
+to 1/α (20 at 95%). A fair bet reaches 20 with probability at most 1
+in 20, ever (Ville's inequality). The mixture is fixed — Jeffreys',
+symmetric and the best in the worst case — so there is nothing to tune
+after seeing the data. Details in Sequential stopping in
+{doc}`reference`.
+
 ## Latency
 
 A latency gate (`max_latency=2.0`) judges a quantile of the run times
@@ -354,7 +415,8 @@ When you quote a result, include what a reader needs to judge it:
 - [ ] Whether the analysis was **exploratory or confirmatory**: the
       bar, margin and arms were chosen before looking at the results.
 - [ ] Any **errors** and how they were treated (`prob_errors`), and
-      cases that **stopped early**.
+      cases that **stopped early** — with which `--prob-stop`: a
+      sequential verdict is read off `seq`, not a fixed-run interval.
 
 The JSON report holds all of these (`stats_config`, `aggregates[]`,
 `comparisons[]`), so quote from it, not from memory.
@@ -376,3 +438,9 @@ The statistical design is inspired by and informed by:
 - Chen et al., [pass@k](https://arxiv.org/abs/2107.03374) (2021)
 - Yao et al., [τ-bench pass^k](https://arxiv.org/abs/2406.12045) (2024)
 - Turner & Grünwald, [anytime-valid inference](https://arxiv.org/abs/2203.09785)
+- H. Robbins, Statistical methods related to the law of the iterated
+  logarithm (1970): the method of mixtures behind the sequential
+  interval.
+- Howard, Ramdas, McAuliffe & Sekhon, [Time-uniform, nonparametric,
+  nonasymptotic confidence sequences](https://arxiv.org/abs/1810.08240)
+  (2021): beta-binomial mixture boundaries.

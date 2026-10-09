@@ -299,6 +299,22 @@ fraction leans toward its verdict, so function-level, metric and
 comparison intervals over it are hidden, with a note. Under xdist it
 needs `--dist loadgroup`, so that one worker runs all of a case's runs.
 
+`--prob-stop=sequential` goes further: it stops a pass-rate gate as
+soon as the case is clearly above or below its bar, judged on an
+interval that stays valid however often it is checked (marked `seq`),
+and the run count becomes the most a case may use:
+
+```
+$ pytest benchmarks/ --prob-stop=sequential     # min_rate=0.9, runs=100
+...
+  classify::solid  53/53  [90%, 100%] seq  decided after 53/100
+  classify::weak   45/60  [55%,  90%] seq  FLAKY  decided after 60/100
+```
+
+That interval is wider than a fixed-run one, so clear cases stop much
+sooner (53 runs here, 96 under curtailment) while borderline ones take
+longer; `--prob-plan` shows the trade-off before you spend anything.
+
 ## Options
 
 | Option | Where | Default | Meaning |
@@ -325,7 +341,7 @@ needs `--dist loadgroup`, so that one worker runs all of a case's runs.
 | `--prob-baseline=PATH` | CLI | none | compare every function with an earlier `--prob-json` report, pairing cases by id |
 | `--prob-margin=MARGIN` | CLI | none (report only) | with `--prob-baseline`: fail a function whose pass rate may have dropped by more than MARGIN |
 | `--prob-latency` | CLI | ini or off | show each case's latency quantile and its interval |
-| `--prob-stop={off,curtail}` | CLI | ini or `off` | `curtail`: skip a gated case's remaining runs once its verdict can no longer change (same verdicts; under xdist needs `--dist loadgroup`) |
+| `--prob-stop={off,curtail,sequential}` | CLI | ini or `off` | `curtail`: skip a gated case's remaining runs once its verdict can no longer change (same verdicts); `sequential`: judge rate gates on an anytime-valid interval and stop as soon as it clears or falls below the bar (`runs` becomes a maximum). Under xdist both need `--dist loadgroup` |
 | `--prob-no-gate-items` | CLI | ini or added | don't add a `[gate]` item per gated case (and `[compare:ARM]`/`[baseline]` per margin) carrying its verdict into `-v`, JUnit XML and `--lf` |
 | `prob_delay` | ini | 0 | default for `--prob-delay` |
 | `prob_transpose` | ini | false | default for `--prob-transpose` |

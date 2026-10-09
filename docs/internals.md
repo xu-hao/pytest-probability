@@ -45,10 +45,11 @@ pytest_runtest_makereport      (hookwrapper)
   └─ gated case, margin comparison, or baseline case under
      --prob-margin: report a failing run as xfailed
 
-Curtailer                      (--prob-stop=curtail; registered in
-  │                             pytest_configure where items run)
+Curtailer                      (--prob-stop=curtail or sequential;
+  │                             registered in pytest_configure where
+  │                             items run)
   └─ pytest_runtest_protocol:  tally each case's runs; once
-                               Gate.settled() names a verdict, skip
+                               Gate.decided() names a verdict, skip
                                the rest (skip mark + probability_stop)
 
 VerdictItem.runtest()          (GateItem, MarginItem)
@@ -789,6 +790,80 @@ column notes in `explain.py` (`plan_notes()`, `render_notes()`).
   print a note in its place. The explain readings take the `Stop`
   (`gate_reading`, `row_reading`) or read `stopped` off the objects.
 
+### Sequential stopping
+
+`--prob-stop=sequential` (issue #14) reuses all of the above — the
+`StopConfig`, the `Curtailer`, the loadgroup grouping and warning, the
+`Stop`s, the suppression — and changes what judges a stoppable rate
+gate:
+
+- **The interval:** `stats.confidence_sequence(x, n, level, prior)` —
+  every p whose beta-binomial mixture wealth
+  `stats.mixture_log_wealth` (log B(a + x, b + n − x) − log B(a, b) −
+  x log p − (n − x) log(1 − p)) is below log(1/α). Under p the wealth
+  is a nonnegative martingale from 1, so by Ville's inequality the
+  chance the interval ever leaves p out is at most α, over every run.
+  The mixing prior is fixed, `stats.SEQUENCE_PRIOR` = Jeffreys'
+  (½, ½). Each bound is a root of the log wealth in the log-odds,
+  where it is convex: a doubling search brackets it from the observed
+  rate and Newton's method converges from the outside without
+  overshooting (`_sequence_low`; the upper bound is the mirrored lower
+  one). `x = n` has a closed form. It is reached as the method
+  `"sequential"` of `stats.proportion_interval`, which `--prob-method`
+  and `method=` don't accept (`stats.METHODS` is unchanged;
+  `stats.INTERVALS` adds it).
+- **The gate:** at collection, where `stop_config().curtails` (the
+  process that runs and stops the case) and the mode is sequential,
+  `BenchFunction.collect()` replaces each stoppable rate gate
+  (`_stoppable()`, the test `BenchItem.curtailable` uses) by
+  `Gate.as_sequential()`: its `StatsConfig` gets method `"sequential"`
+  and the Jeffreys prior, keeping its level. So `to_record()` ships
+  `method: "sequential"` to the controller, `Gate.judge()` is still
+  the only place its interval is made, and everything built on
+  `verdict()` — `min_runs()`, `cutoffs()`, `settled()`, the
+  feasibility warning, `runs_to_settle()` — follows. A worker under
+  `--dist load` doesn't curtail, so its gates stay fixed-run, matching
+  the warning's "every case runs all its runs". Count gates keep their
+  rule and are curtailed.
+- **The rule:** `Gate.decided(passes, fails, errors, remaining)` is what
+  the `Curtailer` asks after each run. A fixed-run gate answers with
+  `settled()`. A sequential gate answers with its verdict on the judged
+  runs when that is PASS or FAIL, else UNDECIDED when `settled()` says
+  UNDECIDED, else `None`. That reuse is sound because, with Jeffreys'
+  mixture and a level of at least `stats.SEQUENCE_MONOTONE_LEVEL`
+  (1 − e^(−½)), a pass never lowers either bound and a non-pass never
+  raises one: the bounds then lie between the mixture's prediction
+  (a + x)/(a + b + n) and 0 or 1, since t·KL(p̂ ‖ that prediction) < ½,
+  so the extremes over the remaining runs decide reachability at every
+  run, not just the last. Below that level a sequential gate only
+  stops on PASS or FAIL. Monotonicity in the pass count at a fixed run
+  count holds at any level (the log wealth is convex in x with its
+  minimum at x = np), which is what `cutoffs()`' bisection needs. A
+  stopped case's `STOP_KEY` property adds `"sequential": True`, the
+  skip reason `, sequential`, and `Stop` carries `sequential` and the
+  session's `mode` for the readings.
+- **Rows:** `ProbabilityAggregator._row_stats(s)` is the gate's
+  `StatsConfig` for a row with a sequential gate, else the session's;
+  the interval column, `rows[].ci` and the row reading use it, so such a
+  row shows its sequence over every run, and `_tag_sequential()` puts
+  `seq` after it (and after the gates block's interval), padding the
+  other rows.
+- **Planning:** for a sequential gate, `Gate.power(n, rate)` is the
+  chance it PASSes at some run up to n and `runs_for_power()` the first
+  n where that reaches the target — monotone in n, unlike a fixed
+  count's power — both from `_pass_chances()`, a forward pass over the
+  pass counts still running (the cutoffs keep them to a band) whose
+  cutoffs come from `_cutoff_walk()`, which searches each run count's
+  cutoffs from the last (`_first_true()`: gallop, then bisect).
+  `Gate.expected_runs(n, rate)` is the mean run count under
+  `decided()`, by the same pass; for a sequential gate it reads the
+  stops off the cutoffs instead of an interval per state.
+  `plan_rows(..., sequential=True)` adds `PlanRow.expected` and the
+  `expected runs` column. Both passes end once less than `_NEGLIGIBLE`
+  (1e-17) is still running. `tests/test_sequential.py` checks
+  `decided()` against every reachable state, and the planning numbers
+  against every path, for small run counts.
+
 ## Invariants worth preserving
 
 If you change the plugin, these are the properties the test suite pins
@@ -880,8 +955,10 @@ down and users rely on:
     (invariant 4), and the aggregator learns of them from their
     reports, so the output is the same with and without xdist.
     Intervals and p-values over a stopped case are suppressed, never
-    shown. Without `--prob-stop=curtail` nothing changes: no marks, no
-    skips, `stopped` is `null` in rows and 0 elsewhere.
+    shown. Without `--prob-stop` nothing changes: no marks, no skips,
+    `stopped` is `null` in rows and 0 elsewhere. (`--prob-stop=
+    sequential` stops count gates this way; its rate gates are
+    invariant 20.)
 18. A failing run's traceback starts at the bench function and keeps
     every frame it called, as a failing `test_*`'s does; `--fulltrace`
     shows the whole traceback. Trimming never changes an outcome, a
@@ -896,3 +973,13 @@ down and users rely on:
     without any of its runs it brings them back, never judging nothing.
     Ungated suites, `--prob-plan` and `--prob-no-gate-items` collect
     none, so their output is unchanged.
+20. A sequential gate's verdict is read off its confidence sequence and
+    nothing else: at the run it stopped at, or at its last run when it
+    never stopped — never a fixed-run interval, so the chance it ever
+    leaves out the true rate stays at most 1 − level. Its interval,
+    printed with `seq` wherever it appears, is a function of the
+    counts and the level only. Only stoppable rate gates of the
+    process that stops them are sequential (in-process, or a worker
+    under `--dist loadgroup`); other cases, and every case under
+    another `--dist`, are judged as without `--prob-stop`, and ungated
+    suites see no change but `stopping.mode`.

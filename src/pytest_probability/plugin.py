@@ -51,6 +51,11 @@ Design notes:
 - ``--prob-stop=curtail`` skips a gated case's remaining runs once
   ``Gate.settled()`` finds that no way they could go changes its
   verdict (``Curtailer``), so verdicts are those of running every run.
+- ``--prob-stop=sequential`` judges a stoppable rate gate on an
+  anytime-valid confidence sequence instead (``stats.confidence_sequence``),
+  so the same ``Curtailer`` can stop it as soon as that interval clears
+  or falls below the bar (``Gate.decided()``); ``runs`` is the most it
+  may use.
 """
 from __future__ import annotations
 
@@ -62,6 +67,7 @@ import functools
 import hashlib
 import importlib.util
 import inspect
+import itertools
 import json
 import math
 import re
@@ -353,8 +359,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         choices=STOP_MODES,
         help="curtail: skip a gated case's remaining runs once its verdict can"
-        " no longer change; the verdicts are the same as running every run"
-        " (default: prob_stop ini or off)",
+        " no longer change; the verdicts are the same as running every run."
+        " sequential: judge rate gates on an anytime-valid interval and stop"
+        " as soon as it clears or falls below the bar; runs= becomes a"
+        " maximum (default: prob_stop ini or off)",
     )
     group.addoption(
         "--prob-no-gate-items",
@@ -464,8 +472,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "prob_stop",
-        "Early stopping: off, or curtail (skip a gated case's remaining runs"
-        " once its verdict can no longer change)",
+        "Early stopping: off, curtail (skip a gated case's remaining runs"
+        " once its verdict can no longer change) or sequential (stop a rate"
+        " gate as soon as its anytime-valid interval clears the bar)",
         default="off",
     )
 
@@ -938,19 +947,23 @@ def latency_config(config: pytest.Config) -> LatencyConfig:
     return cfg
 
 
-STOP_MODES = ("off", "curtail")
+STOP_MODES = ("off", "curtail", "sequential")
 
 
 class CurtailmentWarning(pytest.PytestWarning):
-    """``--prob-stop=curtail`` can't stop cases early in this session:
-    under pytest-xdist it needs ``--dist loadgroup``."""
+    """``--prob-stop`` can't stop cases early in this session: under
+    pytest-xdist it needs ``--dist loadgroup``."""
 
 
 @dataclass(frozen=True)
 class StopConfig:
     """Early stopping, from ``--prob-stop``/``prob_stop``.
 
-    ``mode`` is ``"off"`` or ``"curtail"``. ``active`` says whether cases
+    ``mode`` is ``"off"``, ``"curtail"`` or ``"sequential"``. Under
+    ``sequential``, the stoppable rate gates this process collects are
+    judged by a confidence sequence (``Gate.as_sequential()``) and
+    count gates are curtailed; where stopping isn't active, gates stay
+    as they are and every run runs. ``active`` says whether cases
     can stop early in this session at all: in-process, or under
     pytest-xdist with ``--dist loadgroup``, which keeps all of a case's
     runs on one worker. ``curtails`` says whether *this* process decides
@@ -1084,6 +1097,24 @@ class Gate:
     errors: str = "count"
     runs: int = 1
 
+    @property
+    def sequential(self) -> bool:
+        """Whether the gate's interval is the anytime-valid confidence
+        sequence (``--prob-stop=sequential``) rather than a fixed-run
+        one: its ``stats.method`` is ``"sequential"``."""
+        return self.stats.method == stats.SEQUENTIAL
+
+    def as_sequential(self) -> Gate:
+        """This rate gate judged by the confidence sequence at its own
+        level: the sequence replaces its method, and its mixing prior
+        (Jeffreys) the Bayesian prior; ``confidence`` still applies."""
+        return dataclasses.replace(
+            self,
+            stats=dataclasses.replace(
+                self.stats, method=stats.SEQUENTIAL, prior=stats.SEQUENCE_PRIOR
+            ),
+        )
+
     def judge(
         self, passes: int, total: int
     ) -> tuple[tuple[float, float] | None, str]:
@@ -1191,7 +1222,16 @@ class Gate:
     def power(self, n: int, rate: float) -> float:
         """The chance that n runs give a PASS verdict when every run
         passes with probability ``rate``: the Binomial(n, rate)
-        probability of at least ``critical_passes(n)`` passes."""
+        probability of at least ``critical_passes(n)`` passes.
+
+        For a sequential gate, the chance that it PASSes within n runs —
+        at whichever run its interval first clears the bar, before it
+        falls below it (``_pass_chances``)."""
+        if self.sequential:
+            chance = 0.0
+            for _, (chance, _alive) in zip(range(n), self._pass_chances(rate)):
+                pass
+            return chance
         critical = self.critical_passes(n)
         if critical is None:
             return 0.0
@@ -1215,7 +1255,21 @@ class Gate:
         if self.rule == "rate" and rate <= self.min_rate:
             return None
         start = self.min_runs()
-        if start > cap or self.power(cap, rate) < target:
+        if start > cap:
+            return None
+        if self.sequential:
+            # The chance of a PASS within n runs only grows with n, and
+            # never past what is still running: the first n that reaches
+            # the target is the answer.
+            for n, (chance, alive) in zip(
+                range(1, cap + 1), self._pass_chances(rate)
+            ):
+                if chance >= target:
+                    return n
+                if chance + alive < target:
+                    return None
+            return None
+        if self.power(cap, rate) < target:
             return None
         critical = self.critical_passes(start)
         for n in range(start, cap + 1):
@@ -1279,6 +1333,128 @@ class Gate:
             return None
         return verdict
 
+    def decided(
+        self, passes: int, fails: int, errors: int, remaining: int
+    ) -> str | None:
+        """The verdict to stop the case on after these runs, or ``None``
+        to keep running — the rule ``--prob-stop`` applies after each run.
+
+        A fixed-run gate (a count gate, or any gate under ``curtail``)
+        stops once ``settled()``: when no remaining run could change its
+        verdict. A sequential gate stops as soon as its verdict on the
+        runs so far is PASS or FAIL — its interval is valid however early
+        it stops — and as UNDECIDED once neither is reachable within the
+        ``remaining`` runs. That last test is ``settled()``'s UNDECIDED:
+        the sequence's bounds move one way per run (see
+        ``stats.confidence_sequence``), so if every remaining run passing
+        can't reach PASS at the last run, it can't at any run before, and
+        likewise for FAIL. Below ``stats.SEQUENCE_MONOTONE_LEVEL`` that
+        isn't guaranteed, so such a gate only stops on PASS or FAIL.
+        """
+        if not self.sequential:
+            return self.settled(passes, fails, errors, remaining)
+        judged = passes + fails + (errors if self.errors == "count" else 0)
+        if judged:
+            verdict = self.verdict(passes, judged)
+            if verdict != UNDECIDED:
+                return verdict
+        if self.stats.level < stats.SEQUENCE_MONOTONE_LEVEL:
+            return None
+        if self.settled(passes, fails, errors, remaining) == UNDECIDED:
+            return UNDECIDED
+        return None
+
+    def _cutoff_walk(self) -> Iterator[tuple[int, int]]:
+        """``cutoffs(t)`` for t = 1, 2, ... in turn, each searched for
+        from the last: a run moves them by at most one when the bounds
+        move one way per run, so that is a couple of verdicts per t
+        rather than a bisection, and still exact when they don't (the
+        search gallops outward, then bisects)."""
+        pass_at, fail_at = 1, -1
+        for t in itertools.count(1):
+
+            def passes(x: int, t: int = t) -> bool:
+                return self.verdict(x, t) == PASS
+
+            def unfailed(x: int, t: int = t) -> bool:
+                return self.verdict(x, t) != FAIL
+
+            pass_at = _first_true(passes, t + 1, pass_at)
+            fail_at = _first_true(unfailed, t + 1, fail_at + 1) - 1
+            yield pass_at, fail_at
+
+    def _pass_chances(self, rate: float) -> Iterator[tuple[float, float]]:
+        """After each run t = 1, 2, ... of a sequential gate whose runs
+        each pass with probability ``rate``: the chance it has PASSed by
+        then, and the chance it is still running (neither PASS nor FAIL
+        yet). A forward pass over the pass counts still running, which
+        the cutoffs keep to a band around the bar; it ends once nothing
+        is still running — or so little that no number it feeds could
+        move (``_NEGLIGIBLE``). The budget doesn't enter: stopping as
+        UNDECIDED only stops runs that couldn't PASS within it anyway."""
+        alive = {0: 1.0}
+        passed = 0.0
+        for pass_at, fail_at in self._cutoff_walk():
+            step: dict[int, float] = {}
+            for x, w in alive.items():
+                step[x + 1] = step.get(x + 1, 0.0) + w * rate
+                step[x] = step.get(x, 0.0) + w * (1.0 - rate)
+            alive = {}
+            for x, w in step.items():
+                if not w:
+                    continue
+                if x >= pass_at:
+                    passed += w
+                elif x > fail_at:
+                    alive[x] = w
+            running = math.fsum(alive.values())
+            yield passed, running
+            if running < _NEGLIGIBLE:
+                return
+
+    def expected_runs(self, n: int, rate: float) -> float:
+        """The runs a case of n planned runs uses on average when each
+        passes with probability ``rate`` (none errors or skips) and it
+        stops as ``decided()`` says: Σ t · P(it stops after run t), by the
+        same forward pass as ``_pass_chances``. A sequential gate's stops
+        are read off the cutoffs — exactly ``decided()``, without an
+        interval per state."""
+        if n < 1:
+            return 0.0
+        final = self.cutoffs(n)
+        shortcut = self.stats.level >= stats.SEQUENCE_MONOTONE_LEVEL
+        walk = self._cutoff_walk() if self.sequential else itertools.repeat(None)
+        alive = {0: 1.0}
+        used = 0.0
+        for t, cut in zip(range(1, n + 1), walk):
+            step: dict[int, float] = {}
+            for x, w in alive.items():
+                step[x + 1] = step.get(x + 1, 0.0) + w * rate
+                step[x] = step.get(x, 0.0) + w * (1.0 - rate)
+            alive = {}
+            stopped = []
+            for x, w in step.items():
+                if not w:
+                    continue
+                if t == n:
+                    stops = True
+                elif cut is None:
+                    stops = self.decided(x, t - x, 0, n - t) is not None
+                else:
+                    stops = (
+                        x >= cut[0]
+                        or x <= cut[1]
+                        or (shortcut and final[1] < x and x + n - t < final[0])
+                    )
+                if stops:
+                    stopped.append(w)
+                else:
+                    alive[x] = w
+            used += t * math.fsum(stopped)
+            if math.fsum(alive.values()) < _NEGLIGIBLE:
+                break
+        return used
+
     def bar(self) -> str:
         """The bar as the gates block prints it: ``≥90%``, ``≥19 passes``."""
         if self.rule == "count":
@@ -1323,6 +1499,44 @@ class Gate:
             errors=rec["errors"],
             runs=rec["runs"],
         )
+
+
+# Below this chance of a case still running, the planning passes stop:
+# what is left can't move a chance or an expected run count it feeds.
+_NEGLIGIBLE = 1e-17
+
+
+def _first_true(holds: Callable[[int], bool], end: int, guess: int) -> int:
+    """The smallest x in [0, ``end``] at which ``holds`` — false below
+    it, true from it on, with ``end`` itself counted true unasked —
+    searched outward from ``guess``: galloping until the boundary is
+    bracketed, then bisecting."""
+
+    def test(x: int) -> bool:
+        return x >= end or holds(x)
+
+    x = min(max(guess, 0), end)
+    if test(x):
+        good, bad, step = x, -1, 1
+        while good - step >= 0:
+            if not test(good - step):
+                bad = good - step
+                break
+            good, step = good - step, 2 * step
+    else:
+        good, bad, step = end, x, 1
+        while bad + step < end:
+            if test(bad + step):
+                good = bad + step
+                break
+            bad, step = bad + step, 2 * step
+    while good - bad > 1:
+        mid = (good + bad) // 2
+        if test(mid):
+            good = mid
+        else:
+            bad = mid
+    return good
 
 
 @functools.lru_cache(maxsize=4096)
@@ -2141,6 +2355,10 @@ class BenchFunction(pytest.Collector):
                 f"{short}: invalid probability mark: {exc}"
             ) from None
         compares = planned[1] if planned else [None] * len(variants)
+        scfg = stop_config(self.config)
+        # --prob-stop=sequential, where this process decides the stops: a
+        # worker without --dist loadgroup runs every run, judged as usual.
+        sequential = scfg.mode == "sequential" and scfg.curtails
         plans: list[_CasePlan] = []
         for (variant_id, params, vmarks, _), compare in zip(variants, compares):
             # Unparametrized: one case, named after the function.
@@ -2160,6 +2378,15 @@ class BenchFunction(pytest.Collector):
                 raise self.CollectError(
                     f"{case}: invalid probability mark: {exc}"
                 ) from None
+            if (
+                sequential
+                and gate is not None
+                and gate.rule == "rate"
+                and _stoppable(self.config, case, gate, compare, latency)
+            ):
+                # This process can stop the case, so it is judged by the
+                # interval that stays valid when it does.
+                gate = gate.as_sequential()
             plans.append(
                 _CasePlan(
                     variant_id, params, vmarks, case, runs, gate, compare, latency
@@ -2280,6 +2507,29 @@ class BenchFunction(pytest.Collector):
 # ---------------------------------------------------------------------------
 
 
+def _stoppable(
+    config: pytest.Config,
+    case: str,
+    gate: Gate | None,
+    compare: dict[str, Any] | None,
+    latency: LatencySpec | None,
+) -> bool:
+    """Whether ``--prob-stop`` may stop a case early: it is gated, and
+    no other verdict needs every one of its runs — not its function's
+    comparison margin, not ``--prob-margin`` against a baseline, and not
+    a latency gate (``max_latency``), whose sample of run times skipped
+    runs would shrink. Being conservative keeps every other verdict the
+    one all the runs would give."""
+    if gate is None:
+        return False
+    if latency is not None and latency.gated:
+        return False
+    if compare and compare["margin"] is not None:
+        return False
+    baseline = baseline_of(config)
+    return not (baseline is not None and baseline.judges(case))
+
+
 def _usage_to_dict(u: Any) -> dict[str, Any]:
     """Normalize a usage entry (``TokenUsage``, any object with the same
     attributes, or a plain dict) into a serializable dict."""
@@ -2341,7 +2591,7 @@ class BenchItem(pytest.Item):
         # still fail the session unless a rate gate or a margin judges
         # the case.
         self.latency = latency
-        # The skip reason once --prob-stop=curtail has settled the case.
+        # The skip reason once --prob-stop has decided the case.
         self.stopped: str | None = None
 
     @property
@@ -2358,20 +2608,11 @@ class BenchItem(pytest.Item):
 
     @property
     def curtailable(self) -> bool:
-        """Whether ``--prob-stop=curtail`` may stop this case early: it is
-        gated, and no other verdict needs every one of its runs — not its
-        function's comparison margin, not ``--prob-margin`` against a
-        baseline, and not a latency gate (``max_latency``), whose sample
-        of run times skipped runs would shrink. Being conservative keeps
-        every verdict the one all the runs would give."""
-        if self.gate is None:
-            return False
-        if self.latency is not None and self.latency.gated:
-            return False
-        if self.compare and self.compare["margin"] is not None:
-            return False
-        baseline = baseline_of(self.config)
-        return not (baseline is not None and baseline.judges(self.case))
+        """Whether ``--prob-stop`` may stop this case early
+        (``_stoppable``)."""
+        return _stoppable(
+            self.config, self.case, self.gate, self.compare, self.latency
+        )
 
     def runtest(self) -> None:
         if self.stopped is not None:
@@ -2557,12 +2798,13 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
 
 
 # ---------------------------------------------------------------------------
-# Early stopping by curtailment
+# Early stopping: curtailment and sequential
 # ---------------------------------------------------------------------------
 
-# The user property a run skipped by curtailment carries: its case, the
-# runs that had run when the verdict settled, the case's planned runs
-# and that verdict.
+# The user property a run skipped by early stopping carries: its case,
+# the runs that had run when the verdict was decided, the case's planned
+# runs and that verdict — plus "sequential": True when its confidence
+# sequence decided it (--prob-stop=sequential).
 STOP_KEY = "probability_stop"
 
 
@@ -2587,14 +2829,16 @@ class _Tally:
 
 
 class Curtailer:
-    """``--prob-stop=curtail``: skip a gated case's remaining runs once
-    its verdict can no longer change.
+    """``--prob-stop``: skip a gated case's remaining runs once it is
+    decided — under ``curtail`` once its verdict can no longer change,
+    under ``sequential`` (for a rate gate) as soon as its confidence
+    sequence clears or falls below the bar.
 
     Registered only in a process that runs every run of each case it
     runs: in-process, or an xdist worker under ``--dist loadgroup``
     (each case is one ``xdist_group``). It tallies each case's runs as
     they finish, from the records they leave on ``user_properties``, and
-    asks ``Gate.settled()`` after every one; from then on the case's
+    asks ``Gate.decided()`` after every one; from then on the case's
     runs are skipped with a ``skip`` mark and a ``STOP_KEY`` property,
     so they are reported as skips — not samples — and the aggregator,
     wherever it runs, can count them.
@@ -2634,22 +2878,21 @@ class Curtailer:
             return
         if tally.decided is not None:
             verdict, after = tally.decided
+            how = ", sequential" if tally.gate.sequential else ""
             item.stopped = (
                 f"probability gate: decided after {after}/{tally.planned} runs"
-                f" ({verdict.upper()})"
+                f" ({verdict.upper()}{how})"
             )
-            item.user_properties.append(
-                (
-                    STOP_KEY,
-                    {
-                        "case": item.case,
-                        "run": item.run_id,
-                        "after": after,
-                        "planned": tally.planned,
-                        "verdict": verdict,
-                    },
-                )
-            )
+            stop = {
+                "case": item.case,
+                "run": item.run_id,
+                "after": after,
+                "planned": tally.planned,
+                "verdict": verdict,
+            }
+            if tally.gate.sequential:
+                stop["sequential"] = True
+            item.user_properties.append((STOP_KEY, stop))
             item.add_marker(pytest.mark.skip(reason=item.stopped))
         start = len(item.user_properties)
         yield
@@ -2666,7 +2909,7 @@ class Curtailer:
             else:
                 tally.fails += 1
         if tally.seen < tally.planned:
-            verdict = tally.gate.settled(
+            verdict = tally.gate.decided(
                 tally.passes, tally.fails, tally.errors, tally.planned - tally.seen
             )
             if verdict is not None:
@@ -2676,14 +2919,18 @@ class Curtailer:
 @dataclass
 class Stop:
     """A case that stopped early, as the aggregator rebuilds it from the
-    skipped runs' ``STOP_KEY`` properties: its verdict settled after
-    ``after`` of its ``planned`` runs, and ``skipped`` were skipped."""
+    skipped runs' ``STOP_KEY`` properties: its verdict was decided after
+    ``after`` of its ``planned`` runs, and ``skipped`` were skipped.
+    ``sequential``: its confidence sequence decided it, rather than
+    curtailment; ``mode`` is the session's ``--prob-stop``."""
 
     case: str
     after: int
     planned: int
     verdict: str
     skipped: int = 0
+    sequential: bool = False
+    mode: str = "curtail"
 
     def label(self) -> str:
         """``decided after 12/40``: the note on its rows."""
@@ -3855,7 +4102,11 @@ class PlanRow:
     ``latency`` is the case's latency gate (``None`` without one).
     ``min_runs`` is then the larger of the two gates' minimums; the
     power columns stay the rate gate's alone (``None`` without one),
-    since a latency gate's chance would need an assumed run time."""
+    since a latency gate's chance would need an assumed run time.
+
+    ``expected`` is set only under ``--prob-stop=sequential``, for gated
+    cases: ``Gate.expected_runs()`` at the assumed rate when the case can
+    stop, else its planned runs."""
 
     case: str
     runs: int
@@ -3865,6 +4116,9 @@ class PlanRow:
     power_runs: int | None = None
     chance: float | None = None
     cost_per_run: float | None = None
+    # Under --prob-stop=sequential: the runs a gated case would use on
+    # average at the assumed rate (its planned runs when it can't stop).
+    expected: float | None = None
 
     @property
     def cost(self) -> float | None:
@@ -3873,19 +4127,27 @@ class PlanRow:
         return self.cost_per_run * self.runs
 
 
-def plan_rows(items: Iterable[pytest.Item], pcfg: PlanConfig) -> list[PlanRow]:
+def plan_rows(
+    items: Iterable[pytest.Item], pcfg: PlanConfig, sequential: bool = False
+) -> list[PlanRow]:
     """The plan for the bench items that would run, one row per case
     in collection order. A gate's numbers don't depend on its planned
-    run count, so they are worked out once per distinct gate."""
+    run count, so they are worked out once per distinct gate; a
+    sequential gate's are those of stopping as soon as it is decided.
+    ``sequential`` (``--prob-stop=sequential``) adds each gated case's
+    expected runs."""
     cases: OrderedDict[str, list[Any]] = OrderedDict()
     for item in items:
         if isinstance(item, BenchItem):
             latency = item.latency if item.latency and item.latency.gated else None
-            entry = cases.setdefault(item.case, [0, item.gate, latency])
+            entry = cases.setdefault(item.case, [0, item.gate, latency, True])
             entry[0] += 1
+            # As the Curtailer plans: every item stoppable, with one gate.
+            entry[3] = entry[3] and item.curtailable and item.gate == entry[1]
     per_gate: dict[Gate, tuple[int, int | None]] = {}
+    per_budget: dict[tuple[Gate, int, bool], tuple[float, float]] = {}
     rows = []
-    for case, (runs, gate, latency) in cases.items():
+    for case, (runs, gate, latency, stoppable) in cases.items():
         extra: dict[str, Any] = {"cost_per_run": pcfg.costs.get(case)}
         if gate is not None:
             key = dataclasses.replace(gate, runs=0)
@@ -3895,7 +4157,18 @@ def plan_rows(items: Iterable[pytest.Item], pcfg: PlanConfig) -> list[PlanRow]:
                     gate.runs_for_power(pcfg.assume, _PLAN_POWER, _PLAN_CAP),
                 )
             extra["min_runs"], extra["power_runs"] = per_gate[key]
-            extra["chance"] = gate.power(runs, pcfg.assume)
+            if (key, runs, stoppable) not in per_budget:
+                # A sequential gate's chance is a forward pass, and so is
+                # every expected run count: once per gate and budget.
+                per_budget[key, runs, stoppable] = (
+                    gate.power(runs, pcfg.assume),
+                    gate.expected_runs(runs, pcfg.assume)
+                    if sequential and stoppable
+                    else float(runs),
+                )
+            extra["chance"], expected = per_budget[key, runs, stoppable]
+            if sequential:
+                extra["expected"] = expected
         if latency is not None:
             extra["min_runs"] = max(extra.get("min_runs", 0), latency.min_runs())
         rows.append(PlanRow(case, runs, gate, latency, **extra))
@@ -3924,7 +4197,11 @@ def pytest_runtestloop(session: pytest.Session):
             " during collection"
         )
     aggregator = session.config.pluginmanager.get_plugin("probability-aggregator")
-    aggregator.plan = plan_rows(session.items, plan_config(session.config))
+    aggregator.plan = plan_rows(
+        session.items,
+        plan_config(session.config),
+        sequential=stop_config(session.config).mode == "sequential",
+    )
     return True
 
 
@@ -4556,6 +4833,24 @@ def _baseline_lines(result: BaselineResult) -> list[tuple[str, str | None]]:
     return lines
 
 
+# The tag after an interval from a confidence sequence (--prob-stop=
+# sequential), so it isn't read as a fixed-run one.
+SEQUENTIAL_TAG = "seq"
+
+
+def _tag_sequential(cells: list[str], sequential: list[bool]) -> list[str]:
+    """Interval cells with ``seq`` after those from a confidence sequence
+    and padding after the rest, so columns stay aligned; unchanged when
+    none is."""
+    if not any(sequential):
+        return cells
+    pad = " " * (len(SEQUENTIAL_TAG) + 1)
+    return [
+        f"{cell} {SEQUENTIAL_TAG}" if seq and cell.strip() else cell + pad
+        for cell, seq in zip(cells, sequential)
+    ]
+
+
 def _row_name(s: CaseStats) -> str:
     return s.case
 
@@ -4657,6 +4952,8 @@ class ProbabilityAggregator:
                     after=value["after"],
                     planned=value["planned"],
                     verdict=value["verdict"],
+                    sequential=bool(value.get("sequential")),
+                    mode=stop_config(self._config).mode,
                 )
             stop.skipped += 1
 
@@ -5004,7 +5301,7 @@ class ProbabilityAggregator:
                     "total": s.total,
                     "pass_rate": s.passes / s.total * 100 if s.total else 0.0,
                     "status": s.status,
-                    "ci": self._ci_json(cfg, s),
+                    "ci": self._ci_json(self._row_stats(s), s),
                     "gate": (
                         results[s.case].to_json() if s.case in results else None
                     ),
@@ -5056,6 +5353,15 @@ class ProbabilityAggregator:
             path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
 
+    def _row_stats(self, s: CaseStats) -> StatsConfig:
+        """The settings of a row's own interval: the session's — or, for
+        a case judged by a confidence sequence, its gate's, since a case
+        that may stop the moment it looks clear has no other valid
+        interval."""
+        if s.gate is not None and s.gate.sequential:
+            return s.gate.stats
+        return stats_config(self._config)
+
     @staticmethod
     def _ci_json(cfg: StatsConfig, s: CaseStats) -> dict[str, Any] | None:
         # Always computed (it is data, not display): --prob-no-intervals
@@ -5093,24 +5399,27 @@ class ProbabilityAggregator:
             for t in texts
         ]
 
-    @classmethod
-    def _ci_cells(
-        cls, cfg: StatsConfig, all_stats: list[CaseStats]
-    ) -> list[str | None]:
+    def _ci_cells(self, all_stats: list[CaseStats]) -> list[str | None]:
         """The interval column, one padded cell per row (or ``None``s
         when the column is off).
 
         A single run says almost nothing about a rate, so rows with one
         run get a blank cell, and the column disappears entirely when no
-        row has more.
+        row has more. A row judged by a confidence sequence shows that,
+        tagged ``seq`` (``_row_stats``).
         """
-        if not cfg.intervals or all(s.total <= 1 for s in all_stats):
+        if not stats_config(self._config).intervals or all(
+            s.total <= 1 for s in all_stats
+        ):
             return [None] * len(all_stats)
-        return cls._interval_cells(
+        cells = self._interval_cells(
             [
-                cfg.interval(s.passes, s.total) if s.total > 1 else None
+                self._row_stats(s).interval(s.passes, s.total) if s.total > 1 else None
                 for s in all_stats
             ]
+        )
+        return _tag_sequential(
+            cells, [s.gate is not None and s.gate.sequential for s in all_stats]
         )
 
     @staticmethod
@@ -5175,7 +5484,10 @@ class ProbabilityAggregator:
         frac_col = max(len(f) for f in fracs)
         # Always shown, whatever the interval column's settings: the
         # verdict is read off this interval.
-        cells = self._interval_cells([r.interval for r in shown])
+        cells = _tag_sequential(
+            self._interval_cells([r.interval for r in shown]),
+            [r.gate.sequential for r in shown],
+        )
         bars = [r.gate.bar() for r in shown]
         bar_col = max(len(b) for b in bars)
         for r, frac, cell, bar in zip(shown, fracs, cells, bars):
@@ -5287,13 +5599,21 @@ class ProbabilityAggregator:
         from . import explain
 
         cfg = stats_config(self._config)
-        return explain.aggregate_reading(agg, cfg.min_inputs)
+        return explain.aggregate_reading(
+            agg, cfg.min_inputs, mode=stop_config(self._config).mode
+        )
 
     def _metric_reading(self, agg: Aggregate, m: MetricAggregate):
         from . import explain
 
         cfg = stats_config(self._config)
-        return explain.metric_reading(agg, m, cfg.min_inputs, intervals=cfg.intervals)
+        return explain.metric_reading(
+            agg,
+            m,
+            cfg.min_inputs,
+            intervals=cfg.intervals,
+            mode=stop_config(self._config).mode,
+        )
 
     def _comparison_reading(self, cmp: Comparison):
         from . import explain
@@ -5302,6 +5622,7 @@ class ProbabilityAggregator:
             cmp,
             undecided_fails=gate_config(self._config).fails(UNDECIDED),
             min_inputs=stats_config(self._config).min_inputs,
+            mode=stop_config(self._config).mode,
         )
 
     def _baseline_reading(self, cmp: Comparison):
@@ -5313,6 +5634,7 @@ class ProbabilityAggregator:
             path=result.baseline.path,
             undecided_fails=gate_config(self._config).fails(UNDECIDED),
             min_inputs=stats_config(self._config).min_inputs,
+            mode=stop_config(self._config).mode,
         )
 
     def _baseline_summary_reading(self):
@@ -5340,7 +5662,7 @@ class ProbabilityAggregator:
     def _row_reading(self, s: CaseStats):
         from . import explain
 
-        cfg = stats_config(self._config)
+        cfg = self._row_stats(s)
         interval = cfg.interval(s.passes, s.total) if s.total else None
         # A margin, like a gate, judges the case: its reading has the step.
         baseline = baseline_of(self._config)
@@ -5397,8 +5719,14 @@ class ProbabilityAggregator:
         # row is notable.
         cfg = stats_config(self._config)
         extra = []
-        if any(c is not None for c in self._ci_cells(cfg, all_stats)):
+        cells = self._ci_cells(all_stats)
+        if any(c is not None for c in cells):
             extra.append(("interval", explain.stats_key(cfg)))
+            extra.extend(
+                ("interval", explain.stats_key(self._row_stats(s)))
+                for s, c in zip(all_stats, cells)
+                if c is not None and c.strip()
+            )
         if show_latency:
             # So does the latency block.
             extra.extend(explain.latency_terms(r) for r in latency.values())
@@ -5417,6 +5745,7 @@ class ProbabilityAggregator:
         timed = any(r.latency is not None for r in rows)
         both = any(r.gate is not None and r.latency is not None for r in rows)
         priced = any(r.cost is not None for r in rows)
+        expected = any(r.expected is not None for r in rows)
 
         def runs_cell(r: PlanRow) -> str:
             if r.power_runs is not None:
@@ -5428,6 +5757,8 @@ class ProbabilityAggregator:
         header = ["case", "runs"]
         if gated or timed:
             header += ["min runs", "runs for 80%", "chance now"]
+        if expected:
+            header.append("expected runs")
         header += [f"catch {_pct_bar(f)}" for f in pcfg.flakes]
         if priced:
             header.append("cost")
@@ -5443,6 +5774,8 @@ class ProbabilityAggregator:
                     # them when a latency gate also applies.
                     mark = _PLAN_LATENCY_MARK if r.latency is not None else ""
                     cells += [least, runs_cell(r) + mark, _chance(r.chance) + mark]
+            if expected:
+                cells.append("—" if r.expected is None else f"{r.expected:,.0f}")
             cells += [_chance(stats.detection_chance(f, r.runs)) for f in pcfg.flakes]
             if priced:
                 cells.append("" if r.cost is None else f"${r.cost:.4f}")
@@ -5485,6 +5818,7 @@ class ProbabilityAggregator:
             latency=timed,
             both=both,
             mark=_PLAN_LATENCY_MARK,
+            expected=expected,
         )
         for text in explain.render_notes(notes, width):
             tr.write_line(text)
@@ -5516,7 +5850,7 @@ class ProbabilityAggregator:
 
         name_col = max(len(_row_name(s)) for s in all_stats)
         frac_col = max(len(f"{s.passes}/{s.total}") for s in all_stats)
-        cis = self._ci_cells(stats_config(self._config), all_stats)
+        cis = self._ci_cells(all_stats)
         for s, ci in zip(all_stats, cis):
             line = f"  {_row_name(s):<{name_col}}  {f'{s.passes}/{s.total}':>{frac_col}}"
             if ci is not None:
@@ -5590,6 +5924,7 @@ class ProbabilityAggregator:
             or self._baseline_comparisons()
             or any(v != PASS for v in verdicts)
             or self._stops
+            or any(s.gate is not None and s.gate.sequential for s in all_stats)
         ):
             from .explain import HINT
 
