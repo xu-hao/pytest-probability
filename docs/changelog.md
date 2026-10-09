@@ -237,6 +237,16 @@
   gate, early stopping, latency, planning, reproducibility, a "what to
   report" checklist and credits. `--prob-explain`'s "Full guide" link
   now points at it.
+- **Visible change in failure output:** a failing or errored bench
+  run's traceback now starts at the bench function, like a failing
+  `test_*`, instead of listing every pytest and pluggy frame above it.
+  Frames the bench function called (helpers, your client code) are
+  kept, `--tb=auto` shows middle frames one line each, and
+  `--fulltrace` still shows everything. The same applies to gated
+  runs printed by `--xfail-tb`. Failing runs also report much faster:
+  50 failing runs took 4.7 s before and 0.18 s now, about the same as
+  50 failing `test_*`s. Outcomes, records and the JSON report's failure
+  messages are unchanged.
 
 ## 0.2.0 (2026-07-08)
 

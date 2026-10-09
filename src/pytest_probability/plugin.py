@@ -2268,6 +2268,69 @@ class BenchItem(pytest.Item):
     def reportinfo(self):
         return self.path, 0, f"case: {self.case}"
 
+    def _traceback_filter(self, excinfo: pytest.ExceptionInfo[BaseException]):
+        """Trim a failing run's traceback to the bench function, as
+        pytest's ``Function`` does for ``test_*``: drop the runner,
+        pluggy and ``runtest()`` frames above it, keep everything it
+        called, honour ``__tracebackhide__``, and under ``--tb=auto``
+        show the middle frames one line each. ``--fulltrace`` skips
+        all of it.
+
+        ``_traceback_filter`` is internal to pytest (``Node`` passes it
+        to ``getrepr`` as the ``tbfilter``); anything unexpected falls
+        back to the full traceback, today's output.
+        """
+        traceback = excinfo.traceback
+        if self.config.getoption("fulltrace", False):
+            return traceback
+        try:
+            return self._trim_traceback(excinfo, traceback)
+        except Exception:  # pragma: no cover - future-pytest safety net
+            return traceback
+
+    def _trim_traceback(self, excinfo, traceback):
+        code = getattr(inspect.unwrap(self.bench_fn), "__code__", None)
+        # The bench module is compiled by us, so the frame's code is the
+        # function's own: match it by identity, not by path and line.
+        start = next(
+            (
+                i
+                for i, entry in enumerate(traceback)
+                if entry.frame.code.raw is code
+            ),
+            None,
+        )
+        if start is not None:
+            ntraceback = traceback[start:]
+        else:
+            # A wrapper hid the function: drop pytest's frames and ours.
+            ntraceback = traceback.filter(
+                lambda entry: entry.frame.code.raw is not _RUNTEST_CODE
+                and (_filter_traceback is None or _filter_traceback(entry))
+            )
+            if not ntraceback:
+                ntraceback = traceback
+        ntraceback = ntraceback.filter(excinfo)
+        if self.config.getoption("tbstyle", "auto") == "auto" and len(ntraceback) > 2:
+            ntraceback = type(ntraceback)(
+                [
+                    ntraceback[0],
+                    *(e.with_repr_style("short") for e in ntraceback[1:-1]),
+                    ntraceback[-1],
+                ]
+            )
+        return ntraceback
+
+
+_RUNTEST_CODE = BenchItem.runtest.__code__
+
+try:
+    # pytest's own "is this frame pytest/pluggy internals" test, which
+    # Function uses for the same fallback. Internal, like the rewriter.
+    from _pytest._code.code import filter_traceback as _filter_traceback
+except ImportError:  # pragma: no cover - future-pytest safety net
+    _filter_traceback = None
+
 
 # Old-style wrapper (not wrapper=True) so pytest 7.4 with older pluggy
 # keeps working.
