@@ -2552,7 +2552,42 @@ def _usage_to_dict(u: Any) -> dict[str, Any]:
 _clock: Callable[[], float] = time.perf_counter
 
 
-class BenchItem(pytest.Item):
+class _ProbItem(pytest.Item):
+    """Shared base for ``BenchItem`` and ``VerdictItem``.
+
+    On pytest >= 9.2, ``Node`` stores its identity as a structured
+    ``NodeId`` in ``_id`` rather than a string in ``_nodeid``:
+
+    - passing the string ``nodeid`` lets pytest parse any ``[...]``
+      suffix into ``NodeId.params`` so ``item.id`` matches the
+      ``NodeId.parse(...)`` keys that ``LFPlugin`` reloads from
+      ``cache/lastfailed``;
+    - bridging ``_nodeid`` onto ``_id`` keeps ``pytest-xdist``'s
+      ``--dist loadgroup`` (which appends ``@group`` by assigning
+      ``item._nodeid``) working on pytest 9.2.
+    """
+
+    if hasattr(pytest.Item, "id"):
+
+        def __init__(self, **kwargs: Any) -> None:
+            parent = kwargs.get("parent")
+            name = kwargs.get("name")
+            if "nodeid" not in kwargs and parent is not None and name is not None:
+                kwargs["nodeid"] = (
+                    f"{parent.nodeid}::{name}" if parent.nodeid else name
+                )
+            super().__init__(**kwargs)
+
+        @property
+        def _nodeid(self) -> str:
+            return str(self._id)
+
+        @_nodeid.setter
+        def _nodeid(self, value: str) -> None:
+            self._id = type(self._id).parse(value)
+
+
+class BenchItem(_ProbItem):
     """One (case, run) execution of a bench function.
 
     The function body is an ordinary pytest test body: a passing body
@@ -2962,7 +2997,7 @@ class _Verdict(NamedTuple):
     paragraphs: tuple[str, ...] = ()
 
 
-class VerdictItem(pytest.Item):
+class VerdictItem(_ProbItem):
     """An item that runs after the bench items a verdict needs and
     passes or fails with that verdict, so ``-v``, JUnit XML and ``--lf``
     see it like any test.
@@ -3160,13 +3195,13 @@ class VerdictItems:
         lastfailed = getattr(lf, "lastfailed", None)
         if not getattr(lf, "active", False) or not lastfailed:
             return
-        failed = {v.key for v in verdict_items if v.nodeid in lastfailed}
+        failed = {v.key for v in verdict_items if _lf_key(v) in lastfailed}
         if not failed:
             return
-        added: set[str] = set()
+        added: set[Any] = set()
         for key, runs in _runs_by_key(items).items():
             if key in failed:
-                added.update(r.nodeid for r in runs if r.nodeid not in lastfailed)
+                added.update(_lf_key(r) for r in runs if _lf_key(r) not in lastfailed)
         lastfailed.update(dict.fromkeys(added, True))
         self._rerun = (len(added), len(failed))
 
@@ -3208,6 +3243,12 @@ class VerdictItems:
                 f" of {item.key[1]} had not run here before this item"
             )
         return None
+
+
+def _lf_key(item: pytest.Item) -> Any:
+    # pytest >= 9.2 keys LFPlugin.lastfailed by NodeId (item.id);
+    # earlier pytest keys it by the string item.nodeid.
+    return getattr(item, "id", item.nodeid)
 
 
 def _plural(n: int, noun: str) -> str:
