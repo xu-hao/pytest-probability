@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **pytest 9.2 compatibility:** fixed `--lf`/`--ff` reruns of failed verdict
+  items and `pytest-xdist` `--dist loadgroup` grouping under pytest 9.2's
+  structured `NodeId` representation while preserving pytest 7.4/8.x support.
+
 ## 0.3.0 (2026-10-09)
 
 - **Visible output change:** with more than one run, every summary row

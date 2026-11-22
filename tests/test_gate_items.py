@@ -416,6 +416,50 @@ def test_lf_keeps_real_failures_with_the_gates(pytester):
     result.assert_outcomes(passed=3, failed=2)
 
 
+def test_lf_reruns_failed_margin_item_with_its_function(pytester):
+    pytester.makepyfile(bench_s=_PAIRED)
+    first = pytester.runpytest("--tb=no", "-q")
+    assert first.ret == pytest.ExitCode.TESTS_FAILED
+    result = pytester.runpytest("--tb=no", "--lf", "-v")
+    result.stdout.fnmatch_lines(
+        [
+            "run-last-failure: rerun previous 37 failures",
+            "probability: rerunning 36 runs with the 1 failed verdict item that"
+            " needs them",
+        ]
+    )
+    names = [i for i, _ in _items(result)]
+    assert len(names) == 37
+    assert names[-1] == "bench_s.py::bench_pair[compare:never]"
+    assert "bench_s.py::bench_pair[compare:same]" not in names
+    result.assert_outcomes(passed=24, failed=1, xfailed=12)
+
+
+def test_items_keep_structured_id_and_nodeid_in_sync(pytester):
+    # On pytest >= 9.2, Node stores a structured NodeId in _id; custom
+    # BenchItem/GateItem/MarginItem instances must match NodeId.parse(nodeid)
+    # (for LFPlugin's cache/lastfailed) and reflect _nodeid writes (for
+    # pytest-xdist --dist loadgroup).
+    pytester.makepyfile(bench_s=_bench(CLASSIFY) + _PAIRED.split("\n", 2)[2])
+    pytester.makeconftest(
+        """
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if hasattr(item, "id"):
+            assert item.id == type(item.id).parse(item.nodeid)
+            orig = item.nodeid
+            item._nodeid = f"{orig}@grp"
+            assert item.nodeid == f"{orig}@grp"
+            assert item.id == type(item.id).parse(f"{orig}@grp")
+            item._nodeid = orig
+            assert item.nodeid == orig
+            assert item.id == type(item.id).parse(orig)
+"""
+    )
+    result = _run(pytester, "--collect-only", "-q")
+    assert result.ret == pytest.ExitCode.OK
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
